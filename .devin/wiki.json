@@ -1,19 +1,7 @@
 {
   "repo_notes": [
     {
-      "content": "Generate the wiki from the current main branch of tecxbro/daniel-ims-ag. Source code and convex/schema.ts are authoritative; README.md and ARCHITECTURE.md are orientation aids. Verify file paths, function names, environment variables, limits, schemas, tool registrations, and lifecycle behavior before stating them."
-    },
-    {
-      "content": "Document only behavior implemented in the repository today. Clearly label optional, configuration-dependent, and intentionally unsupported behavior. Do not include old branding, migration history, batch or phase history, private roadmap plans, or features inferred only from comments."
-    },
-    {
-      "content": "Write for a new contributor. Parent pages should orient and link; child pages should contain implementation detail. Prefer concise diagrams, tables, and sequence flows, and include repository-relative source paths, configuration, failure modes, security boundaries, and related-page links."
-    },
-    {
-      "content": "Never expose secrets, tokens, webhook signatures, real phone numbers, private user data, or local absolute paths. Use clearly fake placeholders. Distinguish the interaction dispatcher, normal execution workers, and coding workspaces, including their different tool and filesystem permissions."
-    },
-    {
-      "content": "Avoid duplicating explanations across pages. Note provider differences between Claude and Codex, distinguish API billing from subscription-backed runtime usage, and distinguish Photon Spectrum SDK streaming from webhook-based integrations."
+      "content": ""
     }
   ],
   "pages": [
@@ -22,17 +10,17 @@
       "purpose": "High-level introduction to Daniel: what it is, how it works, key components, and how to get started. Links to all major subsections.",
       "page_notes": [
         {
-          "content": "Use README.md and ARCHITECTURE.md for orientation, then verify claims against current source. Present Daniel as the current self-hosted iMessage agent and exclude former branding or speculative roadmap material."
+          "content": ""
         }
       ]
     },
     {
-      "title": "Getting Started & Configuration",
+      "title": "Getting Started & Configuration ",
       "purpose": "Setup instructions, environment variables, the interactive setup script, and runtime configuration options (Claude vs Codex, model selection, billing modes).",
       "parent": "Overview",
       "page_notes": [
         {
-          "content": "Treat .env.example and the current setup scripts as authoritative. Separate required and optional settings, explain environment-versus-Convex precedence, and use fake values for all secrets."
+          "content": ""
         }
       ]
     },
@@ -42,7 +30,7 @@
       "parent": "Overview",
       "page_notes": [
         {
-          "content": "Include a system diagram and an end-to-end message sequence. Name concrete files and emphasize that the dispatcher does not directly receive shell, filesystem, web, or third-party integration access."
+          "content": ""
         }
       ]
     },
@@ -51,7 +39,7 @@
       "purpose": "Overview of the three-layer agent architecture: the interaction agent (dispatcher), execution workers, and the coding bridge. Links to child pages for each layer.",
       "page_notes": [
         {
-          "content": "Explain responsibilities and trust boundaries first, then link to the dispatcher, execution worker, coding bridge, and runtime adapter pages without repeating their full implementation details."
+          "content": ""
         }
       ]
     },
@@ -61,7 +49,7 @@
       "parent": "Core Agent System",
       "page_notes": [
         {
-          "content": "Anchor this page in server/interaction-agent.ts and server/prompts/daniel-voice.ts. List only tools registered in code and explain direct answers, delegation, acknowledgements, and final Daniel-voice rewriting."
+          "content": ""
         }
       ]
     },
@@ -71,7 +59,7 @@
       "parent": "Core Agent System",
       "page_notes": [
         {
-          "content": "Trace spawn, scoped tool loading, execution, persistence, cancellation/retry, and result return. Verify WebSearch/WebFetch availability and clearly separate read operations from external writes staged as drafts."
+          "content": ""
         }
       ]
     },
@@ -81,7 +69,7 @@
       "parent": "Core Agent System",
       "page_notes": [
         {
-          "content": "Use server/coding-agent.ts, server/coding/workspace.ts, server/coding/response-style.ts, and related Convex modules. Explain path validation, cloning, pending input, follow-ups, response styles, and managed workspace-write boundaries."
+          "content": ""
         }
       ]
     },
@@ -91,7 +79,7 @@
       "parent": "Core Agent System",
       "page_notes": [
         {
-          "content": "Document the common runtime contract before provider details. Be exact about authentication, read-only versus workspace-write profiles, Codex collaboration modes, approvals, protocol types, and capabilities that differ by runtime."
+          "content": ""
         }
       ]
     },
@@ -100,7 +88,7 @@
       "purpose": "Overview of Daniel's tiered memory architecture: extraction, storage, recall, decay, and consolidation. Links to child pages for each subsystem.",
       "page_notes": [
         {
-          "content": "Describe the lifecycle as extract, classify/store, embed, recall, decay/cleanup, and consolidate. Link to exact modules and avoid unsupported or anthropomorphic claims about memory."
+          "content": ""
         }
       ]
     },
@@ -110,7 +98,7 @@
       "parent": "Memory System",
       "page_notes": [
         {
-          "content": "Read server/memory/ and convex/schema.ts for exact enums, validators, indexes, decay rules, archive/supersede fields, and image anchors. Use compact tier and segment tables."
+          "content": ""
         }
       ]
     },
@@ -120,7 +108,7 @@
       "parent": "Memory System",
       "page_notes": [
         {
-          "content": "Verify provider order, model names, vector dimensions, normalization, fallback behavior, and vector-index calls from current code. Explain the no-paid-key path without overstating recall quality."
+          "content": ""
         }
       ]
     },
@@ -130,7 +118,7 @@
       "parent": "Memory System",
       "page_notes": [
         {
-          "content": "Trace proposer, adversary, and judge inputs and outputs, then show how deterministic code applies merges, supersedes, and pruning. Cover scheduling, persistence, broadcast telemetry, and usage records."
+          "content": ""
         }
       ]
     },
@@ -139,7 +127,7 @@
       "purpose": "Overview of how messages flow in and out via Photon Spectrum, and how images are ingested, validated, stored, and cleaned up. Links to child pages.",
       "page_notes": [
         {
-          "content": "Give a transport overview and cross-link the Photon and image pages. Emphasize that inbound Spectrum delivery uses the SDK stream, while webhook integrations may still require a public URL."
+          "content": ""
         }
       ]
     },
@@ -149,7 +137,7 @@
       "parent": "iMessage Transport & Image Handling",
       "page_notes": [
         {
-          "content": "Use server/imessage.ts and Photon integration code as source of truth. Cover normalization, deduplication, typing state, attachments, phone selection, markdown cleanup, chunking, error handling, and exact limits from code."
+          "content": ""
         }
       ]
     },
@@ -159,7 +147,7 @@
       "parent": "iMessage Transport & Image Handling",
       "page_notes": [
         {
-          "content": "List accepted MIME types and size limits from code, then trace validation, Convex storage, runtime content blocks, message or memory references, retention, cleanup, and surfaced failures."
+          "content": ""
         }
       ]
     },
@@ -168,7 +156,7 @@
       "purpose": "Overview of how Daniel connects to external services via Composio, the local browser, and the integration registry. Links to child pages.",
       "page_notes": [
         {
-          "content": "Explain the registry and worker-scoped loading model before cataloging providers. Separate hosted Composio integrations from the optional local browser."
+          "content": ""
         }
       ]
     },
@@ -178,7 +166,7 @@
       "parent": "Integrations & External Tools",
       "page_notes": [
         {
-          "content": "Anchor claims in server/composio.ts, server/composio-routes.ts, and server/integrations/. Document registration, identity/account ownership, implemented OAuth modes, route security, status, and worker tool naming."
+          "content": ""
         }
       ]
     },
@@ -188,7 +176,7 @@
       "parent": "Integrations & External Tools",
       "page_notes": [
         {
-          "content": "Trace startup registration, signature verification, event filtering, self-send rejection, warmup skip, classification, memory use, usage logging, notification, failure behavior, and restarts without exposing secrets."
+          "content": ""
         }
       ]
     },
@@ -198,7 +186,7 @@
       "parent": "Integrations & External Tools",
       "page_notes": [
         {
-          "content": "Document launcher/profile lifecycle, local HTTP and MCP surfaces, snapshots, screenshot rotation, login handoff, enablement, validation, redaction, and public-tunnel rejection."
+          "content": ""
         }
       ]
     },
@@ -207,7 +195,7 @@
       "purpose": "Cron-based recurring task scheduling, timezone-aware execution, the automation polling loop, agent spawning for automation runs, and the create/list/toggle/delete tool surface.",
       "page_notes": [
         {
-          "content": "Explain the user-facing automation tools and server execution loop at a high level. State the single-server assumption and link to scheduling and draft-safety details."
+          "content": ""
         }
       ]
     },
@@ -217,7 +205,7 @@
       "parent": "Automations & Proactive Workflows",
       "page_notes": [
         {
-          "content": "Use server/automations.ts, server/automation-tools.ts, timezone code, and Convex modules. Cover cron parsing, saved IANA timezone, polling, run records, spawning, failures, rescheduling, outbound iMessage delivery, and missing distributed locks."
+          "content": ""
         }
       ]
     },
@@ -227,7 +215,7 @@
       "parent": "Automations & Proactive Workflows",
       "page_notes": [
         {
-          "content": "Show the two-phase safety boundary: workers stage external mutations, then the interaction agent lists, sends, or rejects them. Document statuses, payloads, expiry/errors, commit paths, and audit state from code."
+          "content": ""
         }
       ]
     },
@@ -236,7 +224,7 @@
       "purpose": "Overview of the Convex database schema, all tables, indexes, and how the server interacts with Convex for state management. Links to child pages.",
       "page_notes": [
         {
-          "content": "Explain Convex as the coordination layer for queries, mutations, actions, storage, realtime subscriptions, and vector search. Treat convex/schema.ts as the authoritative inventory."
+          "content": ""
         }
       ]
     },
@@ -246,7 +234,7 @@
       "parent": "Persistence Layer (Convex)",
       "page_notes": [
         {
-          "content": "Inventory every current table and index, including codingPreferences, agentLogs, memoryEvents, and automationRuns when present. Describe lifecycle, relationships, validators, and indexes without inventing foreign-key guarantees."
+          "content": ""
         }
       ]
     },
@@ -256,7 +244,7 @@
       "parent": "Persistence Layer (Convex)",
       "page_notes": [
         {
-          "content": "Trace actual usage-write call sites. Explain tokens, provider, model, runtime, operation categories, calculated versus unavailable cost, and billingMode without fabricating pricing or subscription costs."
+          "content": ""
         }
       ]
     },
@@ -265,7 +253,7 @@
       "purpose": "The React/Vite debug dashboard: panels for agents, memory, automations, connections, consolidation, events, settings, and the changelog drawer. WebSocket live updates.",
       "page_notes": [
         {
-          "content": "Describe the dashboard as a local operational/debug surface. Cover its Convex queries, server endpoints, WebSocket events, health and usage views, and local security assumptions."
+          "content": ""
         }
       ]
     },
@@ -275,7 +263,7 @@
       "parent": "Operations Dashboard",
       "page_notes": [
         {
-          "content": "Map each existing panel to its React component, data sources, actions, loading/empty/error states, and live-update behavior. Do not document removed or mocked UI."
+          "content": ""
         }
       ]
     },
@@ -285,7 +273,7 @@
       "parent": "Operations Dashboard",
       "page_notes": [
         {
-          "content": "Use server/broadcast.ts and the dashboard socket hook/types. Map event producers and consumers, reconnect behavior, fake payload examples, and durable Convex state versus ephemeral socket events."
+          "content": ""
         }
       ]
     },
@@ -294,7 +282,7 @@
       "purpose": "Overview of the .agents/skills and skills/ directories: reusable skill definitions for Convex patterns, the photon-spectrum skill injected into coding workspaces, and the upgrade-daniel skill.",
       "page_notes": [
         {
-          "content": "Inventory the current .agents/skills and skills trees. Distinguish repository-development guidance, workspace-injected skills, and runtime integrations, and explain how the upgrade skill is invoked."
+          "content": ""
         }
       ]
     },
@@ -304,7 +292,7 @@
       "parent": "Skills & Agent Toolkits",
       "page_notes": [
         {
-          "content": "Describe the exact injection/copy lifecycle, reference documents, templates, and fetch script. Explain intended template usage and refreshed-doc caching without implying the skill runs production transport."
+          "content": ""
         }
       ]
     }
