@@ -1,7 +1,3 @@
-<p align="center">
-  <img src="assets/daniel.png" alt="Daniel portrait" width="220" />
-</p>
-
 # Daniel
 
 Daniel is a self-hosted personal agent that lives in iMessage. It can run on
@@ -12,12 +8,6 @@ Daniel is a complete agent system rather than a chat wrapper: a dispatcher
 routes work to focused execution workers, Convex stores durable state, Photon
 Spectrum carries iMessages, and the operations dashboard exposes memory,
 automations, integrations, coding workspaces, browser controls, and usage.
-
-<p align="center">
-  <img src="assets/imessage.jpg" alt="Daniel replying inside iMessage" width="320" />
-  <br>
-  <sub><em>Ask naturally in iMessage; Daniel keeps context and delegates work.</em></sub>
-</p>
 
 ## What Daniel Includes
 
@@ -54,30 +44,6 @@ automations, integrations, coding workspaces, browser controls, and usage.
 
 The dashboard is a React/Vite application backed by live Convex queries and
 the local Daniel server.
-
-<p align="center">
-  <img src="assets/agents-view.jpg" alt="Daniel agents dashboard" width="840" />
-  <br>
-  <sub><em>Agents — runtime, status, usage, tool activity, and worker summaries.</em></sub>
-</p>
-
-<p align="center">
-  <img src="assets/automations.jpg" alt="Daniel automations dashboard" width="840" />
-  <br>
-  <sub><em>Automations — recurring jobs created from natural-language schedules.</em></sub>
-</p>
-
-<p align="center">
-  <img src="assets/memory-graph.jpg" alt="Daniel memory dashboard" width="840" />
-  <br>
-  <sub><em>Memory — searchable records across short, long, and permanent tiers.</em></sub>
-</p>
-
-<p align="center">
-  <img src="assets/connections.jpg" alt="Daniel connections dashboard" width="840" />
-  <br>
-  <sub><em>Connections — external toolkits available to delegated workers.</em></sub>
-</p>
 
 ## System Map
 
@@ -238,12 +204,6 @@ reasoning are persisted for the dashboard.
 Inbound images can flow through both the interaction agent and spawned
 workers. Raw image bytes expire according to
 `DANIEL_IMAGE_RETENTION_DAYS` unless a memory record anchors them.
-
-<p align="center">
-  <img src="assets/image-memory-example.jpeg" alt="Example image for Daniel image understanding" width="280" />
-  <br>
-  <sub><em>Example input for image understanding and memory anchoring.</em></sub>
-</p>
 
 ## Automations and Proactive Work
 
