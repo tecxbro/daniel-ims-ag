@@ -1,0 +1,312 @@
+{
+  "repo_notes": [
+    {
+      "content": "Generate the wiki from the current main branch of tecxbro/daniel-ims-ag. Source code and convex/schema.ts are authoritative; README.md and ARCHITECTURE.md are orientation aids. Verify file paths, function names, environment variables, limits, schemas, tool registrations, and lifecycle behavior before stating them."
+    },
+    {
+      "content": "Document only behavior implemented in the repository today. Clearly label optional, configuration-dependent, and intentionally unsupported behavior. Do not include old branding, migration history, batch or phase history, private roadmap plans, or features inferred only from comments."
+    },
+    {
+      "content": "Write for a new contributor. Parent pages should orient and link; child pages should contain implementation detail. Prefer concise diagrams, tables, and sequence flows, and include repository-relative source paths, configuration, failure modes, security boundaries, and related-page links."
+    },
+    {
+      "content": "Never expose secrets, tokens, webhook signatures, real phone numbers, private user data, or local absolute paths. Use clearly fake placeholders. Distinguish the interaction dispatcher, normal execution workers, and coding workspaces, including their different tool and filesystem permissions."
+    },
+    {
+      "content": "Avoid duplicating explanations across pages. Note provider differences between Claude and Codex, distinguish API billing from subscription-backed runtime usage, and distinguish Photon Spectrum SDK streaming from webhook-based integrations."
+    }
+  ],
+  "pages": [
+    {
+      "title": "Overview",
+      "purpose": "High-level introduction to Daniel: what it is, how it works, key components, and how to get started. Links to all major subsections.",
+      "page_notes": [
+        {
+          "content": "Use README.md and ARCHITECTURE.md for orientation, then verify claims against current source. Present Daniel as the current self-hosted iMessage agent and exclude former branding or speculative roadmap material."
+        }
+      ]
+    },
+    {
+      "title": "Getting Started & Configuration",
+      "purpose": "Setup instructions, environment variables, the interactive setup script, and runtime configuration options (Claude vs Codex, model selection, billing modes).",
+      "parent": "Overview",
+      "page_notes": [
+        {
+          "content": "Treat .env.example and the current setup scripts as authoritative. Separate required and optional settings, explain environment-versus-Convex precedence, and use fake values for all secrets."
+        }
+      ]
+    },
+    {
+      "title": "Architecture Overview",
+      "purpose": "The dispatcher/worker split, system map, data flow from iMessage through the interaction agent to workers, and how Convex ties everything together.",
+      "parent": "Overview",
+      "page_notes": [
+        {
+          "content": "Include a system diagram and an end-to-end message sequence. Name concrete files and emphasize that the dispatcher does not directly receive shell, filesystem, web, or third-party integration access."
+        }
+      ]
+    },
+    {
+      "title": "Core Agent System",
+      "purpose": "Overview of the three-layer agent architecture: the interaction agent (dispatcher), execution workers, and the coding bridge. Links to child pages for each layer.",
+      "page_notes": [
+        {
+          "content": "Explain responsibilities and trust boundaries first, then link to the dispatcher, execution worker, coding bridge, and runtime adapter pages without repeating their full implementation details."
+        }
+      ]
+    },
+    {
+      "title": "Interaction Agent (Dispatcher)",
+      "purpose": "Deep dive into server/interaction-agent.ts: how it routes messages, its tool surface (memory, spawn_agent, spawn_coding_agent, automations, drafts, self-tools), the Daniel voice prompt, and the acknowledgment pattern.",
+      "parent": "Core Agent System",
+      "page_notes": [
+        {
+          "content": "Anchor this page in server/interaction-agent.ts and server/prompts/daniel-voice.ts. List only tools registered in code and explain direct answers, delegation, acknowledgements, and final Daniel-voice rewriting."
+        }
+      ]
+    },
+    {
+      "title": "Execution Agent (Worker)",
+      "purpose": "How spawnExecutionAgent works, tool loading (Composio, browser, WebSearch/WebFetch), the draft staging safety pattern, agent lifecycle (cancel/retry), and usage logging.",
+      "parent": "Core Agent System",
+      "page_notes": [
+        {
+          "content": "Trace spawn, scoped tool loading, execution, persistence, cancellation/retry, and result return. Verify WebSearch/WebFetch availability and clearly separate read operations from external writes staged as drafts."
+        }
+      ]
+    },
+    {
+      "title": "Coding Agent & Workspace",
+      "purpose": "The coding bridge: spawnCodingAgent, workspace lifecycle (plan/build/debug modes), Codex profiles, pending input Q&A flow, response styles, and workspace path management.",
+      "parent": "Core Agent System",
+      "page_notes": [
+        {
+          "content": "Use server/coding-agent.ts, server/coding/workspace.ts, server/coding/response-style.ts, and related Convex modules. Explain path validation, cloning, pending input, follow-ups, response styles, and managed workspace-write boundaries."
+        }
+      ]
+    },
+    {
+      "title": "Runtime Adapters (Claude & Codex)",
+      "purpose": "How server/runtimes/ abstracts Claude Agent SDK and Codex app-server behind a common runAgentRuntime interface, including sandbox policies, collaboration modes, and the codex-app-server-protocol.",
+      "parent": "Core Agent System",
+      "page_notes": [
+        {
+          "content": "Document the common runtime contract before provider details. Be exact about authentication, read-only versus workspace-write profiles, Codex collaboration modes, approvals, protocol types, and capabilities that differ by runtime."
+        }
+      ]
+    },
+    {
+      "title": "Memory System",
+      "purpose": "Overview of Daniel's tiered memory architecture: extraction, storage, recall, decay, and consolidation. Links to child pages for each subsystem.",
+      "page_notes": [
+        {
+          "content": "Describe the lifecycle as extract, classify/store, embed, recall, decay/cleanup, and consolidate. Link to exact modules and avoid unsupported or anthropomorphic claims about memory."
+        }
+      ]
+    },
+    {
+      "title": "Memory Tiers, Segments & Storage",
+      "purpose": "The three memory tiers (short/long/permanent), seven segments (identity, preference, correction, relationship, project, knowledge, context), decay rates, the Convex memoryRecords schema, and the write_memory/recall tools.",
+      "parent": "Memory System",
+      "page_notes": [
+        {
+          "content": "Read server/memory/ and convex/schema.ts for exact enums, validators, indexes, decay rules, archive/supersede fields, and image anchors. Use compact tier and segment tables."
+        }
+      ]
+    },
+    {
+      "title": "Embeddings & Semantic Recall",
+      "purpose": "How embeddings are generated (Voyage → OpenAI → local Xenova/bge-large-en-v1.5 fallback), the 1024-dimension vector index in Convex, and how recall() performs semantic search.",
+      "parent": "Memory System",
+      "page_notes": [
+        {
+          "content": "Verify provider order, model names, vector dimensions, normalization, fallback behavior, and vector-index calls from current code. Explain the no-paid-key path without overstating recall quality."
+        }
+      ]
+    },
+    {
+      "title": "Memory Consolidation Pipeline",
+      "purpose": "The proposer/adversary/judge LLM pipeline that merges, supersedes, and prunes memories. Scheduling, real-time broadcast telemetry, and usage tracking.",
+      "parent": "Memory System",
+      "page_notes": [
+        {
+          "content": "Trace proposer, adversary, and judge inputs and outputs, then show how deterministic code applies merges, supersedes, and pruning. Cover scheduling, persistence, broadcast telemetry, and usage records."
+        }
+      ]
+    },
+    {
+      "title": "iMessage Transport & Image Handling",
+      "purpose": "Overview of how messages flow in and out via Photon Spectrum, and how images are ingested, validated, stored, and cleaned up. Links to child pages.",
+      "page_notes": [
+        {
+          "content": "Give a transport overview and cross-link the Photon and image pages. Emphasize that inbound Spectrum delivery uses the SDK stream, while webhook integrations may still require a public URL."
+        }
+      ]
+    },
+    {
+      "title": "Photon Spectrum Bridge",
+      "purpose": "How server/imessage.ts connects to Photon Spectrum SDK, message deduplication, markdown stripping, chunking for iMessage limits, E.164 phone normalization, and the sendImessage function.",
+      "parent": "iMessage Transport & Image Handling",
+      "page_notes": [
+        {
+          "content": "Use server/imessage.ts and Photon integration code as source of truth. Cover normalization, deduplication, typing state, attachments, phone selection, markdown cleanup, chunking, error handling, and exact limits from code."
+        }
+      ]
+    },
+    {
+      "title": "Image Ingestion & Storage",
+      "purpose": "MIME type validation, size limits, Convex storage upload, content-block construction for multimodal prompts, image retention policy, and the cleanup loop.",
+      "parent": "iMessage Transport & Image Handling",
+      "page_notes": [
+        {
+          "content": "List accepted MIME types and size limits from code, then trace validation, Convex storage, runtime content blocks, message or memory references, retention, cleanup, and surfaced failures."
+        }
+      ]
+    },
+    {
+      "title": "Integrations & External Tools",
+      "purpose": "Overview of how Daniel connects to external services via Composio, the local browser, and the integration registry. Links to child pages.",
+      "page_notes": [
+        {
+          "content": "Explain the registry and worker-scoped loading model before cataloging providers. Separate hosted Composio integrations from the optional local browser."
+        }
+      ]
+    },
+    {
+      "title": "Composio Integration Registry",
+      "purpose": "The IntegrationModule registry, how Composio toolkits are loaded and registered, multi-account handling, OAuth flows (managed vs BYO), identity extraction, and the composio-routes HTTP API.",
+      "parent": "Integrations & External Tools",
+      "page_notes": [
+        {
+          "content": "Anchor claims in server/composio.ts, server/composio-routes.ts, and server/integrations/. Document registration, identity/account ownership, implemented OAuth modes, route security, status, and worker tool naming."
+        }
+      ]
+    },
+    {
+      "title": "Proactive Email & Webhook System",
+      "purpose": "How Composio webhooks are registered and verified (HMAC), the Gmail trigger pipeline, email classification, warmup-skip logic, and the ensureProactiveWatcher startup flow.",
+      "parent": "Integrations & External Tools",
+      "page_notes": [
+        {
+          "content": "Trace startup registration, signature verification, event filtering, self-send rejection, warmup skip, classification, memory use, usage logging, notification, failure behavior, and restarts without exposing secrets."
+        }
+      ]
+    },
+    {
+      "title": "Local Browser Automation",
+      "purpose": "Patchright-based Chrome automation: launcher lifecycle, login handoff, accessibility snapshots, screenshot rotation, the browser REST API, MCP tools, and local-only security controls.",
+      "parent": "Integrations & External Tools",
+      "page_notes": [
+        {
+          "content": "Document launcher/profile lifecycle, local HTTP and MCP surfaces, snapshots, screenshot rotation, login handoff, enablement, validation, redaction, and public-tunnel rejection."
+        }
+      ]
+    },
+    {
+      "title": "Automations & Proactive Workflows",
+      "purpose": "Cron-based recurring task scheduling, timezone-aware execution, the automation polling loop, agent spawning for automation runs, and the create/list/toggle/delete tool surface.",
+      "page_notes": [
+        {
+          "content": "Explain the user-facing automation tools and server execution loop at a high level. State the single-server assumption and link to scheduling and draft-safety details."
+        }
+      ]
+    },
+    {
+      "title": "Automation Scheduling & Execution",
+      "purpose": "How automations are stored in Convex, the tickAutomations polling loop, nextRunFor cron evaluation, runAutomation lifecycle (create run → spawn agent → update run → reschedule), and SMS notifications.",
+      "parent": "Automations & Proactive Workflows",
+      "page_notes": [
+        {
+          "content": "Use server/automations.ts, server/automation-tools.ts, timezone code, and Convex modules. Cover cron parsing, saved IANA timezone, polling, run records, spawning, failures, rescheduling, outbound iMessage delivery, and missing distributed locks."
+        }
+      ]
+    },
+    {
+      "title": "Draft Staging & Safety Controls",
+      "purpose": "The draft-before-send pattern: save_draft (staging), list_drafts/send_draft/reject_draft (decision), how the interaction agent commits external actions, and the Convex drafts table schema.",
+      "parent": "Automations & Proactive Workflows",
+      "page_notes": [
+        {
+          "content": "Show the two-phase safety boundary: workers stage external mutations, then the interaction agent lists, sends, or rejects them. Document statuses, payloads, expiry/errors, commit paths, and audit state from code."
+        }
+      ]
+    },
+    {
+      "title": "Persistence Layer (Convex)",
+      "purpose": "Overview of the Convex database schema, all tables, indexes, and how the server interacts with Convex for state management. Links to child pages.",
+      "page_notes": [
+        {
+          "content": "Explain Convex as the coordination layer for queries, mutations, actions, storage, realtime subscriptions, and vector search. Treat convex/schema.ts as the authoritative inventory."
+        }
+      ]
+    },
+    {
+      "title": "Database Schema & Tables",
+      "purpose": "All Convex tables: messages, conversations, memoryRecords (with vector index), executionAgents, codingProjects, codingSessions, codingEvents, codingPendingInputs, automations, drafts, consolidationRuns, usageRecords, settings, and messageDedup.",
+      "parent": "Persistence Layer (Convex)",
+      "page_notes": [
+        {
+          "content": "Inventory every current table and index, including codingPreferences, agentLogs, memoryEvents, and automationRuns when present. Describe lifecycle, relationships, validators, and indexes without inventing foreign-key guarantees."
+        }
+      ]
+    },
+    {
+      "title": "Usage Tracking & Cost Accounting",
+      "purpose": "The usageRecords table, how every LLM call (dispatcher, execution, extract, consolidation phases, proactive, coding) logs tokens and cost, and the billingMode (api vs codex-subscription) distinction.",
+      "parent": "Persistence Layer (Convex)",
+      "page_notes": [
+        {
+          "content": "Trace actual usage-write call sites. Explain tokens, provider, model, runtime, operation categories, calculated versus unavailable cost, and billingMode without fabricating pricing or subscription costs."
+        }
+      ]
+    },
+    {
+      "title": "Operations Dashboard",
+      "purpose": "The React/Vite debug dashboard: panels for agents, memory, automations, connections, consolidation, events, settings, and the changelog drawer. WebSocket live updates.",
+      "page_notes": [
+        {
+          "content": "Describe the dashboard as a local operational/debug surface. Cover its Convex queries, server endpoints, WebSocket events, health and usage views, and local security assumptions."
+        }
+      ]
+    },
+    {
+      "title": "Dashboard Panels & Components",
+      "purpose": "Each panel in the debug UI: DashboardPanel, AgentsPanel, MemoryPanel (with graph view), AutomationsPanel, ConnectionsPanel, ConsolidationPanel, EventsPanel, SettingsPanel, and ChangelogDrawer.",
+      "parent": "Operations Dashboard",
+      "page_notes": [
+        {
+          "content": "Map each existing panel to its React component, data sources, actions, loading/empty/error states, and live-update behavior. Do not document removed or mocked UI."
+        }
+      ]
+    },
+    {
+      "title": "Real-time Events & Broadcast",
+      "purpose": "The WebSocket broadcast system (server/broadcast.ts), event types (agent_spawned, agent_stale, automation_started, consolidation_phase, etc.), and how the dashboard subscribes via useSocket.",
+      "parent": "Operations Dashboard",
+      "page_notes": [
+        {
+          "content": "Use server/broadcast.ts and the dashboard socket hook/types. Map event producers and consumers, reconnect behavior, fake payload examples, and durable Convex state versus ephemeral socket events."
+        }
+      ]
+    },
+    {
+      "title": "Skills & Agent Toolkits",
+      "purpose": "Overview of the .agents/skills and skills/ directories: reusable skill definitions for Convex patterns, the photon-spectrum skill injected into coding workspaces, and the upgrade-daniel skill.",
+      "page_notes": [
+        {
+          "content": "Inventory the current .agents/skills and skills trees. Distinguish repository-development guidance, workspace-injected skills, and runtime integrations, and explain how the upgrade skill is invoked."
+        }
+      ]
+    },
+    {
+      "title": "Photon Spectrum Skill",
+      "purpose": "The photon-spectrum skill injected into every coding workspace: references (spectrum-basics, webhook-patterns, photon-llms), templates (basic-webhook, convex-handler, nextjs-api-route), and the fetch-photon-docs script.",
+      "parent": "Skills & Agent Toolkits",
+      "page_notes": [
+        {
+          "content": "Describe the exact injection/copy lifecycle, reference documents, templates, and fetch script. Explain intended template usage and refreshed-doc caching without implying the skill runs production transport."
+        }
+      ]
+    }
+  ]
+}
