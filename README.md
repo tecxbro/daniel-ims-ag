@@ -1,5 +1,7 @@
 # Daniel
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/tecxbro/daniel-ims-ag)
+
 Daniel is a self-hosted personal agent that lives in iMessage. It can run on
 either a Claude Code subscription through the Claude Agent SDK or a
 Codex/ChatGPT subscription through the local Codex app-server runtime.
