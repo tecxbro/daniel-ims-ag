@@ -1,0 +1,11 @@
+{
+  "projectName": "Daniel",
+  "packageName": "daniel",
+  "version": "0.1.0",
+  "repositorySlug": "tecxbro/daniel-ims-ag",
+  "canonicalRepository": "https://github.com/tecxbro/daniel-ims-ag.git",
+  "upgradeCommand": "/upgrade-daniel",
+  "defaultConfigDirectory": ".daniel",
+  "defaultUserId": "daniel-default",
+  "defaultBranch": "main"
+}
