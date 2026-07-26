@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/daniel.gif" alt="Daniel mascot" width="220" />
+  <img src="assets/daniel.png" alt="Daniel portrait" width="220" />
 </p>
 
 # Daniel
