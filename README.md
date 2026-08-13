@@ -71,9 +71,10 @@ coding state, settings, image references, and usage.
 ```
 
 The dispatcher does not receive every powerful tool. It interprets the
-conversation, recalls relevant memory, and spawns a worker when the task needs
-web access, files, integrations, browser actions, or deeper execution. That
-separation keeps the main conversation responsive and limits tool scope.
+conversation, recalls relevant memory, and answers stable questions itself.
+It spawns a worker only when the task needs a live lookup, files, integrations,
+browser actions, or deeper execution. That separation keeps the main
+conversation responsive and limits tool scope.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the detailed runtime and data-flow
 model.

@@ -6,6 +6,9 @@ updates.
 
 ## Unreleased
 
+- Dispatcher now answers stable questions itself and only spawns a web/tool
+  worker when the request needs a live lookup or a real-world action.
+
 ## 0.1.0 — 2026-07-25
 
 - Initial Daniel release.
