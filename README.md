@@ -20,8 +20,9 @@ automations, integrations, coding workspaces, browser controls, and usage.
   small while delegated workers receive the tools needed for each task.
 - **Coding agents** with managed workspaces, plan/build/debug modes, pending
   questions, follow-up turns, and persisted coding events.
-- **Tiered memory** with short-, long-, and permanent-memory records, semantic
-  recall, extraction, decay, cleanup, and adversarial consolidation.
+- **Long-term semantic memory** through SuperMemory, with automatic profile
+  hydration, relevant recall, durable turn capture, exact updates, and
+  confirmed forgetting.
 - **Image understanding and retention** across the dispatcher and execution
   workers, with size/MIME validation and configurable cleanup.
 - **Scheduled automations** with timezone-aware cron evaluation and proactive
@@ -34,10 +35,11 @@ automations, integrations, coding workspaces, browser controls, and usage.
   Slack, GitHub, Linear, Notion, HubSpot, Discord, and more.
 - **Optional local browser use** through a Patchright-backed Chrome profile
   with local-only routes, explicit enablement, and manual login handoff.
-- **Persistent Convex state** for messages, settings, memory, usage, coding
-  sessions, automations, drafts, and execution status.
-- **Operations dashboard** for live health, usage, agents, automations, memory,
-  events, consolidation, connections, browser controls, and settings.
+- **Persistent Convex state** for messages, settings, memory synchronization,
+  usage, coding sessions, automations, drafts, and execution status.
+- **Operations dashboard** for live health, usage, agents, automations,
+  SuperMemory profiles and documents, synchronization jobs, connections,
+  browser controls, and settings.
 - **Upgrade and rollback workflows** through `/upgrade-daniel`, including
   previews, conflict detection, rollback branches/tags, merge, cherry-pick,
   optional rebase, breaking-change discovery, and validation.
@@ -57,17 +59,15 @@ Photon Spectrum SDK
    │
    ▼
 Interaction agent (dispatcher)
-   ├── memory recall / writes
+   ├── SuperMemory profile hydration / recall
    ├── settings and self-tools
    ├── automation and draft tools
    ├── execution workers + scoped integrations
    └── coding worker + managed workspace
             │
-            ▼
-       Claude or Codex
-
-Convex persists conversations, memory, agents, automations, drafts,
-coding state, settings, image references, and usage.
+            ├── Claude or Codex
+            ├── Convex: application + synchronization state
+            └── SuperMemory: long-term semantic memory
 ```
 
 The dispatcher does not receive every powerful tool. It interprets the
@@ -87,13 +87,14 @@ model.
 | Claude Code or Codex CLI | Agent runtime and subscription authentication | Yes, choose one |
 | Photon Spectrum | iMessage transport | Yes for iMessage |
 | Convex | Persistent data and realtime dashboard state | Yes |
+| SuperMemory | Long-term semantic memory and user profiles | Yes |
 | Composio | Hosted integrations and proactive email webhooks | Optional |
 | ngrok or another public URL | Composio webhook delivery when no stable URL exists | Optional |
 | Chrome/Chromium via Patchright | Local visual/login browser workflows | Optional |
 
 Subscription authentication means Daniel does not require an Anthropic or
-OpenAI API key for its main agent runtime. Provider API keys remain optional
-for embeddings or other explicitly configured services.
+OpenAI API key for its main agent runtime. `SUPERMEMORY_API_KEY` is separate
+and remains server-only.
 
 ## Quickstart
 
@@ -124,7 +125,7 @@ The setup flow:
 2. Selects Claude or Codex and its model settings.
 3. Collects Photon credentials.
 4. Creates or reuses a Convex deployment and generates Convex clients.
-5. Configures optional embeddings, integrations, public URL, and browser use.
+5. Configures SuperMemory, integrations, public URL, and browser use.
 6. Runs readiness checks without committing local secrets.
 
 After startup:
@@ -172,9 +173,12 @@ Inbound processing:
 4. Supported attachments are downloaded with size and MIME limits.
 5. Images are stored in Convex and converted to runtime-specific content
    blocks.
-6. The interaction agent recalls memory, responds directly, or spawns a
-   worker.
-7. The final answer is sent through Spectrum and persisted.
+6. In `shadow` or `supermemory` read mode, Daniel automatically hydrates the
+   user's SuperMemory profile and relevant memories before the interaction
+   agent responds or spawns a worker.
+7. The final answer is sent through Spectrum and persisted in Convex.
+8. A durable Convex outbox job captures that completed user/assistant delta
+   for SuperMemory.
 
 `PHOTON_IMESSAGE_PHONE` optionally pins outbound direct messages to a
 dedicated line. `PHOTON_LLMS_URL` can cache current Photon documentation into
@@ -186,27 +190,68 @@ and integration guidance.
 
 ## Memory and Images
 
-Memory records are divided into short, long, and permanent tiers and labeled
-by segment, such as preference, identity, project, context, or correction.
-Daniel recalls before making claims about user-specific facts.
+Convex stores application state and synchronization state. SuperMemory stores
+and retrieves long-term semantic memory.
 
-Semantic recall tries providers in this order:
+The raw transcript and recent ten-message prompt history stay in Convex. Each
+memory owner has one SuperMemory container shared by all of their
+conversations. Daniel normalizes owner and conversation IDs, then derives
+private deterministic HMAC keys; raw phone numbers are never used in provider
+identifiers. In `shadow` or `supermemory` read mode, Daniel hydrates the static
+profile, recent/dynamic profile, and memories relevant to the current message
+before each normal turn.
 
-1. Voyage when `VOYAGE_API_KEY` is configured.
-2. OpenAI when `OPENAI_API_KEY` is configured.
-3. Local `Xenova/bge-large-en-v1.5` through Transformers.js.
-
-All providers produce vectors compatible with the Convex memory index.
-Without a paid provider, Daniel downloads the local model once and preloads it
-in the background.
-
-Consolidation uses a proposer, adversary, and judge pipeline to merge
-duplicates, resolve contradictions, and remove noise. Runs and intermediate
-reasoning are persisted for the dashboard.
+In `dual` or `supermemory` write mode, after a completed turn is delivered,
+Daniel writes one normalized user/assistant delta to the Convex
+`memorySyncJobs` outbox. The worker submits that job to SuperMemory and records
+retries, dead letters, and returned provider IDs. Explicit remembers use
+exact-memory creation, corrections use provider versions, and broad forget
+requests use a two-stage flow: preview candidate memories, persist their exact
+IDs in Convex, then forget only those IDs after confirmation.
 
 Inbound images can flow through both the interaction agent and spawned
-workers. Raw image bytes expire according to
-`DANIEL_IMAGE_RETENTION_DAYS` unless a memory record anchors them.
+workers. Ordinary images expire according to `DANIEL_IMAGE_RETENTION_DAYS`.
+Only explicitly durable images are uploaded to SuperMemory; pending or active
+`memoryImageAnchors` rows retain their Convex bytes. An anchor is released only
+after provider deletion is confirmed, after which normal cleanup may proceed.
+
+### Memory migration and rollback
+
+Read and write behavior is controlled independently:
+
+| Read mode | User-facing behavior |
+|---|---|
+| `convex` | Legacy Convex recall only. |
+| `shadow` | Legacy Convex recall remains user-facing while SuperMemory hydration is measured. |
+| `supermemory` | SuperMemory profile and search are user-facing; legacy fallback is allowed only when explicitly enabled during burn-in. |
+
+| Write mode | Capture behavior |
+|---|---|
+| `convex` | Legacy Convex memory writes only. |
+| `dual` | Legacy writes continue for rollback while completed turn deltas also enter the SuperMemory outbox. |
+| `supermemory` | SuperMemory capture and exact operations only; legacy semantic memory is frozen. |
+
+Legacy active memories are exported with checksums, created as exact
+SuperMemory memories, and reconciled through `memoryMigrationRows`; archived
+or pruned rows remain export-only. Historical transcript backfill is optional
+and disabled by default. After read cutover, `supermemory`/`dual` keeps the
+Convex fallback current during the seven-day burn-in. After write cutover,
+`supermemory`/`supermemory` freezes the legacy store: repair the provider or
+replay/reconcile outbox work instead of treating Convex as a current fallback.
+
+The legacy `memoryRecords`, `memoryEvents`, and `consolidationRuns` tables are
+retained read-only for 30 days after write cutover. Only after the retention
+and verification gates pass may decommissioning delete rows in that exact
+order, verify all three tables are empty, remove their functions, remove their
+schema definitions, regenerate Convex types, deploy, and finally delete the
+retired server files. After that point, rollback requires restoring the
+immutable export and reverting the decommission change; it is no longer a
+mode-only rollback.
+
+All SuperMemory SDK and HTTP calls stay inside the server-only adapter in
+`server/memory/supermemory/`. Browser, route, tool, and dashboard code must use
+that adapter or normalized server APIs and must never receive the provider API
+key.
 
 ## Automations and Proactive Work
 
@@ -292,8 +337,6 @@ configuration uses the `DANIEL_` namespace.
 | `DANIEL_CODEX_AUTH_HOME` | Alternate Codex credential directory |
 | `DANIEL_CLASSIFIER_MODEL` | Optional Claude proactive classifier model |
 | `DANIEL_CODEX_CLASSIFIER_MODEL` | Optional Codex proactive classifier model |
-| `DANIEL_ADVERSARY_MODEL` | Optional Claude consolidation adversary model |
-| `DANIEL_CODEX_ADVERSARY_MODEL` | Optional Codex consolidation adversary model |
 | `DANIEL_PROJECTS_ROOT` | Managed coding workspace root |
 | `DANIEL_USER_PHONE` | iMessage destination for proactive notices |
 | `DANIEL_BROWSER_*` | Optional local-browser configuration |
@@ -310,7 +353,12 @@ configuration uses the `DANIEL_` namespace.
 | `COMPOSIO_API_KEY` | External integrations |
 | `COMPOSIO_USER_ID` | Optional connection owner override |
 | `COMPOSIO_AUTO_WEBHOOK` | Automatic proactive webhook registration |
-| `VOYAGE_API_KEY` / `OPENAI_API_KEY` | Optional paid embeddings |
+| `SUPERMEMORY_API_KEY` | Server-only SuperMemory credential |
+| `DANIEL_MEMORY_ID_SALT` | Stable secret for private deterministic memory identifiers |
+| `DANIEL_MEMORY_READ_MODE` | `convex`, `shadow`, or `supermemory` |
+| `DANIEL_MEMORY_WRITE_MODE` | `convex`, `dual`, or `supermemory` |
+| `DANIEL_MEMORY_LEGACY_FALLBACK` | Temporary read fallback during migration burn-in |
+| `DANIEL_SUPERMEMORY_*` | Hydration, search, ingestion, and optional backfill settings |
 | `PUBLIC_URL` / `NGROK_DOMAIN` | Public integration webhook URL |
 | `PORT` | Local server port |
 | `GITHUB_TOKEN` | Optional authenticated changelog fetches |
@@ -352,7 +400,7 @@ earlier configuration namespaces.
 │   ├── coding/                  # Workspace and coding guidance
 │   ├── images/                  # Image validation and retention
 │   ├── integrations/            # Integration registry and loaders
-│   ├── memory/                  # Recall, extraction, cleanup, and types
+│   ├── memory/                  # Hydration, capture, sync, operations, and legacy migration code
 │   ├── prompts/                 # Shared Daniel voice policy
 │   └── runtimes/                # Claude/Codex adapters and protocol types
 ├── skills/photon-spectrum/      # Bundled Photon implementation skill
@@ -445,8 +493,9 @@ logs for Spectrum lifecycle and bridge readiness messages.
 
 ### Memory recall is slow on first boot
 
-Without Voyage or OpenAI keys, the local embedding model downloads once and
-then loads from cache. `npm run setup` can preload it before normal use.
+Check `DANIEL_MEMORY_READ_MODE`, `DANIEL_SUPERMEMORY_TIMEOUT_MS`, provider
+health, and the sync backlog. Hydration fails open, so a provider timeout
+should not prevent Daniel from replying.
 
 ### Dashboard is disconnected
 

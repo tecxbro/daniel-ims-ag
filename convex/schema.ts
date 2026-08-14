@@ -63,6 +63,148 @@ export default defineSchema({
       filterFields: ["lifecycle"],
     }),
 
+  memorySyncJobs: defineTable({
+    jobId: v.string(),
+    kind: v.union(
+      v.literal("conversation_turn"),
+      v.literal("explicit_memory"),
+      v.literal("image"),
+      v.literal("memory_update"),
+      v.literal("memory_forget"),
+    ),
+    ownerKey: v.string(),
+    containerTag: v.string(),
+    customId: v.optional(v.string()),
+    conversationId: v.optional(v.string()),
+    turnId: v.optional(v.string()),
+    payload: v.string(),
+    payloadHash: v.string(),
+    status: v.union(
+      v.literal("pending"),
+      v.literal("processing"),
+      v.literal("submitted"),
+      v.literal("completed"),
+      v.literal("failed"),
+      v.literal("dead_letter"),
+    ),
+    providerDocumentId: v.optional(v.string()),
+    providerMemoryIds: v.optional(v.array(v.string())),
+    attempts: v.number(),
+    nextAttemptAt: v.number(),
+    lastError: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_job_id", ["jobId"])
+    .index("by_status_next_attempt", ["status", "nextAttemptAt"])
+    .index("by_owner_key_and_status_and_updated_at", [
+      "ownerKey",
+      "status",
+      "updatedAt",
+    ])
+    .index("by_payload_hash", ["payloadHash"])
+    .index("by_turn_id", ["turnId"])
+    .index("by_custom_id", ["customId"]),
+
+  memoryImageAnchors: defineTable({
+    storageId: v.id("_storage"),
+    ownerKey: v.string(),
+    conversationId: v.optional(v.string()),
+    turnId: v.optional(v.string()),
+    customId: v.string(),
+    providerDocumentId: v.optional(v.string()),
+    status: v.union(
+      v.literal("pending"),
+      v.literal("active"),
+      v.literal("released"),
+    ),
+    reason: v.string(),
+    createdAt: v.number(),
+    releasedAt: v.optional(v.number()),
+  })
+    .index("by_storage_id", ["storageId"])
+    .index("by_custom_id", ["customId"])
+    .index("by_status", ["status"])
+    .index("by_owner_key_and_status", ["ownerKey", "status"]),
+
+  memoryMigrationRows: defineTable({
+    legacyMemoryId: v.string(),
+    ownerKey: v.string(),
+    containerTag: v.string(),
+    status: v.union(
+      v.literal("pending"),
+      v.literal("migrated"),
+      v.literal("failed"),
+      v.literal("skipped"),
+    ),
+    providerDocumentId: v.optional(v.string()),
+    providerMemoryId: v.optional(v.string()),
+    contentHash: v.string(),
+    lastError: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_legacy_memory_id", ["legacyMemoryId"])
+    .index("by_status", ["status"])
+    .index("by_owner_key_and_container_tag_and_status", [
+      "ownerKey",
+      "containerTag",
+      "status",
+    ]),
+
+  memoryPendingOperations: defineTable({
+    operationId: v.string(),
+    ownerKey: v.string(),
+    conversationId: v.string(),
+    type: v.union(v.literal("forget"), v.literal("update")),
+    providerMemoryIds: v.array(v.string()),
+    preview: v.string(),
+    status: v.union(
+      v.literal("pending"),
+      v.literal("confirmed"),
+      v.literal("completed"),
+      v.literal("cancelled"),
+      v.literal("expired"),
+    ),
+    createdAt: v.number(),
+    expiresAt: v.number(),
+    completedAt: v.optional(v.number()),
+  })
+    .index("by_operation_id", ["operationId"])
+    .index("by_conversation_status", ["conversationId", "status"]),
+
+  memoryProviderState: defineTable({
+    // "deployment" for global provider state, or a deterministic key for a
+    // per-container initialization record. Mutations enforce uniqueness.
+    stateKey: v.string(),
+    scope: v.union(v.literal("deployment"), v.literal("container")),
+    containerTag: v.optional(v.string()),
+    saltFingerprint: v.optional(v.string()),
+    initializedAt: v.optional(v.number()),
+    healthStatus: v.optional(
+      v.union(
+        v.literal("disabled"),
+        v.literal("unconfigured"),
+        v.literal("healthy"),
+        v.literal("degraded"),
+        v.literal("unavailable"),
+      ),
+    ),
+    lastSuccessfulSubmissionAt: v.optional(v.number()),
+    lastFailedSubmissionAt: v.optional(v.number()),
+    lastError: v.optional(v.string()),
+    readMode: v.optional(
+      v.union(v.literal("convex"), v.literal("shadow"), v.literal("supermemory")),
+    ),
+    writeMode: v.optional(
+      v.union(v.literal("convex"), v.literal("dual"), v.literal("supermemory")),
+    ),
+    lastWorkerActivityAt: v.optional(v.number()),
+    updatedAt: v.number(),
+  })
+    .index("by_state_key", ["stateKey"])
+    .index("by_container_tag", ["containerTag"]),
+
   executionAgents: defineTable({
     agentId: v.string(),
     conversationId: v.optional(v.string()),

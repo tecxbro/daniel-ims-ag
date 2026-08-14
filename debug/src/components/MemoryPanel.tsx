@@ -1,338 +1,466 @@
-import { useState } from "react";
-import { useQuery } from "convex/react";
-import { api } from "../../../convex/_generated/api.js";
-import type { Id } from "../../../convex/_generated/dataModel.js";
-import MemoryGraphView from "./MemoryGraphView.js";
-import { EmbeddingBanner } from "./EmbeddingBanner.js";
+import { useCallback, useEffect, useId, useState, type FormEvent } from "react";
+import MemorySourceExplorer, {
+  type MemoryExplorerItem,
+  type MemoryVersionSummary,
+} from "./MemoryGraphView.js";
+import { SupermemoryStatusBanner } from "./EmbeddingBanner.js";
 import {
   EmptyState,
   HeaderPill,
   PanelPage,
-  mutedTextClass,
   panelCardClass,
   subtlePanelClass,
 } from "./PanelPrimitives.js";
 
-type Tier = "all" | "short" | "long" | "permanent";
-type Segment = "all" | "identity" | "preference" | "relationship" | "project" | "knowledge" | "context";
-type ViewMode = "table" | "graph";
+type MemoryView = "profile" | "search" | "documents";
+type UnknownRecord = Record<string, unknown>;
 
-const TIER_OPTIONS: { value: Tier; label: string }[] = [
-  { value: "all", label: "All" },
-  { value: "short", label: "Short" },
-  { value: "long", label: "Long" },
-  { value: "permanent", label: "Permanent" },
-];
-
-const SEGMENT_OPTIONS: Segment[] = [
-  "all",
-  "identity",
-  "preference",
-  "relationship",
-  "project",
-  "knowledge",
-  "context",
-];
-
-const TIER_BADGE: Record<string, { dark: string; light: string }> = {
-  short: {
-    dark: "text-sky-400 bg-sky-400/10 border-sky-500/20",
-    light: "text-sky-600 bg-sky-50 border-sky-200",
-  },
-  long: {
-    dark: "text-violet-400 bg-violet-400/10 border-violet-500/20",
-    light: "text-violet-600 bg-violet-50 border-violet-200",
-  },
-  permanent: {
-    dark: "text-amber-400 bg-amber-400/10 border-amber-500/20",
-    light: "text-amber-600 bg-amber-50 border-amber-200",
-  },
-};
-
-const SEGMENT_COLOR: Record<string, { dark: string; light: string }> = {
-  identity: { dark: "text-rose-400", light: "text-rose-600" },
-  preference: { dark: "text-teal-400", light: "text-teal-600" },
-  relationship: { dark: "text-pink-400", light: "text-pink-600" },
-  project: { dark: "text-orange-400", light: "text-orange-600" },
-  knowledge: { dark: "text-blue-400", light: "text-blue-600" },
-  context: { dark: "text-slate-400", light: "text-slate-500" },
-};
-
-function MemoryImageBadge({ storageId }: { storageId: string }) {
-  const url = useQuery(api.messages.getStorageUrl, {
-    storageId: storageId as Id<"_storage">,
-  });
-  if (!url) return <div className="w-12 h-12 bg-neutral-200 rounded" />;
-  return (
-    <a href={url} target="_blank" rel="noreferrer">
-      <img
-        src={url}
-        alt="image memory"
-        className="w-12 h-12 object-cover rounded border border-neutral-300"
-      />
-    </a>
-  );
+interface ProfileSnapshot {
+  stable: string[];
+  recent: string[];
+  relevant: MemoryExplorerItem[];
+  latencyMs?: number;
 }
 
+function record(value: unknown): UnknownRecord {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as UnknownRecord)
+    : {};
+}
+
+function text(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function numberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function timestamp(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const parsed = Date.parse(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return undefined;
+}
+
+function lines(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => (typeof entry === "string" ? entry.trim() : ""))
+      .filter(Boolean);
+  }
+  const single = text(value);
+  return single ? single.split("\n").map((line) => line.trim()).filter(Boolean) : [];
+}
+
+function history(value: unknown): MemoryVersionSummary[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const versions = value.map((entry) => {
+    const raw = record(entry);
+    return {
+      id: text(raw.id ?? raw.memoryId),
+      version: numberValue(raw.version) ?? text(raw.version),
+      content: text(raw.content ?? raw.text),
+      status: text(raw.status),
+      createdAt: timestamp(raw.createdAt),
+      updatedAt: timestamp(raw.updatedAt),
+    };
+  });
+  return versions.length > 0 ? versions : undefined;
+}
+
+function explorerItem(value: unknown, index: number, kind: "memory" | "document"): MemoryExplorerItem {
+  const raw = record(value);
+  const metadata = record(raw.metadata);
+  const id =
+    text(raw.id ?? raw.memoryId ?? raw.documentId ?? raw.providerDocumentId) ??
+    `${kind}:${index}`;
+  const forgotten =
+    raw.forgotten === true ||
+    metadata.forgotten === true ||
+    text(raw.status)?.toLowerCase() === "forgotten" ||
+    text(metadata.status)?.toLowerCase() === "forgotten" ||
+    Boolean(text(raw.forgetReason));
+  const currentValue =
+    raw.current ?? raw.isCurrent ?? raw.latest ?? raw.isLatest ?? metadata.current ?? metadata.isCurrent;
+  return {
+    id,
+    title: text(raw.title ?? raw.name ?? raw.filename),
+    content: text(raw.content ?? raw.text ?? raw.summary ?? raw.excerpt),
+    status: text(raw.status ?? raw.processingStatus),
+    current: typeof currentValue === "boolean" ? currentValue : forgotten ? false : undefined,
+    forgotten,
+    similarity: numberValue(raw.similarity ?? raw.score),
+    version:
+      numberValue(raw.version ?? metadata.version) ?? text(raw.version ?? metadata.version),
+    providerDocumentId: text(
+      raw.providerDocumentId ?? metadata.providerDocumentId ?? raw.documentId ?? (kind === "document" ? raw.id : undefined),
+    ),
+    providerMemoryId: text(
+      raw.providerMemoryId ?? metadata.providerMemoryId ?? raw.memoryId ?? (kind === "memory" ? raw.id : undefined),
+    ),
+    updatedAt: timestamp(raw.updatedAt),
+    metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+    history: history(raw.history ?? raw.versions ?? raw.versionHistory ?? metadata.history),
+  };
+}
+
+function normalizeProfile(value: unknown): ProfileSnapshot {
+  const raw = record(value);
+  const profile = record(raw.profile);
+  const relevantValues = raw.results ?? raw.memories ?? profile.memories;
+  return {
+    stable: lines(profile.static ?? raw.staticProfile ?? raw.static),
+    recent: lines(profile.dynamic ?? raw.dynamicProfile ?? raw.recentContext ?? raw.dynamic),
+    relevant: Array.isArray(relevantValues)
+      ? relevantValues.map((entry, index) => explorerItem(entry, index, "memory"))
+      : [],
+    latencyMs: numberValue(raw.latencyMs),
+  };
+}
+
+function normalizeList(value: unknown, kind: "memory" | "document"): MemoryExplorerItem[] {
+  const raw = record(value);
+  const candidates =
+    kind === "memory"
+      ? raw.results ?? raw.memories ?? raw.items ?? value
+      : raw.documents ?? raw.results ?? raw.items ?? value;
+  return Array.isArray(candidates)
+    ? candidates.map((entry, index) => explorerItem(entry, index, kind))
+    : [];
+}
+
+async function getJson(path: string, signal?: AbortSignal): Promise<unknown> {
+  const response = await fetch(path, { headers: { Accept: "application/json" }, signal });
+  if (!response.ok) throw new Error(`Request failed (${response.status})`);
+  return await response.json();
+}
+
+const VIEWS: { id: MemoryView; label: string }[] = [
+  { id: "profile", label: "Profile" },
+  { id: "search", label: "Search" },
+  { id: "documents", label: "Documents" },
+];
+
 export function MemoryPanel({ isDark }: { isDark: boolean }) {
-  const [viewMode, setViewMode] = useState<ViewMode>("table");
-  const [tierFilter, setTierFilter] = useState<Tier>("all");
-  const [segmentFilter, setSegmentFilter] = useState<Segment>("all");
-  const [search, setSearch] = useState("");
-  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [view, setView] = useState<MemoryView>("profile");
+  const [profile, setProfile] = useState<ProfileSnapshot | null>(null);
+  const [documents, setDocuments] = useState<MemoryExplorerItem[]>([]);
+  const [searchResults, setSearchResults] = useState<MemoryExplorerItem[]>([]);
+  const [query, setQuery] = useState("");
+  const [documentQuery, setDocumentQuery] = useState("");
+  const [loadingProfile, setLoadingProfile] = useState(true);
+  const [loadingDocuments, setLoadingDocuments] = useState(false);
+  const [searching, setSearching] = useState(false);
+  const [profileError, setProfileError] = useState<string | null>(null);
+  const [documentsError, setDocumentsError] = useState<string | null>(null);
+  const [documentsMessage, setDocumentsMessage] = useState("Enter a query to find source documents.");
+  const [searchMessage, setSearchMessage] = useState("Enter a question to search provider memory.");
+  const searchId = useId();
 
-  const records = useQuery(api.memoryRecords.list, {
-    tier: tierFilter !== "all" ? (tierFilter as any) : undefined,
-    lifecycle: "active",
-    limit: 500,
-  });
-
-  const allRecords = records ?? [];
-  const filtered = allRecords.filter((r: any) => {
-    if (segmentFilter !== "all" && r.segment !== segmentFilter) return false;
-    if (search.trim()) {
-      const q = search.toLowerCase();
-      return (
-        (r.content ?? "").toLowerCase().includes(q) ||
-        (r.memoryId ?? "").toLowerCase().includes(q) ||
-        (r.segment ?? "").toLowerCase().includes(q)
-      );
+  const loadProfile = useCallback(async (signal?: AbortSignal) => {
+    setLoadingProfile(true);
+    try {
+      setProfile(normalizeProfile(await getJson("/api/memory/profile", signal)));
+      setProfileError(null);
+    } catch (cause) {
+      if (!signal?.aborted) setProfileError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      if (!signal?.aborted) setLoadingProfile(false);
     }
-    return true;
-  });
+  }, []);
 
-  const btnActive = isDark
+  const loadDocuments = useCallback(async (requestedQuery?: string, signal?: AbortSignal) => {
+    const normalizedQuery = (requestedQuery ?? documentQuery).trim();
+    if (!normalizedQuery) {
+      setDocumentsMessage("Enter a query before searching documents.");
+      return;
+    }
+    setLoadingDocuments(true);
+    try {
+      const params = new URLSearchParams({ q: normalizedQuery, limit: "50" });
+      const results = normalizeList(
+        await getJson(`/api/memory/documents?${params.toString()}`, signal),
+        "document",
+      );
+      setDocuments(results);
+      setDocumentsError(null);
+      setDocumentsMessage(`${results.length} ${results.length === 1 ? "document" : "documents"} found.`);
+    } catch (cause) {
+      if (!signal?.aborted) {
+        const message = cause instanceof Error ? cause.message : String(cause);
+        setDocumentsError(message);
+        setDocumentsMessage(message);
+      }
+    } finally {
+      if (!signal?.aborted) setLoadingDocuments(false);
+    }
+  }, [documentQuery]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadProfile(controller.signal);
+    return () => controller.abort();
+  }, [loadProfile]);
+
+  async function submitSearch(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const normalizedQuery = query.trim();
+    if (!normalizedQuery) {
+      setSearchMessage("Enter a question before searching.");
+      return;
+    }
+    setSearching(true);
+    setSearchMessage("Searching provider memory…");
+    try {
+      const response = await fetch("/api/memory/search", {
+        method: "POST",
+        headers: { Accept: "application/json", "Content-Type": "application/json" },
+        body: JSON.stringify({ q: normalizedQuery, searchMode: "hybrid" }),
+      });
+      if (!response.ok) throw new Error(`Search failed (${response.status})`);
+      const results = normalizeList(await response.json(), "memory");
+      setSearchResults(results);
+      setSearchMessage(`${results.length} ${results.length === 1 ? "result" : "results"} found.`);
+    } catch (cause) {
+      setSearchResults([]);
+      setSearchMessage(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  function submitDocumentSearch(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setDocumentsError(null);
+    void loadDocuments(documentQuery);
+  }
+
+  const profileCount = (profile?.stable.length ?? 0) + (profile?.recent.length ?? 0);
+  const displayedCount =
+    view === "profile" ? profileCount : view === "search" ? searchResults.length : documents.length;
+  const activeButton = isDark
     ? "bg-zinc-100 text-zinc-950 shadow-sm"
     : "bg-white text-zinc-950 shadow-sm";
-  const btnInactive = isDark
-    ? "text-zinc-400 hover:bg-white/5 hover:text-zinc-200"
-    : "text-zinc-500 hover:bg-white/70 hover:text-zinc-800";
+  const inactiveButton = isDark
+    ? "text-zinc-400 hover:bg-white/5 hover:text-zinc-100"
+    : "text-zinc-600 hover:bg-white hover:text-zinc-950";
 
   return (
     <PanelPage
-      eyebrow="Store"
+      eyebrow="Supermemory"
       title="Memory"
-      description="Search, filter, and inspect the active memory store."
-      stat={<HeaderPill isDark={isDark}>{filtered.length}/{allRecords.length}</HeaderPill>}
-      maxWidth={viewMode === "graph" ? "max-w-none" : "max-w-[1040px]"}
+      description="Inspect the current profile, semantic results, source documents, and provider fields returned by the server."
+      stat={<HeaderPill isDark={isDark}>{displayedCount} shown</HeaderPill>}
+      maxWidth="max-w-[1120px]"
     >
-      <EmbeddingBanner isDark={isDark} />
-      <div className={panelCardClass(isDark, "flex flex-wrap items-center gap-2 px-3 py-3")}>
+      <SupermemoryStatusBanner isDark={isDark} />
+
+      <div className={panelCardClass(isDark, "flex flex-wrap items-center justify-between gap-3 px-3 py-3")}>
         <div
+          role="tablist"
+          aria-label="Memory explorer views"
           className={`segmented-control flex items-center rounded-2xl border p-1 ${
             isDark ? "border-white/10 bg-[#17171a]" : "border-zinc-200 bg-zinc-100"
           }`}
         >
-          {(["table", "graph"] as const).map((mode) => (
+          {VIEWS.map((item) => (
             <button
-              key={mode}
-              onClick={() => setViewMode(mode)}
-              className={`segmented-button px-2.5 py-1 text-xs capitalize ${
-                viewMode === mode ? btnActive : btnInactive
-              } rounded-xl`}
+              key={item.id}
+              type="button"
+              role="tab"
+              aria-selected={view === item.id}
+              aria-controls={`memory-panel-${item.id}`}
+              onClick={() => setView(item.id)}
+              className={`min-h-8 rounded-xl px-3 text-xs outline-none transition focus-visible:ring-2 focus-visible:ring-emerald-500 ${
+                view === item.id ? activeButton : inactiveButton
+              }`}
             >
-              {mode}
+              {item.label}
             </button>
           ))}
         </div>
-
-        {viewMode === "table" && (
-          <>
-            <div className="flex items-center gap-1">
-              {TIER_OPTIONS.map((t) => (
-                <button
-                  key={t.value}
-                  onClick={() => setTierFilter(t.value)}
-                  className={`segmented-button rounded-xl px-2.5 py-1 text-xs ${
-                    tierFilter === t.value ? btnActive : btnInactive
-                  }`}
-                >
-                  {t.label}
-                </button>
-              ))}
-            </div>
-
-            <select
-              value={segmentFilter}
-              onChange={(e) => setSegmentFilter(e.target.value as Segment)}
-              className={`rounded-xl border px-2.5 py-1.5 text-xs focus:outline-none ${
-                isDark
-                  ? "border-white/10 bg-[#17171a] text-zinc-300"
-                  : "border-zinc-200 bg-white text-zinc-700"
-              }`}
-            >
-              {SEGMENT_OPTIONS.map((s) => (
-                <option key={s} value={s}>
-                  {s === "all" ? "All segments" : s}
-                </option>
-              ))}
-            </select>
-
-            <input
-              type="text"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search memories…"
-              className={`min-w-[200px] flex-1 rounded-xl border px-3 py-1.5 text-sm focus:outline-none ${
-                isDark
-                  ? "border-white/10 bg-[#17171a] text-zinc-300 placeholder:text-zinc-600"
-                  : "border-zinc-200 bg-white text-zinc-700 placeholder:text-zinc-400"
-              }`}
-            />
-          </>
-        )}
+        <p className={`text-xs ${isDark ? "text-zinc-500" : "text-zinc-500"}`}>
+          Provider identifiers are shown only for local debugging.
+        </p>
       </div>
 
-      {viewMode === "graph" && (
-        <div className={panelCardClass(isDark, "h-[calc(100vh-190px)] min-h-[520px] overflow-hidden")}>
-          <MemoryGraphView records={allRecords as any} isDark={isDark} />
-        </div>
-      )}
-
-      {viewMode === "table" && (
-        <div className={panelCardClass(isDark, "overflow-hidden")}>
-          {records === undefined ? (
-            <div className="p-5 space-y-3">
-              {Array.from({ length: 6 }, (_, i) => (
-                <div
-                  key={i}
-                  className={subtlePanelClass(isDark, "h-14 shimmer")}
-                />
-              ))}
+      {view === "profile" && (
+        <div id="memory-panel-profile" role="tabpanel" className="space-y-4">
+          {loadingProfile ? (
+            <div className="grid gap-4 lg:grid-cols-2" aria-label="Loading profile">
+              <div className={subtlePanelClass(isDark, "h-40 shimmer")} />
+              <div className={subtlePanelClass(isDark, "h-40 shimmer")} />
             </div>
-          ) : filtered.length === 0 ? (
+          ) : profileError ? (
+            <ErrorState message={`Profile unavailable: ${profileError}`} onRetry={() => void loadProfile()} isDark={isDark} />
+          ) : profile && profileCount === 0 ? (
             <EmptyState isDark={isDark}>
-              No records match your filters
+              No profile facts yet. Supermemory will build stable and recent context from completed conversations.
             </EmptyState>
           ) : (
-            <div
-              className={`divide-y ${
-                isDark ? "divide-white/10" : "divide-zinc-100"
-              }`}
-            >
-              {filtered.map((r: any) => {
-                const isExpanded = expandedId === r.memoryId;
-                const tierBadge = TIER_BADGE[r.tier] ?? { dark: "", light: "" };
-                const segColor =
-                  SEGMENT_COLOR[r.segment] ?? {
-                    dark: "text-slate-400",
-                    light: "text-slate-500",
-                  };
-
-                return (
-                  <div
-                    key={r.memoryId}
-                    className={`px-5 py-3 cursor-pointer transition-colors ${
-                      isDark ? "hover:bg-white/5" : "hover:bg-zinc-50"
-                    }`}
-                    onClick={() =>
-                      setExpandedId(isExpanded ? null : r.memoryId)
-                    }
-                  >
-                    <div className="flex items-center gap-2 mb-1">
-                      <span
-                        className={`text-[10px] px-1.5 py-0.5 rounded border font-medium ${
-                          isDark ? tierBadge.dark : tierBadge.light
-                        }`}
-                      >
-                        {r.tier}
-                      </span>
-                      <span
-                        className={`text-[10px] font-semibold ${
-                          isDark ? segColor.dark : segColor.light
-                        }`}
-                      >
-                        {r.segment}
-                      </span>
-                      <span
-                        className={`text-[10px] mono ml-auto ${
-                          mutedTextClass(isDark)
-                        }`}
-                      >
-                        {(r.importance ?? 0).toFixed(2)}
-                      </span>
-                      <span
-                        className={`text-[10px] mono ${
-                          isDark ? "text-zinc-600" : "text-zinc-300"
-                        }`}
-                      >
-                        {r.accessCount ?? 0}x
-                      </span>
-                    </div>
-
-                    <p
-                      className={`text-sm ${
-                        isExpanded ? "" : "line-clamp-2"
-                      } ${isDark ? "text-slate-300" : "text-slate-700"}`}
-                    >
-                      {r.content}
-                    </p>
-
-                    {Array.isArray(r.imageStorageIds) && r.imageStorageIds.length > 0 && (
-                      <div className="flex gap-1 mt-1">
-                        {r.imageStorageIds.map((id: string) => (
-                          <MemoryImageBadge key={id} storageId={id} />
-                        ))}
-                      </div>
-                    )}
-
-                    {isExpanded && (
-                      <div className="mt-3 space-y-2 text-xs slide-down">
-                        <div
-                          className={`grid grid-cols-2 gap-x-6 gap-y-1 ${
-                            mutedTextClass(isDark)
-                          }`}
-                        >
-                          <div>
-                            ID:{" "}
-                            <span
-                              className={`mono ${
-                                isDark ? "text-slate-400" : "text-slate-600"
-                              }`}
-                            >
-                              {r.memoryId}
-                            </span>
-                          </div>
-                          <div>
-                            Decay:{" "}
-                            <span
-                              className={`mono ${
-                                isDark ? "text-slate-400" : "text-slate-600"
-                              }`}
-                            >
-                              {r.decayRate}
-                            </span>
-                          </div>
-                          {r.sourceTurn && (
-                            <div>
-                              Turn:{" "}
-                              <span
-                                className={`mono ${
-                                  isDark ? "text-slate-400" : "text-slate-600"
-                                }`}
-                              >
-                                {r.sourceTurn}
-                              </span>
-                            </div>
-                          )}
-                          <div>
-                            Last accessed:{" "}
-                            <span
-                              className={isDark ? "text-slate-400" : "text-slate-600"}
-                            >
-                              {new Date(r.lastAccessedAt).toLocaleString()}
-                            </span>
-                          </div>
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                );
-              })}
+            <div className="grid gap-4 lg:grid-cols-2">
+              <ProfileSection title="Static profile" lines={profile?.stable ?? []} empty="No static profile facts." isDark={isDark} />
+              <ProfileSection title="Recent context" lines={profile?.recent ?? []} empty="No recent context." isDark={isDark} />
             </div>
+          )}
+
+          {profile && profile.relevant.length > 0 && (
+            <section className={panelCardClass(isDark, "overflow-hidden")}>
+              <div className={`border-b px-5 py-3 ${isDark ? "border-white/10" : "border-zinc-200"}`}>
+                <h2 className={`text-sm font-semibold ${isDark ? "text-zinc-100" : "text-zinc-950"}`}>Profile-linked results</h2>
+                <p className={`mt-0.5 text-xs ${isDark ? "text-zinc-500" : "text-zinc-500"}`}>
+                  Returned with the profile{profile.latencyMs !== undefined ? ` in ${Math.round(profile.latencyMs)} ms` : ""}.
+                </p>
+              </div>
+              <MemorySourceExplorer items={profile.relevant} isDark={isDark} emptyMessage="No linked results." />
+            </section>
           )}
         </div>
       )}
+
+      {view === "search" && (
+        <div id="memory-panel-search" role="tabpanel" className="space-y-4">
+          <form onSubmit={submitSearch} role="search" className={panelCardClass(isDark, "p-4")}>
+            <label htmlFor={searchId} className={`block text-xs font-medium ${isDark ? "text-zinc-300" : "text-zinc-700"}`}>
+              Semantic memory search
+            </label>
+            <div className="mt-2 flex flex-col gap-2 sm:flex-row">
+              <input
+                id={searchId}
+                type="search"
+                value={query}
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="What does the user prefer for launch briefs?"
+                className={`min-h-10 min-w-0 flex-1 rounded-xl border px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 ${
+                  isDark
+                    ? "border-white/10 bg-[#17171a] text-zinc-100 placeholder:text-zinc-600"
+                    : "border-zinc-200 bg-white text-zinc-900 placeholder:text-zinc-400"
+                }`}
+              />
+              <button
+                type="submit"
+                aria-busy={searching}
+                className={`min-h-10 rounded-xl px-4 text-sm font-medium outline-none transition focus-visible:ring-2 focus-visible:ring-emerald-500 ${
+                  isDark ? "bg-zinc-100 text-zinc-950 hover:bg-white" : "bg-zinc-950 text-white hover:bg-zinc-800"
+                }`}
+              >
+                {searching ? "Searching…" : "Search"}
+              </button>
+            </div>
+            <p role="status" aria-live="polite" className={`mt-2 text-xs ${isDark ? "text-zinc-500" : "text-zinc-500"}`}>
+              {searchMessage}
+            </p>
+          </form>
+          <section className={panelCardClass(isDark, "overflow-hidden")} aria-label="Search results">
+            <MemorySourceExplorer
+              items={searchResults}
+              isDark={isDark}
+              emptyMessage="No search results to show."
+            />
+          </section>
+        </div>
+      )}
+
+      {view === "documents" && (
+        <div id="memory-panel-documents" role="tabpanel">
+          <section className={panelCardClass(isDark, "overflow-hidden")} aria-label="Source documents">
+            <div className={`border-b px-5 py-3 ${isDark ? "border-white/10" : "border-zinc-200"}`}>
+              <div>
+                <h2 className={`text-sm font-semibold ${isDark ? "text-zinc-100" : "text-zinc-950"}`}>Source documents</h2>
+                <p className={`mt-0.5 text-xs ${isDark ? "text-zinc-500" : "text-zinc-500"}`}>
+                  Semantic document matches and source metadata. Processing, version, and history appear only when the server supplies them.
+                </p>
+              </div>
+              <form onSubmit={submitDocumentSearch} role="search" className="mt-3 flex flex-col gap-2 sm:flex-row">
+                <label htmlFor={`${searchId}-documents`} className="sr-only">Search source documents</label>
+                <input
+                  id={`${searchId}-documents`}
+                  type="search"
+                  value={documentQuery}
+                  onChange={(event) => setDocumentQuery(event.target.value)}
+                  placeholder="Search source documents"
+                  className={`min-h-10 min-w-0 flex-1 rounded-xl border px-3 text-sm outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 ${
+                    isDark
+                      ? "border-white/10 bg-[#17171a] text-zinc-100 placeholder:text-zinc-600"
+                      : "border-zinc-200 bg-white text-zinc-900 placeholder:text-zinc-400"
+                  }`}
+                />
+                <button
+                  type="submit"
+                  aria-busy={loadingDocuments}
+                  className={`min-h-10 rounded-xl px-4 text-sm font-medium outline-none transition focus-visible:ring-2 focus-visible:ring-emerald-500 ${
+                    isDark ? "bg-zinc-100 text-zinc-950 hover:bg-white" : "bg-zinc-950 text-white hover:bg-zinc-800"
+                  }`}
+                >
+                  {loadingDocuments ? "Searching…" : "Search documents"}
+                </button>
+              </form>
+              <p role="status" aria-live="polite" className={`mt-2 text-xs ${isDark ? "text-zinc-500" : "text-zinc-500"}`}>
+                {documentsMessage}
+              </p>
+            </div>
+            {loadingDocuments ? (
+              <div className="space-y-3 p-5" aria-label="Loading documents">
+                <div className={subtlePanelClass(isDark, "h-20 shimmer")} />
+                <div className={subtlePanelClass(isDark, "h-20 shimmer")} />
+              </div>
+            ) : documentsError ? (
+              <ErrorState message={`Documents unavailable: ${documentsError}`} onRetry={() => void loadDocuments(documentQuery)} isDark={isDark} />
+            ) : (
+              <MemorySourceExplorer items={documents} isDark={isDark} emptyMessage="No source documents yet." />
+            )}
+          </section>
+        </div>
+      )}
     </PanelPage>
+  );
+}
+
+function ProfileSection({
+  title,
+  lines: profileLines,
+  empty,
+  isDark,
+}: {
+  title: string;
+  lines: string[];
+  empty: string;
+  isDark: boolean;
+}) {
+  return (
+    <section className={panelCardClass(isDark, "p-5")}>
+      <h2 className={`text-sm font-semibold ${isDark ? "text-zinc-100" : "text-zinc-950"}`}>{title}</h2>
+      {profileLines.length === 0 ? (
+        <p className={`mt-3 text-sm ${isDark ? "text-zinc-500" : "text-zinc-500"}`}>{empty}</p>
+      ) : (
+        <ul className="mt-3 space-y-2">
+          {profileLines.map((line, index) => (
+            <li key={`${line}:${index}`} dir="auto" className={`rounded-xl px-3 py-2 text-sm leading-relaxed ${isDark ? "bg-white/5 text-zinc-300" : "bg-zinc-50 text-zinc-700"}`}>
+              {line}
+            </li>
+          ))}
+        </ul>
+      )}
+    </section>
+  );
+}
+
+function ErrorState({ message, onRetry, isDark }: { message: string; onRetry: () => void; isDark: boolean }) {
+  return (
+    <div role="alert" className={panelCardClass(isDark, "flex flex-wrap items-center justify-between gap-3 p-5")}>
+      <p className="break-words text-sm text-rose-400">{message}</p>
+      <button
+        type="button"
+        onClick={onRetry}
+        className={`min-h-9 rounded-xl border px-3 text-xs outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 ${
+          isDark ? "border-white/10 bg-white/5 text-zinc-300" : "border-zinc-200 bg-white text-zinc-700"
+        }`}
+      >
+        Try again
+      </button>
+    </div>
   );
 }

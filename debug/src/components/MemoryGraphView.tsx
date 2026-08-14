@@ -1,166 +1,197 @@
-import { useMemo, useRef } from "react";
-import ForceGraph2D from "react-force-graph-2d";
+export interface MemoryVersionSummary {
+  id?: string;
+  version?: number | string;
+  content?: string;
+  status?: string;
+  createdAt?: number;
+  updatedAt?: number;
+}
 
-type MemoryRecord = {
-  memoryId: string;
-  content: string;
-  tier: string;
-  segment: string;
-  importance: number;
-};
-
-type HubNode = {
+export interface MemoryExplorerItem {
   id: string;
-  kind: "hub";
-  label: string;
-  memoryCount: number;
-  dominantSegment: string;
-};
-
-type MemoryNode = {
-  id: string;
-  kind: "memory";
-  label: string;
-  content: string;
-  segment: string;
-  tier: string;
-  importance: number;
-};
-
-type GraphNode = HubNode | MemoryNode;
-
-const SEGMENT_COLORS: Record<string, string> = {
-  identity: "#f43f5e",
-  preference: "#14b8a6",
-  relationship: "#ec4899",
-  project: "#f97316",
-  knowledge: "#3b82f6",
-  context: "#64748b",
-};
-const DEFAULT_COLOR = "#94a3b8";
-
-function segmentColor(segment: string): string {
-  return SEGMENT_COLORS[segment] ?? DEFAULT_COLOR;
+  title?: string;
+  content?: string;
+  status?: string;
+  current?: boolean;
+  forgotten?: boolean;
+  similarity?: number;
+  version?: number | string;
+  providerDocumentId?: string;
+  providerMemoryId?: string;
+  updatedAt?: number;
+  metadata?: Record<string, unknown>;
+  history?: MemoryVersionSummary[];
 }
 
-function humanizeSegment(s: string): string {
-  return s.charAt(0).toUpperCase() + s.slice(1);
+function displayMetadata(metadata: Record<string, unknown> | undefined): string[] {
+  if (!metadata) return [];
+  return Object.entries(metadata)
+    .filter(([, value]) => value !== undefined && value !== null && typeof value !== "object")
+    .slice(0, 8)
+    .map(([key, value]) => `${key}: ${String(value)}`);
 }
 
-function buildGraph(records: MemoryRecord[]) {
-  const bySegment = new Map<string, MemoryRecord[]>();
-  for (const r of records) {
-    const seg = r.segment || "unknown";
-    const list = bySegment.get(seg);
-    if (list) list.push(r);
-    else bySegment.set(seg, [r]);
-  }
-
-  const nodes: GraphNode[] = [];
-  const links: { source: string; target: string }[] = [];
-
-  for (const [segment, members] of bySegment) {
-    const hubId = `hub:${segment}`;
-    nodes.push({
-      id: hubId,
-      kind: "hub",
-      label: humanizeSegment(segment),
-      memoryCount: members.length,
-      dominantSegment: segment,
-    });
-    for (const m of members) {
-      nodes.push({
-        id: m.memoryId,
-        kind: "memory",
-        label: m.content.slice(0, 50) + (m.content.length > 50 ? "…" : ""),
-        content: m.content,
-        segment: m.segment,
-        tier: m.tier,
-        importance: m.importance,
-      });
-      links.push({ source: hubId, target: m.memoryId });
-    }
-  }
-
-  return { nodes, links };
+function formatDate(value: number | undefined): string {
+  return value
+    ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(value)
+    : "Time unavailable";
 }
 
-export default function MemoryGraphView({
-  records,
+export default function MemorySourceExplorer({
+  items,
   isDark,
+  emptyMessage,
 }: {
-  records: any[];
+  items: MemoryExplorerItem[];
   isDark: boolean;
+  emptyMessage: string;
 }) {
-  const graph = useMemo(() => buildGraph(records as MemoryRecord[]), [records]);
-  const fgRef = useRef<any>(null);
-
-  if (records.length === 0) {
+  if (items.length === 0) {
     return (
-      <div
-        className={`flex items-center justify-center h-full text-sm ${
-          isDark ? "text-zinc-600" : "text-zinc-400"
-        }`}
-      >
-        No memories yet. Chat with the agent to build your graph.
+      <div className={`px-5 py-12 text-center text-sm ${isDark ? "text-zinc-500" : "text-zinc-500"}`}>
+        {emptyMessage}
       </div>
     );
   }
 
   return (
-    <div className="w-full h-full">
-      <ForceGraph2D
-        ref={fgRef}
-        graphData={graph}
-        backgroundColor={isDark ? "#202024" : "#ffffff"}
-        nodeRelSize={4}
-        linkColor={() => (isDark ? "rgba(148,163,184,0.15)" : "rgba(15,23,42,0.15)")}
-        linkWidth={1}
-        nodeLabel={(n: any) =>
-          n.kind === "hub"
-            ? `<div style="padding:4px 8px;background:#020617;color:#fff;border-radius:4px;font-size:12px">${n.label} — ${n.memoryCount} memories</div>`
-            : `<div style="padding:4px 8px;background:#020617;color:#fff;border-radius:4px;font-size:12px;max-width:280px">${n.content}</div>`
-        }
-        nodeCanvasObject={(node: any, ctx, globalScale) => {
-          const isHub = node.kind === "hub";
-          const color = isHub
-            ? segmentColor(node.dominantSegment)
-            : segmentColor(node.segment);
+    <ul className={`divide-y ${isDark ? "divide-white/10" : "divide-zinc-200"}`}>
+      {items.map((item) => {
+        const metadata = displayMetadata(item.metadata);
+        const state = item.forgotten
+          ? "Forgotten"
+          : item.current === true
+            ? "Current"
+            : item.current === false
+              ? "Previous version"
+              : item.status || "State unavailable";
+        return (
+          <li key={item.id} className="min-w-0 px-5 py-4">
+            <article>
+              <div className="flex flex-wrap items-center gap-2">
+                <h3 className={`min-w-0 flex-1 truncate text-sm font-medium ${isDark ? "text-zinc-100" : "text-zinc-950"}`}>
+                  {item.title || (item.providerDocumentId ? "Source document" : "Memory result")}
+                </h3>
+                <span
+                  className={`rounded-full border px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide ${
+                    item.forgotten
+                      ? isDark
+                        ? "border-rose-400/20 bg-rose-400/10 text-rose-300"
+                        : "border-rose-200 bg-rose-50 text-rose-700"
+                      : item.current === false
+                        ? isDark
+                          ? "border-amber-400/20 bg-amber-400/10 text-amber-300"
+                          : "border-amber-200 bg-amber-50 text-amber-700"
+                        : item.current === true
+                          ? isDark
+                            ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-300"
+                            : "border-emerald-200 bg-emerald-50 text-emerald-700"
+                          : isDark
+                            ? "border-white/10 bg-white/5 text-zinc-300"
+                            : "border-zinc-200 bg-zinc-50 text-zinc-700"
+                  }`}
+                >
+                  {state}
+                </span>
+              </div>
 
-          if (isHub) {
-            const radius = Math.max(10, Math.min(30, 8 + Math.log2(node.memoryCount + 1) * 4));
-            ctx.fillStyle = color;
-            ctx.globalAlpha = 0.9;
-            ctx.beginPath();
-            ctx.arc(node.x, node.y, radius, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.globalAlpha = 1;
-            ctx.fillStyle = "#ffffff";
-            ctx.font = `bold ${Math.max(10, 12 / globalScale)}px Geist, ui-sans-serif, system-ui`;
-            ctx.textAlign = "center";
-            ctx.textBaseline = "middle";
-            ctx.fillText(node.label, node.x, node.y);
-          } else {
-            const radius = Math.max(3, Math.min(8, 3 + node.importance * 5));
-            ctx.fillStyle = color;
-            ctx.globalAlpha = 0.7;
-            ctx.beginPath();
-            ctx.arc(node.x, node.y, radius, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.globalAlpha = 1;
-            if (globalScale > 1.5) {
-              ctx.fillStyle = isDark ? "rgba(244,244,245,0.9)" : "rgba(39,39,42,0.9)";
-              ctx.font = `${10 / globalScale}px Geist, ui-sans-serif, system-ui`;
-              ctx.textAlign = "center";
-              ctx.textBaseline = "top";
-              ctx.fillText(node.label.slice(0, 40), node.x, node.y + radius + 2);
-            }
-          }
-        }}
-        d3AlphaDecay={0.02}
-        d3VelocityDecay={0.3}
-        cooldownTicks={100}
-      />
-    </div>
+              {item.content && (
+                <p dir="auto" className={`mt-2 break-words text-sm leading-relaxed ${isDark ? "text-zinc-300" : "text-zinc-700"}`}>
+                  {item.content}
+                </p>
+              )}
+
+              <dl className={`mt-3 flex flex-wrap gap-x-4 gap-y-1 text-[11px] ${isDark ? "text-zinc-500" : "text-zinc-500"}`}>
+                {item.similarity !== undefined && (
+                  <div className="flex gap-1">
+                    <dt>Similarity</dt>
+                    <dd className="mono">{item.similarity.toFixed(3)}</dd>
+                  </div>
+                )}
+                {item.version !== undefined && (
+                  <div className="flex gap-1">
+                    <dt>Version</dt>
+                    <dd className="mono">{String(item.version)}</dd>
+                  </div>
+                )}
+                {item.updatedAt !== undefined && (
+                  <div className="flex gap-1">
+                    <dt>Updated</dt>
+                    <dd>
+                      <time>{formatDate(item.updatedAt)}</time>
+                    </dd>
+                  </div>
+                )}
+                {item.providerDocumentId && (
+                  <div className="flex min-w-0 gap-1">
+                    <dt>Document</dt>
+                    <dd className="max-w-[300px] truncate mono" title={item.providerDocumentId}>
+                      {item.providerDocumentId}
+                    </dd>
+                  </div>
+                )}
+                {item.providerMemoryId && (
+                  <div className="flex min-w-0 gap-1">
+                    <dt>Memory</dt>
+                    <dd className="max-w-[300px] truncate mono" title={item.providerMemoryId}>
+                      {item.providerMemoryId}
+                    </dd>
+                  </div>
+                )}
+              </dl>
+
+              {metadata.length > 0 && (
+                <div className="mt-2 flex flex-wrap gap-1.5" aria-label="Source metadata">
+                  {metadata.map((entry) => (
+                    <span
+                      key={entry}
+                      className={`max-w-full truncate rounded-lg px-2 py-1 text-[10px] mono ${
+                        isDark ? "bg-white/5 text-zinc-400" : "bg-zinc-100 text-zinc-600"
+                      }`}
+                      title={entry}
+                    >
+                      {entry}
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              {item.history && item.history.length > 0 && (
+                <details className="mt-3">
+                  <summary
+                    className={`min-h-8 cursor-pointer rounded-lg px-2 py-1.5 text-xs outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 ${
+                      isDark ? "text-zinc-400 hover:bg-white/5" : "text-zinc-600 hover:bg-zinc-100"
+                    }`}
+                  >
+                    Version history · {item.history.length}
+                  </summary>
+                  <ol className="mt-2 space-y-2 ps-2">
+                    {item.history.map((version, index) => (
+                      <li
+                        key={version.id ?? `${item.id}:version:${index}`}
+                        className={`rounded-xl border p-3 text-xs ${
+                          isDark ? "border-white/10 bg-black/20 text-zinc-300" : "border-zinc-200 bg-zinc-50 text-zinc-700"
+                        }`}
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <span className="font-medium">
+                            Version {version.version ?? item.history!.length - index}
+                            {version.status ? ` · ${version.status}` : ""}
+                          </span>
+                          <time className={isDark ? "text-zinc-500" : "text-zinc-500"}>
+                            {formatDate(version.updatedAt ?? version.createdAt)}
+                          </time>
+                        </div>
+                        {version.content && <p dir="auto" className="mt-1 break-words leading-relaxed">{version.content}</p>}
+                      </li>
+                    ))}
+                  </ol>
+                </details>
+              )}
+            </article>
+          </li>
+        );
+      })}
+    </ul>
   );
 }

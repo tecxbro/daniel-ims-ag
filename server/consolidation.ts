@@ -5,6 +5,13 @@ import { getRuntimeConfig, type RuntimeConfig } from "./runtime-config.js";
 import { runAgentRuntime } from "./runtimes/index.js";
 import { EMPTY_USAGE, type UsageTotals } from "./usage.js";
 
+/** Historical implementation retained for decommission; runtime is frozen. */
+export function legacyConsolidationEnabled(
+  _env: Record<string, string | undefined> = process.env,
+): false {
+  return false;
+}
+
 function randomId(prefix: string): string {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -171,6 +178,12 @@ export async function runConsolidation(trigger = "scheduled"): Promise<{
   merged: number;
   pruned: number;
 }> {
+  if (!legacyConsolidationEnabled()) {
+    throw new Error(
+      "Legacy Convex memory consolidation is retired in Supermemory write mode.",
+    );
+  }
+
   const runId = randomId("cons");
   const runtimeConfig = await getRuntimeConfig();
   await convex.mutation(api.consolidation.createRun, { runId, trigger });
@@ -479,6 +492,7 @@ export async function runConsolidation(trigger = "scheduled"): Promise<{
 }
 
 export function startConsolidationLoop(intervalMs = 24 * 60 * 60 * 1000): () => void {
+  if (!legacyConsolidationEnabled()) return () => undefined;
   const timer = setInterval(() => {
     runConsolidation("scheduled").catch((err) =>
       console.error("[consolidation] loop error", err),

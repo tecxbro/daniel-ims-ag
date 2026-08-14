@@ -1,4 +1,4 @@
-import { action, mutation, query } from "./_generated/server";
+import { action, internalQuery, mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 import { api } from "./_generated/api";
 import type { Id } from "./_generated/dataModel";
@@ -15,6 +15,77 @@ const segmentV = v.union(
 );
 const lifecycleV = v.union(v.literal("active"), v.literal("archived"), v.literal("pruned"));
 
+/**
+ * Implementation 8 freezes the legacy semantic store. Keep the mutation
+ * registrations during the retention window so stale callers fail with a
+ * deliberate cutover error instead of silently recreating rollback state.
+ */
+function rejectLegacyMemoryWrite(operation: string): never {
+  throw new Error(
+    `LEGACY_MEMORY_WRITE_FROZEN: ${operation} is disabled after the SuperMemory-only cutover`,
+  );
+}
+
+const MIGRATION_EXPORT_PAGE_SIZE = 100;
+
+function migrationPageSize(value: number | undefined): number {
+  const size = value ?? MIGRATION_EXPORT_PAGE_SIZE;
+  if (!Number.isInteger(size) || size < 1 || size > 250) {
+    throw new Error("pageSize must be an integer between 1 and 250");
+  }
+  return size;
+}
+
+const migrationPageArgs = {
+  cursor: v.optional(v.union(v.string(), v.null())),
+  pageSize: v.optional(v.number()),
+};
+
+/** CLI-only immutable migration export. These functions are intentionally internal. */
+export const exportMemoryRecordsPage = internalQuery({
+  args: migrationPageArgs,
+  handler: async (ctx, args) => {
+    return await ctx.db
+      .query("memoryRecords")
+      .order("asc")
+      .paginate({ cursor: args.cursor ?? null, numItems: migrationPageSize(args.pageSize) });
+  },
+});
+
+export const exportMemoryEventsPage = internalQuery({
+  args: migrationPageArgs,
+  handler: async (ctx, args) => {
+    return await ctx.db
+      .query("memoryEvents")
+      .order("asc")
+      .paginate({ cursor: args.cursor ?? null, numItems: migrationPageSize(args.pageSize) });
+  },
+});
+
+export const exportConsolidationRunsPage = internalQuery({
+  args: migrationPageArgs,
+  handler: async (ctx, args) => {
+    return await ctx.db
+      .query("consolidationRuns")
+      .order("asc")
+      .paginate({ cursor: args.cursor ?? null, numItems: migrationPageSize(args.pageSize) });
+  },
+});
+
+export const exportMessagesSincePage = internalQuery({
+  args: {
+    ...migrationPageArgs,
+    createdAtOrAfter: v.number(),
+  },
+  handler: async (ctx, args) => {
+    return await ctx.db
+      .query("messages")
+      .withIndex("by_createdAt", (q) => q.gte("createdAt", args.createdAtOrAfter))
+      .order("asc")
+      .paginate({ cursor: args.cursor ?? null, numItems: migrationPageSize(args.pageSize) });
+  },
+});
+
 export const upsert = mutation({
   args: {
     memoryId: v.string(),
@@ -29,62 +100,8 @@ export const upsert = mutation({
     metadata: v.optional(v.string()),
     imageStorageIds: v.optional(v.union(v.array(v.id("_storage")), v.null())),
   },
-  handler: async (ctx, args) => {
-    const now = Date.now();
-
-    // Archive any memories this one supersedes. Must run on BOTH the insert
-    // and update paths — consolidation merges typically update an existing
-    // "keep" memory while archiving the ones it absorbed.
-    if (args.supersedes?.length) {
-      for (const sid of args.supersedes) {
-        if (sid === args.memoryId) continue; // never archive self
-        const target = await ctx.db
-          .query("memoryRecords")
-          .withIndex("by_memory_id", (q) => q.eq("memoryId", sid))
-          .unique();
-        if (target && target.lifecycle === "active") {
-          await ctx.db.patch(target._id, { lifecycle: "archived" });
-        }
-      }
-    }
-
-    const existing = await ctx.db
-      .query("memoryRecords")
-      .withIndex("by_memory_id", (q) => q.eq("memoryId", args.memoryId))
-      .unique();
-
-    if (existing) {
-      await ctx.db.patch(existing._id, {
-        content: args.content,
-        tier: args.tier,
-        segment: args.segment,
-        importance: args.importance,
-        decayRate: args.decayRate,
-        supersedes: args.supersedes,
-        embedding: args.embedding ?? existing.embedding,
-        metadata: args.metadata ?? existing.metadata,
-        imageStorageIds:
-          args.imageStorageIds === null
-            ? undefined
-            : args.imageStorageIds && args.imageStorageIds.length > 0
-              ? args.imageStorageIds
-              : existing.imageStorageIds,
-        lastAccessedAt: now,
-      });
-      return existing._id;
-    }
-
-    const { imageStorageIds, ...rest } = args;
-    return await ctx.db.insert("memoryRecords", {
-      ...rest,
-      ...(imageStorageIds && imageStorageIds.length > 0
-        ? { imageStorageIds }
-        : {}),
-      accessCount: 0,
-      lastAccessedAt: now,
-      lifecycle: "active",
-      createdAt: now,
-    });
+  handler: async () => {
+    rejectLegacyMemoryWrite("memoryRecords.upsert");
   },
 });
 
@@ -164,30 +181,15 @@ export const search = query({
 
 export const markAccessed = mutation({
   args: { memoryId: v.string() },
-  handler: async (ctx, args) => {
-    const mem = await ctx.db
-      .query("memoryRecords")
-      .withIndex("by_memory_id", (q) => q.eq("memoryId", args.memoryId))
-      .unique();
-    if (!mem) return null;
-    await ctx.db.patch(mem._id, {
-      accessCount: mem.accessCount + 1,
-      lastAccessedAt: Date.now(),
-    });
-    return mem._id;
+  handler: async () => {
+    rejectLegacyMemoryWrite("memoryRecords.markAccessed");
   },
 });
 
 export const setLifecycle = mutation({
   args: { memoryId: v.string(), lifecycle: lifecycleV },
-  handler: async (ctx, args) => {
-    const mem = await ctx.db
-      .query("memoryRecords")
-      .withIndex("by_memory_id", (q) => q.eq("memoryId", args.memoryId))
-      .unique();
-    if (!mem) return null;
-    await ctx.db.patch(mem._id, { lifecycle: args.lifecycle });
-    return mem._id;
+  handler: async () => {
+    rejectLegacyMemoryWrite("memoryRecords.setLifecycle");
   },
 });
 
@@ -260,14 +262,8 @@ export const setEmbedding = mutation({
     memoryId: v.string(),
     embedding: v.array(v.float64()),
   },
-  handler: async (ctx, args) => {
-    const mem = await ctx.db
-      .query("memoryRecords")
-      .withIndex("by_memory_id", (q) => q.eq("memoryId", args.memoryId))
-      .unique();
-    if (!mem) return null;
-    await ctx.db.patch(mem._id, { embedding: args.embedding });
-    return mem._id;
+  handler: async () => {
+    rejectLegacyMemoryWrite("memoryRecords.setEmbedding");
   },
 });
 

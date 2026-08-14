@@ -19,18 +19,29 @@ const DIMENSIONS = 1024;
 let extractor: FeatureExtractionPipeline | null = null;
 let loading: Promise<FeatureExtractionPipeline> | null = null;
 
-export type EmbeddingProvider = "voyage" | "openai" | "local";
+export type EmbeddingProvider = "voyage" | "openai" | "local" | "retired";
+
+/**
+ * Historical embedding values stay readable, but the embedding runtime is no
+ * longer an active semantic provider under any configuration.
+ */
+export function legacyEmbeddingRuntimeEnabled(
+  _env: Record<string, string | undefined> = process.env,
+): false {
+  return false;
+}
 
 export function activeProvider(): EmbeddingProvider {
+  if (!legacyEmbeddingRuntimeEnabled()) return "retired";
   if (process.env.VOYAGE_API_KEY) return "voyage";
   if (process.env.OPENAI_API_KEY) return "openai";
   return "local";
 }
 
-// Always true now — local is always available. Kept for back-compat with
-// callsites that still gate on it.
+// Kept for compatibility while Convex/shadow modes are available before
+// activation. It is false after the Supermemory-only cutover.
 export function embeddingsAvailable(): boolean {
-  return true;
+  return legacyEmbeddingRuntimeEnabled();
 }
 
 async function embedVoyage(text: string): Promise<number[]> {
@@ -114,6 +125,7 @@ async function embedLocal(text: string): Promise<number[]> {
 // recall() doesn't pay the ~5–15s model load. Safe to call at server
 // startup — failures are logged, not thrown.
 export function preloadLocalModel(): void {
+  if (!legacyEmbeddingRuntimeEnabled()) return;
   if (process.env.VOYAGE_API_KEY || process.env.OPENAI_API_KEY) return;
   getLocalExtractor().catch((err) => {
     console.warn("[embeddings] local model preload failed:", err);
@@ -121,6 +133,7 @@ export function preloadLocalModel(): void {
 }
 
 export async function embed(text: string): Promise<number[] | null> {
+  if (!legacyEmbeddingRuntimeEnabled()) return null;
   try {
     if (process.env.VOYAGE_API_KEY) return await embedVoyage(text);
     if (process.env.OPENAI_API_KEY) return await embedOpenAI(text);

@@ -21,7 +21,7 @@ import { AutomationsPanel } from "./components/AutomationsPanel.js";
 import { MemoryPanel } from "./components/MemoryPanel.js";
 import { EventsPanel } from "./components/EventsPanel.js";
 import { ConnectionsPanel } from "./components/ConnectionsPanel.js";
-import { ConsolidationPanel } from "./components/ConsolidationPanel.js";
+import { MemorySyncPanel } from "./components/ConsolidationPanel.js";
 import { SettingsPanel } from "./components/SettingsPanel.js";
 import { ChangelogDrawer } from "./components/ChangelogDrawer.js";
 import { RuntimeProviderLogo, type RuntimeProvider } from "./lib/branding.js";
@@ -33,7 +33,7 @@ type View =
   | "automations"
   | "memory"
   | "events"
-  | "consolidation"
+  | "sync"
   | "connections"
   | "settings";
 
@@ -44,10 +44,14 @@ interface RuntimeConfigSnapshot {
   model: string;
 }
 
-interface MemoryTierCounts {
-  short: number;
-  long: number;
-  permanent: number;
+interface MemoryOperationalSummary {
+  memoryProvider: {
+    healthStatus: string;
+    profileState: "ready" | "empty" | "unavailable";
+    readMode: string;
+    writeMode: string;
+  };
+  sync: { active: number; failed: number; deadLetter: number };
 }
 
 interface AgentSummary {
@@ -60,7 +64,7 @@ const NAV_ICONS: Record<View, any> = {
   automations: WorkflowCircle03Icon,
   memory: AiBrain02Icon,
   events: Activity01Icon,
-  consolidation: ArrowShrink02Icon,
+  sync: ArrowShrink02Icon,
   connections: Link04Icon,
   settings: Settings01Icon,
 };
@@ -71,7 +75,7 @@ const NAV: { id: View; label: string }[] = [
   { id: "automations", label: "Automations" },
   { id: "memory", label: "Memory" },
   { id: "events", label: "Events" },
-  { id: "consolidation", label: "Consolidation" },
+  { id: "sync", label: "Memory sync" },
   { id: "connections", label: "Connections" },
   { id: "settings", label: "Settings" },
 ];
@@ -91,8 +95,8 @@ export function App() {
   const [changelogOpen, setChangelogOpen] = useState(false);
   const { connected } = useSocket();
 
-  const counts = useQuery(api.memoryRecords.countsByTier, {}) as
-    | MemoryTierCounts
+  const memorySummary = useQuery(api.dashboard.metrics, {}) as
+    | MemoryOperationalSummary
     | undefined;
   const agents = useQuery(api.agents.list, {}) as AgentSummary[] | undefined;
   const storedRuntime = useQuery(api.settings.get, { key: "runtime" }) as
@@ -155,6 +159,7 @@ export function App() {
       }`}
     >
       <nav
+        aria-label="Primary"
         className={`w-[244px] shrink-0 p-3 flex flex-col ${
           isDark ? "bg-[#101012]" : "bg-[#f7f7f5]"
         }`}
@@ -192,8 +197,9 @@ export function App() {
             <button
               key={item.id}
               data-active={view === item.id}
+              aria-current={view === item.id ? "page" : undefined}
               onClick={() => setView(item.id)}
-              className={`sidebar-nav-item flex h-8 w-full items-center gap-2 rounded-2xl px-2.5 text-left text-[12px] ${
+              className={`sidebar-nav-item flex h-8 w-full items-center gap-2 rounded-2xl px-2.5 text-left text-[12px] outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 ${
                 view === item.id
                   ? isDark
                     ? "text-zinc-50"
@@ -219,24 +225,40 @@ export function App() {
         </div>
 
         <div className="mt-auto space-y-3">
-          {counts && (
+          {memorySummary && (
             <div
               className={`rounded-2xl border p-2.5 ${
                 isDark ? "border-white/10 bg-black/20" : "border-zinc-200 bg-zinc-50"
               }`}
             >
               <div className={`mb-2 text-xs ${isDark ? "text-zinc-500" : "text-zinc-500"}`}>
-                Memory
+                Supermemory
               </div>
-              <div className="grid grid-cols-3 gap-2">
-                <MetricPill label="Short" value={counts.short} isDark={isDark} />
-                <MetricPill label="Long" value={counts.long} isDark={isDark} />
-                <MetricPill
-                  label="Perm"
-                  value={counts.permanent}
-                  isDark={isDark}
-                  color={isDark ? "text-amber-300" : "text-amber-700"}
-                />
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-2 text-xs">
+                  <span className={isDark ? "text-zinc-500" : "text-zinc-500"}>Provider</span>
+                  <span className={`truncate capitalize ${memorySummary.memoryProvider.healthStatus === "healthy" ? "text-emerald-400" : "text-amber-400"}`}>
+                    {memorySummary.memoryProvider.healthStatus}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between gap-2 text-xs">
+                  <span className={isDark ? "text-zinc-500" : "text-zinc-500"}>Profile</span>
+                  <span className={`truncate capitalize ${isDark ? "text-zinc-300" : "text-zinc-700"}`}>
+                    {memorySummary.memoryProvider.profileState}
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <MetricPill label="Active" value={memorySummary.sync.active} isDark={isDark} />
+                  <MetricPill
+                    label="Failed"
+                    value={memorySummary.sync.failed + memorySummary.sync.deadLetter}
+                    isDark={isDark}
+                    color={memorySummary.sync.failed + memorySummary.sync.deadLetter > 0 ? "text-rose-400" : undefined}
+                  />
+                </div>
+                <div className={`truncate text-[10px] mono ${isDark ? "text-zinc-500" : "text-zinc-500"}`} title={`Read ${memorySummary.memoryProvider.readMode}; write ${memorySummary.memoryProvider.writeMode}`}>
+                  {memorySummary.memoryProvider.readMode} → {memorySummary.memoryProvider.writeMode}
+                </div>
               </div>
             </div>
           )}
@@ -244,7 +266,7 @@ export function App() {
             <div className="flex items-center">
               <button
                 onClick={() => setChangelogOpen(true)}
-                aria-label="Open changelog"
+                aria-label={`Open changelog, v${metadata.version}`}
                 className={`rounded-lg px-1.5 py-1 text-[11px] mono transition-colors ${
                   isDark
                     ? "text-zinc-600 hover:bg-white/5 hover:text-zinc-300"
@@ -257,7 +279,8 @@ export function App() {
             </div>
             <button
               onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-              className={`p-1.5 rounded-xl transition-colors ${
+              aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`}
+              className={`p-1.5 rounded-xl transition-colors outline-none focus-visible:ring-2 focus-visible:ring-emerald-500 ${
                 isDark
                   ? "text-zinc-500 hover:bg-zinc-800 hover:text-zinc-100"
                   : "text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900"
@@ -313,7 +336,7 @@ export function App() {
             {view === "automations" && <AutomationsPanel isDark={isDark} />}
             {view === "memory" && <MemoryPanel isDark={isDark} />}
             {view === "events" && <EventsPanel isDark={isDark} />}
-            {view === "consolidation" && <ConsolidationPanel isDark={isDark} />}
+            {view === "sync" && <MemorySyncPanel isDark={isDark} />}
             {view === "connections" && <ConnectionsPanel isDark={isDark} />}
             {view === "settings" && <SettingsPanel isDark={isDark} />}
           </div>
