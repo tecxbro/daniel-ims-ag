@@ -157,6 +157,19 @@ export default defineSchema({
       "status",
     ]),
 
+  legacyMemoryCleanupRuns: defineTable({
+    runId: v.string(),
+    expectedMemoryRecords: v.number(),
+    expectedMemoryEvents: v.number(),
+    expectedConsolidationRuns: v.number(),
+    deletedMemoryRecords: v.number(),
+    deletedMemoryEvents: v.number(),
+    deletedConsolidationRuns: v.number(),
+    status: v.union(v.literal("running"), v.literal("zero_verified")),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  }).index("by_run_id", ["runId"]),
+
   memoryPendingOperations: defineTable({
     operationId: v.string(),
     ownerKey: v.string(),
