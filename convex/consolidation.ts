@@ -7,17 +7,16 @@ const statusV = v.union(
   v.literal("failed"),
 );
 
+function rejectLegacyConsolidationWrite(operation: string): never {
+  throw new Error(
+    `LEGACY_MEMORY_WRITE_FROZEN: ${operation} is disabled after the SuperMemory-only cutover`,
+  );
+}
+
 export const createRun = mutation({
   args: { runId: v.string(), trigger: v.string() },
-  handler: async (ctx, args) => {
-    return await ctx.db.insert("consolidationRuns", {
-      ...args,
-      status: "running",
-      proposalsCount: 0,
-      mergedCount: 0,
-      prunedCount: 0,
-      startedAt: Date.now(),
-    });
+  handler: async () => {
+    rejectLegacyConsolidationWrite("consolidation.createRun");
   },
 });
 
@@ -31,16 +30,8 @@ export const updateRun = mutation({
     notes: v.optional(v.string()),
     details: v.optional(v.string()),
   },
-  handler: async (ctx, args) => {
-    const { runId, ...patch } = args;
-    const run = await ctx.db
-      .query("consolidationRuns")
-      .withIndex("by_run_id", (q) => q.eq("runId", runId))
-      .unique();
-    if (!run) return null;
-    const done = patch.status && patch.status !== "running";
-    await ctx.db.patch(run._id, { ...patch, ...(done ? { completedAt: Date.now() } : {}) });
-    return run._id;
+  handler: async () => {
+    rejectLegacyConsolidationWrite("consolidation.updateRun");
   },
 });
 

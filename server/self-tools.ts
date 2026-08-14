@@ -1,11 +1,13 @@
 import { z } from "zod";
+import { api } from "../convex/_generated/api.js";
 import {
   CURATED_TOOLKITS,
   listConnectedToolkits,
   listToolkitMeta,
   listToolsForToolkit,
 } from "./composio.js";
-import { activeProvider as activeEmbeddingProvider } from "./embeddings.js";
+import { readMemoryProviderConfiguration } from "./memory/supermemory/client.js";
+import type { MemoryProviderConfiguration } from "./memory/supermemory/types.js";
 import { listEnabledIntegrations } from "./integrations/registry.js";
 import { createClaudeMcpServer } from "./runtimes/claude.js";
 import { defineRuntimeTool } from "./runtimes/tool.js";
@@ -34,6 +36,191 @@ const NAMESPACE = "daniel-self";
 
 const reasoningEffortSchema = z.enum(["minimal", "low", "medium", "high", "xhigh"]);
 
+type MemoryProviderHealth =
+  | "disabled"
+  | "unconfigured"
+  | "healthy"
+  | "degraded"
+  | "unavailable"
+  | "unknown";
+
+interface MemoryProviderDeploymentState {
+  healthStatus: Exclude<MemoryProviderHealth, "unknown"> | null;
+  lastSuccessfulSubmissionAt: number | null;
+  lastFailedSubmissionAt: number | null;
+  lastError: string | null;
+  lastWorkerActivityAt: number | null;
+  updatedAt: number | null;
+}
+
+export interface MemorySyncBacklogStatus {
+  pending: number;
+  processing: number;
+  submitted: number;
+  completed: number;
+  failed: number;
+  deadLetter: number;
+  active: number;
+  total: number;
+  truncated: boolean;
+}
+
+export interface MemoryProviderOperationalStatus {
+  providerState: MemoryProviderDeploymentState | null;
+  syncBacklog: MemorySyncBacklogStatus | null;
+  providerStateAvailable: boolean;
+  syncBacklogAvailable: boolean;
+}
+
+interface MemoryStatusClient {
+  query(reference: unknown, args: Record<string, never>): Promise<unknown>;
+}
+
+interface MemoryStatusApi {
+  memoryProviderState: { getDeploymentState: unknown };
+  memorySyncJobs: { backlog: unknown };
+}
+
+const memoryStatusApi = api as unknown as MemoryStatusApi;
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function numberOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function nonNegativeCount(record: Record<string, unknown>, key: string): number {
+  const value = record[key];
+  const nested = asRecord(value);
+  const count = typeof value === "number" ? value : nested?.count;
+  return typeof count === "number" && Number.isFinite(count)
+    ? Math.max(0, Math.floor(count))
+    : 0;
+}
+
+function normalizeProviderState(value: unknown): MemoryProviderDeploymentState | null {
+  const state = asRecord(value);
+  if (!state) return null;
+  const rawHealth = state.healthStatus;
+  const healthStatus =
+    rawHealth === "disabled" ||
+    rawHealth === "unconfigured" ||
+    rawHealth === "healthy" ||
+    rawHealth === "degraded" ||
+    rawHealth === "unavailable"
+      ? rawHealth
+      : null;
+  return {
+    healthStatus,
+    lastSuccessfulSubmissionAt: numberOrNull(state.lastSuccessfulSubmissionAt),
+    lastFailedSubmissionAt: numberOrNull(state.lastFailedSubmissionAt),
+    lastError: typeof state.lastError === "string" ? state.lastError : null,
+    lastWorkerActivityAt: numberOrNull(state.lastWorkerActivityAt),
+    updatedAt: numberOrNull(state.updatedAt),
+  };
+}
+
+function normalizeSyncBacklog(value: unknown): MemorySyncBacklogStatus | null {
+  const backlog = asRecord(value);
+  if (!backlog) return null;
+  const counts = asRecord(backlog.counts) ?? backlog;
+  const pending = nonNegativeCount(counts, "pending");
+  const processing = nonNegativeCount(counts, "processing");
+  const submitted = nonNegativeCount(counts, "submitted");
+  const completed = nonNegativeCount(counts, "completed");
+  const failed = nonNegativeCount(counts, "failed");
+  const deadLetter = Math.max(
+    nonNegativeCount(counts, "deadLetter"),
+    nonNegativeCount(counts, "dead_letter"),
+  );
+  return {
+    pending,
+    processing,
+    submitted,
+    completed,
+    failed,
+    deadLetter,
+    active:
+      numberOrNull(backlog.active) ?? pending + processing + submitted + failed,
+    total:
+      numberOrNull(backlog.total) ??
+      pending + processing + submitted + completed + failed + deadLetter,
+    truncated: backlog.truncated === true,
+  };
+}
+
+/** Reads the durable provider-state and outbox modules without calling Supermemory. */
+export async function readMemoryProviderOperationalStatus(
+  client?: MemoryStatusClient,
+): Promise<MemoryProviderOperationalStatus> {
+  const statusClient =
+    client ?? ((await import("./convex-client.js")).convex as unknown as MemoryStatusClient);
+  const [providerStateResult, syncBacklogResult] = await Promise.allSettled([
+    statusClient.query(memoryStatusApi.memoryProviderState.getDeploymentState, {}),
+    statusClient.query(memoryStatusApi.memorySyncJobs.backlog, {}),
+  ]);
+  return {
+    providerState:
+      providerStateResult.status === "fulfilled"
+        ? normalizeProviderState(providerStateResult.value)
+        : null,
+    syncBacklog:
+      syncBacklogResult.status === "fulfilled"
+        ? normalizeSyncBacklog(syncBacklogResult.value)
+        : null,
+    providerStateAvailable: providerStateResult.status === "fulfilled",
+    syncBacklogAvailable: syncBacklogResult.status === "fulfilled",
+  };
+}
+
+export function buildMemoryRuntimeStatus(
+  memory: MemoryProviderConfiguration,
+  operational: MemoryProviderOperationalStatus,
+) {
+  const memoryProvider =
+    memory.readMode === "convex" && memory.writeMode === "convex"
+      ? ("convex" as const)
+      : ("supermemory" as const);
+  const memoryProviderHealth: MemoryProviderHealth =
+    memoryProvider === "convex"
+      ? "disabled"
+      : !memory.apiKeyConfigured
+        ? "unconfigured"
+        : (operational.providerState?.healthStatus ?? "unknown");
+  const fallbackActive =
+    memory.readMode === "supermemory" && memory.legacyFallback;
+
+  return {
+    memoryProvider,
+    memoryReadMode: memory.readMode,
+    memoryCaptureMode: memory.writeMode,
+    memoryWriteMode: memory.writeMode,
+    memoryProviderHealth,
+    memorySyncBacklog: operational.syncBacklog,
+    memoryLastProviderSuccessAt:
+      operational.providerState?.lastSuccessfulSubmissionAt ?? null,
+    memoryLastProviderFailureAt:
+      operational.providerState?.lastFailedSubmissionAt ?? null,
+    memoryLastProviderFailure: operational.providerState?.lastError ?? null,
+    memoryLastWorkerActivityAt:
+      operational.providerState?.lastWorkerActivityAt ?? null,
+    memoryProviderStateUpdatedAt: operational.providerState?.updatedAt ?? null,
+    memoryProviderStateAvailable: operational.providerStateAvailable,
+    memorySyncBacklogAvailable: operational.syncBacklogAvailable,
+    memoryLegacyRuntime: "retired" as const,
+    memoryLegacyFallback: {
+      enabled: memory.legacyFallback,
+      active: fallbackActive,
+      status: fallbackActive ? ("provider_errors_only" as const) : ("inactive" as const),
+    },
+    supermemoryConfigured: memory.apiKeyConfigured,
+  };
+}
+
 export function createSelfTools(): RuntimeTool[] {
   return [
     defineRuntimeTool(
@@ -46,6 +233,11 @@ export function createSelfTools(): RuntimeTool[] {
         const tzInfo = await describeUserNow();
         const runtime = await getRuntimeConfig();
         const browser = await getBrowserSettings();
+        const memory = readMemoryProviderConfiguration();
+        const memoryStatus = buildMemoryRuntimeStatus(
+          memory,
+          await readMemoryProviderOperationalStatus(),
+        );
         const config = {
           runtime: runtime.runtime,
           model: runtime.model,
@@ -71,8 +263,12 @@ export function createSelfTools(): RuntimeTool[] {
             extraArgs: browser.extraArgs,
           },
           composioEnabled: Boolean(process.env.COMPOSIO_API_KEY),
-          embeddingsEnabled: true,
-          embeddingsProvider: activeEmbeddingProvider(),
+          // Deprecated compatibility fields. They remain present for old
+          // dashboards, but accurately show that the runtime is retired at
+          // the Supermemory-only cutover and do not import the local model.
+          embeddingsEnabled: false,
+          embeddingsProvider: "retired",
+          ...memoryStatus,
           photonEnabled: Boolean(process.env.PHOTON_PROJECT_ID && process.env.PHOTON_PROJECT_SECRET),
         };
         return runtimeText(JSON.stringify(config, null, 2));

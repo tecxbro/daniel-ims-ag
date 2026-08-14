@@ -1,6 +1,12 @@
 import { mutation, query } from "./_generated/server";
 import { v } from "convex/values";
 
+function rejectLegacyEventWrite(): never {
+  throw new Error(
+    "LEGACY_MEMORY_WRITE_FROZEN: memoryEvents.emit is disabled after the SuperMemory-only cutover",
+  );
+}
+
 export const emit = mutation({
   args: {
     eventType: v.string(),
@@ -9,8 +15,8 @@ export const emit = mutation({
     agentId: v.optional(v.string()),
     data: v.string(),
   },
-  handler: async (ctx, args) => {
-    return await ctx.db.insert("memoryEvents", { ...args, createdAt: Date.now() });
+  handler: async () => {
+    rejectLegacyEventWrite();
   },
 });
 

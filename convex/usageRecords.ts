@@ -12,6 +12,24 @@ const sourceV = v.union(
   v.literal("coding"),
 );
 
+// These values stay in both validators so historical rows remain readable.
+// Their producers are retired at the SuperMemory-only cutover, so accepting
+// a new row would be evidence that a legacy runtime escaped the shutdown.
+const RETIRED_LEGACY_SOURCES = new Set<string>([
+  "extract",
+  "consolidation-proposer",
+  "consolidation-adversary",
+  "consolidation-judge",
+]);
+
+function rejectRetiredLegacySource(source: string): void {
+  if (RETIRED_LEGACY_SOURCES.has(source)) {
+    throw new Error(
+      `LEGACY_MEMORY_USAGE_SOURCE_FROZEN: ${source} is historical-only after the SuperMemory-only cutover`,
+    );
+  }
+}
+
 export const record = mutation({
   args: {
     source: sourceV,
@@ -30,6 +48,7 @@ export const record = mutation({
     durationMs: v.number(),
   },
   handler: async (ctx, args) => {
+    rejectRetiredLegacySource(args.source);
     return await ctx.db.insert("usageRecords", { ...args, createdAt: Date.now() });
   },
 });

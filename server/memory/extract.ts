@@ -45,6 +45,13 @@ interface ExtractedFact {
   describesImage?: boolean;
 }
 
+/** Historical implementation retained for decommission; runtime is frozen. */
+export function legacyExtractionEnabled(
+  _env: Record<string, string | undefined> = process.env,
+): false {
+  return false;
+}
+
 export async function extractAndStore(opts: {
   conversationId: string;
   userMessage: string;
@@ -53,6 +60,11 @@ export async function extractAndStore(opts: {
   runtimeConfig?: RuntimeConfig;
   imageStorageIds?: string[];
 }): Promise<void> {
+  // Implementation 8 freezes legacy semantic writes. This guard also makes
+  // direct or stale callers harmless after cutover, before any LLM/provider
+  // work or Convex mutation can occur.
+  if (!legacyExtractionEnabled()) return;
+
   const started = Date.now();
   try {
     const runtimeConfig = opts.runtimeConfig ?? (await getRuntimeConfig());

@@ -1,6 +1,7 @@
 #!/usr/bin/env tsx
 import prompts from "prompts";
 import { spawn } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -207,9 +208,10 @@ async function main() {
 What this does:
   1. Captures your Photon Spectrum project credentials for iMessage
   2. Asks whether Daniel should use your Claude Code or Codex subscription
-  3. Optionally enables local browser use
-  4. Runs \`npx convex dev\` to create a Convex project
-  5. Writes .env.local
+  3. Configures SuperMemory as Daniel's semantic memory provider
+  4. Optionally enables local browser use
+  5. Runs \`npx convex dev\` to create a Convex project
+  6. Writes .env.local
 
 Before you start:
   • Claude Code subscription if choosing Claude: https://claude.com/code
@@ -392,41 +394,58 @@ to that line.
     );
   }
 
-  // ---- Embedding provider --------------------------------------------------
-  banner("Memory search — embedding provider");
-  const existingVoyage = existing.VOYAGE_API_KEY ?? "";
-  const existingOpenai = existing.OPENAI_API_KEY ?? "";
-  const inferredCurrent = existingVoyage
-    ? "voyage"
-    : existingOpenai
-      ? "openai"
-      : "local";
+  // ---- SuperMemory ---------------------------------------------------------
+  banner("SuperMemory — semantic memory");
   console.log(`
-Daniel's recall() searches your stored memories by semantic similarity. Pick
-how you want to generate embeddings:
+SuperMemory is Daniel's semantic memory provider. Convex remains the application
+database and stores the durable memory-sync outbox and migration audit state.
 
-  • Local  — free, runs in-process via @huggingface/transformers
-            (Xenova/bge-large-en-v1.5, 1024-dim). First run downloads
-            ~440MB and caches forever. No API key.
-  • Voyage — paid, ~$0.06/M tokens. Slightly stronger English retrieval.
-  • OpenAI — paid, ~$0.13/M tokens. Comparable to Voyage.
-
-All three produce 1024-dim vectors (compatible with the same Convex index)
-so you can switch later by adding/removing the API key.
+The memory ID salt privately derives stable per-user container IDs. Treat it
+like a deployment secret and never rotate it after SuperMemory data is written.
 `);
-  const { embeddingProvider } = await prompts(
-    {
-      type: "select",
-      name: "embeddingProvider",
-      message: "Which embedding provider should daniel use?",
-      choices: [
-        { title: "Local (free, recommended)", value: "local" },
-        { title: "Voyage (paid — I have a key)", value: "voyage" },
-        { title: "OpenAI (paid — I have a key)", value: "openai" },
-      ],
-      initial:
-        inferredCurrent === "voyage" ? 1 : inferredCurrent === "openai" ? 2 : 0,
-    },
+  const generatedMemorySalt = randomBytes(32).toString("hex");
+  const memoryAnswers = await prompts(
+    [
+      {
+        type: "password",
+        name: "SUPERMEMORY_API_KEY",
+        message: "SuperMemory API key",
+        initial: existing.SUPERMEMORY_API_KEY ?? "",
+        validate: (value: string) =>
+          Boolean(value?.trim()) || "SuperMemory API key is required",
+      },
+      {
+        type: "password",
+        name: "DANIEL_MEMORY_ID_SALT",
+        message: "Stable Daniel memory ID salt (generated if this is first setup)",
+        initial: existing.DANIEL_MEMORY_ID_SALT || generatedMemorySalt,
+      },
+      {
+        type: "number",
+        name: "DANIEL_SUPERMEMORY_TIMEOUT_MS",
+        message: "SuperMemory profile/search timeout (milliseconds)",
+        initial: Number(existing.DANIEL_SUPERMEMORY_TIMEOUT_MS ?? "1200"),
+        validate: (value: number) =>
+          (Number.isInteger(value) && value > 0) || "Enter a positive whole number",
+      },
+      {
+        type: "number",
+        name: "DANIEL_SUPERMEMORY_THRESHOLD",
+        message: "SuperMemory search threshold (0 to 1)",
+        initial: Number(existing.DANIEL_SUPERMEMORY_THRESHOLD ?? "0.60"),
+        validate: (value: number) =>
+          (value >= 0 && value <= 1) || "Enter a number between 0 and 1",
+      },
+      {
+        type: "number",
+        name: "DANIEL_SUPERMEMORY_SEARCH_LIMIT",
+        message: "Maximum SuperMemory search results (1 to 100)",
+        initial: Number(existing.DANIEL_SUPERMEMORY_SEARCH_LIMIT ?? "8"),
+        validate: (value: number) =>
+          (Number.isInteger(value) && value >= 1 && value <= 100) ||
+          "Enter a whole number between 1 and 100",
+      },
+    ],
     {
       onCancel: () => {
         console.log("Setup cancelled.");
@@ -434,51 +453,14 @@ so you can switch later by adding/removing the API key.
       },
     },
   );
-
-  if (embeddingProvider === "voyage") {
-    const { VOYAGE_API_KEY } = await prompts({
-      type: "password",
-      name: "VOYAGE_API_KEY",
-      message: "Paste your Voyage API key (https://dash.voyageai.com):",
-      initial: existingVoyage,
-    });
-    (answers as any).VOYAGE_API_KEY = VOYAGE_API_KEY || "";
-    (answers as any).OPENAI_API_KEY = "";
-  } else if (embeddingProvider === "openai") {
-    const { OPENAI_API_KEY } = await prompts({
-      type: "password",
-      name: "OPENAI_API_KEY",
-      message: "Paste your OpenAI API key:",
-      initial: existingOpenai,
-    });
-    (answers as any).OPENAI_API_KEY = OPENAI_API_KEY || "";
-    (answers as any).VOYAGE_API_KEY = "";
-  } else {
-    // Local — clear any stale paid keys so embeddings.ts falls through to
-    // the local provider on next start.
-    (answers as any).VOYAGE_API_KEY = "";
-    (answers as any).OPENAI_API_KEY = "";
-
-    const { preload } = await prompts({
-      type: "confirm",
-      name: "preload",
-      message:
-        "Pre-download the local model now? (~440MB, ~30s on broadband — saves the wait on first recall)",
-      initial: true,
-    });
-    if (preload) {
-      console.log("\nDownloading Xenova/bge-large-en-v1.5… (Ctrl+C to skip)\n");
-      try {
-        await runInherit("npx", ["tsx", "scripts/preload-embeddings.ts"]);
-        console.log("✓ Local model cached.");
-      } catch (err) {
-        console.warn(
-          "Preload failed — model will download on first recall instead.",
-          err instanceof Error ? err.message : err,
-        );
-      }
-    }
-  }
+  Object.assign(answers, memoryAnswers, {
+    DANIEL_MEMORY_READ_MODE: "supermemory",
+    DANIEL_MEMORY_WRITE_MODE: "supermemory",
+    DANIEL_SUPERMEMORY_DREAMING: existing.DANIEL_SUPERMEMORY_DREAMING ?? "dynamic",
+    DANIEL_SUPERMEMORY_HISTORY_BACKFILL_DAYS:
+      existing.DANIEL_SUPERMEMORY_HISTORY_BACKFILL_DAYS ?? "0",
+    DANIEL_MEMORY_LEGACY_FALLBACK: "false",
+  });
 
   // ---- Local browser use ---------------------------------------------------
   banner("Local browser use — optional");

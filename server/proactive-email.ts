@@ -10,10 +10,23 @@ import { getRuntimeConfig, type RuntimeConfig } from "./runtime-config.js";
 import { runAgentRuntime } from "./runtimes/index.js";
 import { EMPTY_USAGE, type UsageTotals } from "./usage.js";
 import { handleUserMessage } from "./interaction-agent.js";
-import { sendImessage } from "./imessage.js";
+import { conversationIdForPhone, normalizeE164, sendImessage } from "./imessage.js";
 import { ensureTrigger, getComposio, listConnectedToolkits } from "./composio.js";
 import { ensureWebhookSubscription } from "./composio-webhook.js";
 import { describeUserNow } from "./timezone-config.js";
+import {
+  getSupermemoryProvider,
+  readMemoryProviderConfiguration,
+} from "./memory/supermemory/client.js";
+import { hydrateMemoryContext } from "./memory/supermemory/context.js";
+import {
+  deriveMemoryIdentity,
+  memoryIdSaltFingerprint,
+} from "./memory/supermemory/identity.js";
+import type {
+  DanielMemoryProvider,
+  MemoryHydrationResult,
+} from "./memory/supermemory/types.js";
 
 const TRIGGER_SLUG = "GMAIL_NEW_GMAIL_MESSAGE";
 const CLASSIFIER_MODEL = process.env.DANIEL_CLASSIFIER_MODEL ?? "claude-haiku-4-5-20251001";
@@ -53,6 +66,25 @@ export interface NormalizedEmail {
   snippet: string;
   body: string;
   timestamp?: string;
+}
+
+export interface ProactiveMemoryTarget {
+  phone: string;
+  conversationId: string;
+  memoryOwnerId: string;
+}
+
+/** Uses the same canonical phone identity as inbound iMessage turns. */
+export function resolveProactiveMemoryTarget(
+  rawPhone = process.env.DANIEL_USER_PHONE,
+): ProactiveMemoryTarget | null {
+  const phone = normalizeE164(rawPhone);
+  if (!phone || !/^\+[1-9]\d{7,14}$/.test(phone)) return null;
+  return {
+    phone,
+    conversationId: conversationIdForPhone(phone),
+    memoryOwnerId: phone,
+  };
 }
 
 // Pull the bare address out of a "Name <addr@example.com>" header. Falls
@@ -260,7 +292,7 @@ export async function classifyEmailImportance(
   return { important, summary, usage };
 }
 
-async function recallPreferenceLines(): Promise<string[]> {
+async function recallLegacyPreferenceLines(): Promise<string[]> {
   try {
     const rows = await convex.query(api.memoryRecords.list, {
       segment: "preference",
@@ -274,54 +306,183 @@ async function recallPreferenceLines(): Promise<string[]> {
   }
 }
 
-// Bring whatever the user put in DANIEL_USER_PHONE to E.164 (+1XXXXXXXXXX).
-// Without this, a bare 10-digit number in env produces an `sms:NNNNNNNNNN`
-// conversation that doesn't match the `sms:+1NNNNNNNNNN` ID the iMessage
-// bridge uses for inbound messages from the same person — proactive notices end up in
-// a parallel Convex conversation invisible to the user-driven thread.
-function normalizeProactivePhone(raw: string): string | null {
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-  if (trimmed.startsWith("+")) return trimmed;
-  if (/^\d{10}$/.test(trimmed)) return `+1${trimmed}`;
-  if (/^\d{11,15}$/.test(trimmed)) return `+${trimmed}`;
-  return null;
+type Environment = Record<string, string | undefined>;
+
+export interface ProactivePreferenceDependencies {
+  env?: Environment;
+  provider?: Pick<DanielMemoryProvider, "profile" | "search"> | null;
+  recallLegacy?: () => Promise<string[]>;
+  ensureIdentitySaltFingerprint?: (saltFingerprint: string) => Promise<string>;
 }
 
-async function dispatchProactiveNotice(summary: string): Promise<void> {
-  const raw = process.env.DANIEL_USER_PHONE;
-  if (!raw) {
-    console.warn("[proactive] DANIEL_USER_PHONE not set; skipping dispatch");
-    return;
+export interface ProactiveDispatchDependencies {
+  handleMessage?: typeof handleUserMessage;
+  send?: (phone: string, message: string) => Promise<boolean>;
+  persistAssistantMessage?: (input: {
+    conversationId: string;
+    role: "assistant";
+    content: string;
+  }) => Promise<unknown>;
+}
+
+const PROACTIVE_PREFERENCE_QUERY =
+  "Which emails should Daniel proactively surface or ignore, including important senders, topics, deadlines, and notification preferences?";
+
+function preferenceLinesFromHydration(hydration: MemoryHydrationResult): string[] {
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  for (const value of [
+    ...hydration.profile.static,
+    ...hydration.profile.dynamic,
+    ...hydration.results.map((result) => result.content),
+  ]) {
+    const line = value.trim();
+    const key = line.toLocaleLowerCase("en-US");
+    if (!line || seen.has(key)) continue;
+    seen.add(key);
+    lines.push(line);
+    if (lines.length === 20) break;
   }
-  const phone = normalizeProactivePhone(raw);
-  if (!phone) {
+  return lines;
+}
+
+function isProviderFailure(code: string | undefined): boolean {
+  return (
+    code === "authentication" ||
+    code === "provider" ||
+    code === "rate_limit" ||
+    code === "timeout"
+  );
+}
+
+/**
+ * Keeps legacy preferences user-facing in Convex/shadow mode, but hydrates
+ * the owner's private Supermemory container for shadow observation. After
+ * read cutover, only successful Supermemory profile/search data is returned;
+ * legacy fallback is reserved for provider failures during burn-in.
+ */
+export async function recallPreferenceLines(
+  target: Pick<ProactiveMemoryTarget, "conversationId" | "memoryOwnerId">,
+  dependencies: ProactivePreferenceDependencies = {},
+): Promise<string[]> {
+  const env = dependencies.env ?? process.env;
+  const recallLegacy = dependencies.recallLegacy ?? recallLegacyPreferenceLines;
+  let config;
+  try {
+    config = readMemoryProviderConfiguration(env);
+  } catch (error) {
     console.warn(
-      `[proactive] user phone=${JSON.stringify(raw)} doesn't look like a valid phone number; skipping dispatch`,
+      "[proactive] Supermemory preference configuration is invalid",
+      error instanceof Error ? error.name : "unknown error",
     );
+    return env.DANIEL_MEMORY_READ_MODE?.trim().toLowerCase() === "supermemory"
+      ? []
+      : recallLegacy();
+  }
+
+  if (config.readMode === "convex") return recallLegacy();
+
+  const recallSupermemory = async () => {
+    try {
+      const provider =
+        dependencies.provider === undefined
+          ? getSupermemoryProvider()
+          : dependencies.provider;
+      if (!provider) {
+        return { status: "failed" as const, lines: [], errorCode: "configuration" };
+      }
+      const currentSaltFingerprint = memoryIdSaltFingerprint(
+        env.DANIEL_MEMORY_ID_SALT,
+      );
+      const ensureIdentitySaltFingerprint =
+        dependencies.ensureIdentitySaltFingerprint ??
+        (async (saltFingerprint: string) =>
+          await convex.mutation(
+            api.memoryProviderState.ensureIdentitySaltFingerprint,
+            { saltFingerprint },
+          ));
+      const persistedSaltFingerprint = await ensureIdentitySaltFingerprint(
+        currentSaltFingerprint,
+      );
+      const owner = deriveMemoryIdentity(
+        {
+          conversationId: target.conversationId,
+          memoryOwnerId: target.memoryOwnerId,
+        },
+        {
+          salt: env.DANIEL_MEMORY_ID_SALT,
+          expectedSaltFingerprint: persistedSaltFingerprint,
+        },
+      );
+      const result = await hydrateMemoryContext({
+        provider,
+        owner,
+        currentUserMessage: PROACTIVE_PREFERENCE_QUERY,
+        mode: config.readMode,
+        env,
+      });
+      return {
+        status: result.status,
+        lines: preferenceLinesFromHydration(result.hydration),
+        errorCode: result.error?.code,
+      };
+    } catch (error) {
+      console.warn(
+        "[proactive] Supermemory preference recall could not start",
+        error instanceof Error ? error.name : "unknown error",
+      );
+      return { status: "failed" as const, lines: [], errorCode: "configuration" };
+    }
+  };
+
+  if (config.readMode === "shadow") {
+    const [legacy] = await Promise.all([recallLegacy(), recallSupermemory()]);
+    return legacy;
+  }
+
+  const providerResult = await recallSupermemory();
+  if (providerResult.status !== "failed") return providerResult.lines;
+  if (config.legacyFallback && isProviderFailure(providerResult.errorCode)) {
+    return recallLegacy();
+  }
+  return [];
+}
+
+export async function dispatchProactiveNotice(
+  summary: string,
+  target = resolveProactiveMemoryTarget(),
+  dependencies: ProactiveDispatchDependencies = {},
+): Promise<void> {
+  if (!target) {
+    console.warn("[proactive] DANIEL_USER_PHONE is missing or invalid; skipping dispatch");
     return;
   }
-  const conversationId = `sms:${phone}`;
-  const reply = await handleUserMessage({
-    conversationId,
+  const handleMessage = dependencies.handleMessage ?? handleUserMessage;
+  const send = dependencies.send ?? sendImessage;
+  const persistAssistantMessage =
+    dependencies.persistAssistantMessage ??
+    ((input) => convex.mutation(api.messages.send, input));
+  const reply = await handleMessage({
+    conversationId: target.conversationId,
+    memoryOwnerId: target.memoryOwnerId,
     content: `[proactive notice] ${summary}`,
     kind: "proactive",
   });
   // handleUserMessage only sends iMessage from inside send_ack; the final
   // reply is the caller's responsibility.
   if (reply && reply !== "(no reply)") {
-    await sendImessage(phone, reply);
-    await convex.mutation(api.messages.send, {
-      conversationId,
+    await send(target.phone, reply);
+    await persistAssistantMessage({
+      conversationId: target.conversationId,
       role: "assistant",
       content: reply,
     });
   } else {
     // IA stayed silent — fall back to the raw classifier summary so the
     // user still gets the notice; otherwise classification was a no-op.
-    await sendImessage(phone, summary);
-    await convex.mutation(api.messages.send, {
-      conversationId,
+    await send(target.phone, summary);
+    await persistAssistantMessage({
+      conversationId: target.conversationId,
       role: "assistant",
       content: summary,
     });
@@ -421,12 +582,13 @@ export async function handleEmailEvent(event: NormalizedTriggerEvent): Promise<v
     }
   }
 
-  const preferences = await recallPreferenceLines();
+  const target = resolveProactiveMemoryTarget();
+  const preferences = target ? await recallPreferenceLines(target) : [];
   const { important, summary } = await classifyEmailImportance(email, preferences);
   if (!important || !summary) {
     console.log(`[proactive] dropped (not important): ${email.subject}`);
     return;
   }
   console.log(`[proactive] surfacing: ${summary}`);
-  await dispatchProactiveNotice(summary);
+  await dispatchProactiveNotice(summary, target);
 }

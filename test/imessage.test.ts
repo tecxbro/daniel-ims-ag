@@ -80,7 +80,7 @@ describe("Photon iMessage bridge helpers", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
     try {
-      await sendImessage("+15551234567", "hello");
+      await expect(sendImessage("+15551234567", "hello")).resolves.toBe(false);
       expect(warn).toHaveBeenCalledWith("[imessage] missing Photon credentials - not sending");
     } finally {
       if (oldProjectId === undefined) delete process.env.PHOTON_PROJECT_ID;
@@ -88,5 +88,22 @@ describe("Photon iMessage bridge helpers", () => {
       if (oldProjectSecret === undefined) delete process.env.PHOTON_PROJECT_SECRET;
       else process.env.PHOTON_PROJECT_SECRET = oldProjectSecret;
     }
+  });
+
+  it("reports whether every outbound chunk was delivered", async () => {
+    const deliveredSpace = { send: vi.fn(async () => undefined) };
+    await expect(sendImessage("+15551234567", "hello", {
+      space: deliveredSpace as never,
+    })).resolves.toBe(true);
+
+    const failedSpace = {
+      send: vi.fn(async () => {
+        throw new Error("transport unavailable");
+      }),
+    };
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await expect(sendImessage("+15551234567", "hello", {
+      space: failedSpace as never,
+    })).resolves.toBe(false);
   });
 });

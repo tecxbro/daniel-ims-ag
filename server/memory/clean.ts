@@ -14,6 +14,13 @@ const DECAY_BETA = 0.8;
 const BASE_HALF_LIFE_DAYS = 11.25;
 const LN2 = Math.log(2);
 
+/** Historical implementation retained for decommission; runtime is frozen. */
+export function legacyCleanupEnabled(
+  _env: Record<string, string | undefined> = process.env,
+): false {
+  return false;
+}
+
 /**
  * Adaptive exponential decay ported from Ping's `applyMemoryDecay`
  * (ping/server/memory/background/decay.ts). The half-life scales with
@@ -51,6 +58,10 @@ export async function cleanMemories(): Promise<{
   archived: number;
   pruned: number;
 }> {
+  if (!legacyCleanupEnabled()) {
+    return { scanned: 0, archived: 0, pruned: 0 };
+  }
+
   const active = await convex.query(api.memoryRecords.list, { lifecycle: "active", limit: 500 });
   let archived = 0;
   let pruned = 0;
@@ -82,6 +93,7 @@ export async function cleanMemories(): Promise<{
 }
 
 export function startCleanupLoop(intervalMs = 6 * 60 * 60 * 1000): () => void {
+  if (!legacyCleanupEnabled()) return () => undefined;
   const timer = setInterval(() => {
     cleanMemories().catch((err) => console.error("[memory.clean] loop error", err));
   }, intervalMs);

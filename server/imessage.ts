@@ -1,7 +1,9 @@
 import { Buffer } from "node:buffer";
+import { randomUUID } from "node:crypto";
 import { api } from "../convex/_generated/api.js";
 import { convex } from "./convex-client.js";
 import { handleUserMessage } from "./interaction-agent.js";
+import { finalizeAssistantTurnCapture } from "./memory/supermemory/capture-recovery.js";
 import { broadcast } from "./broadcast.js";
 import { validateImageHeader, MAX_IMAGE_BYTES, type ImageMediaType } from "./images/mime.js";
 import { Spectrum, type Message, type Space } from "spectrum-ts";
@@ -125,33 +127,36 @@ export async function sendImessage(
   toNumber: string,
   text: string,
   options: SendOptions = {},
-): Promise<void> {
+): Promise<boolean> {
   const to = normalizeE164(toNumber);
   if (!to) {
     console.warn(`[imessage] invalid recipient ${JSON.stringify(toNumber)} - not sending`);
-    return;
+    return false;
   }
   let space: Space | null | undefined;
   try {
     space = options.space ?? (await resolveDmSpace(to));
   } catch (err) {
     console.error(`[imessage] failed to resolve DM space for ${to}:`, err);
-    return;
+    return false;
   }
   if (!space) {
     console.warn("[imessage] missing Photon credentials - not sending");
-    return;
+    return false;
   }
 
   const plain = stripMarkdown(text);
+  let delivered = true;
   for (const part of chunk(plain)) {
     try {
       await space.send(part);
       console.log(`[imessage] -> sent ${part.length} chars to ${to}`);
     } catch (err) {
       console.error(`[imessage] send failed to ${to}:`, err);
+      delivered = false;
     }
   }
+  return delivered;
 }
 
 export async function sendTypingIndicator(space: Space): Promise<void> {
@@ -290,6 +295,7 @@ async function handleSpectrumMessage(space: Space, message: Message): Promise<vo
   }
 
   const conversationId = conversationIdForPhone(fromNumber);
+  const turnId = `turn_${randomUUID()}`;
   const turnTag = Math.random().toString(36).slice(2, 8);
   const textForLog = textParts.join("\n").trim();
   const preview = textForLog.length > 100 ? textForLog.slice(0, 100) + "..." : textForLog;
@@ -304,9 +310,12 @@ async function handleSpectrumMessage(space: Space, message: Message): Promise<vo
   });
 
   const stopTyping = startTypingLoop(space);
+  let deliveredTurn = false;
   try {
     const reply = await handleUserMessage({
       conversationId,
+      memoryOwnerId: fromNumber,
+      turnId,
       content: textForLog,
       turnTag,
       images: ingested,
@@ -319,17 +328,28 @@ async function handleSpectrumMessage(space: Space, message: Message): Promise<vo
       console.log(
         `[turn ${turnTag}] -> reply (${elapsed}s, ${reply.length} chars): ${JSON.stringify(replyPreview)}`,
       );
-      await sendImessage(fromNumber, reply, { space });
-      await convex.mutation(api.messages.send, {
+      const delivered = await sendImessage(fromNumber, reply, { space });
+      if (!delivered) {
+        console.error(`[turn ${turnTag}] reply was not fully delivered; skipping memory capture`);
+        return;
+      }
+      deliveredTurn = true;
+      await finalizeAssistantTurnCapture({
         conversationId,
-        role: "assistant",
-        content: reply,
+        memoryOwnerId: fromNumber,
+        turnId,
+        userMessage: textForLog,
+        assistantReply: reply,
+        imageStorageIds: ingested.map((image) => image.storageId),
+        kind: "user",
+        channel: "imessage",
       });
     } else {
       console.log(`[turn ${turnTag}] -> (no reply)`);
     }
   } catch (err) {
     console.error(`[turn ${turnTag}] handler error`, err);
+    if (deliveredTurn) throw err;
   } finally {
     stopTyping();
   }

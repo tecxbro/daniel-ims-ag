@@ -1,731 +1,230 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useQuery } from "convex/react";
 import { api } from "../../../convex/_generated/api.js";
-import { useSocket, type SocketEvent } from "../lib/useSocket.js";
+import type { MemorySyncJobSummary, MemorySyncStatus } from "./EmbeddingBanner.js";
 import {
   EmptyState,
   HeaderPill,
   PanelPage,
-  bodyTextClass,
-  mutedTextClass,
   panelCardClass,
-  subtlePanelClass,
 } from "./PanelPrimitives.js";
 
-type Phase =
-  | "loaded"
-  | "proposing"
-  | "proposed"
-  | "judging"
-  | "judged"
-  | "applying"
-  | "completed"
-  | "failed";
-
-interface LivePhase {
-  runId: string;
-  phase: Phase;
-  memoriesCount?: number;
-  proposalsCount?: number;
-  approvedCount?: number;
-  rejectedCount?: number;
-  mergedCount?: number;
-  prunedCount?: number;
-  error?: string;
-  ts: number;
+interface SyncDashboardData {
+  sync: {
+    pending: number;
+    processing: number;
+    submitted: number;
+    completed: number;
+    failed: number;
+    deadLetter: number;
+    active: number;
+    total: number;
+    captureCompletionRate: number | null;
+    recentJobs: MemorySyncJobSummary[];
+  };
+  truncated: boolean;
 }
 
-const PHASE_CONFIG: Record<
-  string,
-  { icon: string; dot: string; color: string; label: string }
-> = {
-  started: { icon: "🚀", dot: "bg-sky-400", color: "text-sky-400", label: "STARTED" },
-  loaded: { icon: "📥", dot: "bg-sky-400", color: "text-sky-400", label: "LOADED MEMORIES" },
-  proposing: {
-    icon: "📋",
-    dot: "bg-emerald-400 live-dot",
-    color: "text-emerald-400",
-    label: "PROPOSER THINKING",
-  },
-  proposed: {
-    icon: "📋",
-    dot: "bg-emerald-400",
-    color: "text-emerald-400",
-    label: "PROPOSALS",
-  },
-  judging: {
-    icon: "⚖️",
-    dot: "bg-amber-400 live-dot",
-    color: "text-amber-400",
-    label: "JUDGE DELIBERATING",
-  },
-  judged: { icon: "⚖️", dot: "bg-amber-400", color: "text-amber-400", label: "VERDICT" },
-  applying: { icon: "🔧", dot: "bg-cyan-400", color: "text-cyan-400", label: "APPLYING" },
-  completed: {
-    icon: "🏁",
-    dot: "bg-emerald-400",
-    color: "text-emerald-400",
-    label: "COMPLETED",
-  },
-  failed: { icon: "❌", dot: "bg-rose-400", color: "text-rose-400", label: "FAILED" },
-};
+const STATUS_ORDER: { key: keyof Omit<SyncDashboardData["sync"], "active" | "total" | "captureCompletionRate" | "recentJobs">; label: string }[] = [
+  { key: "pending", label: "Pending" },
+  { key: "processing", label: "Processing" },
+  { key: "submitted", label: "Submitted" },
+  { key: "completed", label: "Completed" },
+  { key: "failed", label: "Failed" },
+  { key: "deadLetter", label: "Dead letter" },
+];
 
-function timeAgo(ts?: number): string {
-  if (!ts) return "—";
-  const diff = Date.now() - ts;
-  if (diff < 60_000) return "just now";
-  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)}m ago`;
-  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)}h ago`;
-  return `${Math.floor(diff / 86_400_000)}d ago`;
+function formatTime(value: number | undefined): string {
+  return value
+    ? new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" }).format(value)
+    : "Not scheduled";
 }
 
-export function ConsolidationPanel({ isDark }: { isDark: boolean }) {
-  const runs = useQuery(api.consolidation.listRuns, { limit: 50 });
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [livePhases, setLivePhases] = useState<Record<string, LivePhase[]>>({});
-  const [triggering, setTriggering] = useState(false);
+function humanize(value: string): string {
+  return value.replaceAll("_", " ");
+}
 
-  useSocket((evt: SocketEvent) => {
-    if (
-      evt.event === "consolidation_started" ||
-      evt.event === "consolidation_phase" ||
-      evt.event === "consolidation_completed" ||
-      evt.event === "consolidation_failed"
-    ) {
-      const data = evt.data as any;
-      const id = data.runId;
-      if (!id) return;
-      let phase: Phase;
-      if (evt.event === "consolidation_started") phase = "loaded";
-      else if (evt.event === "consolidation_completed") phase = "completed";
-      else if (evt.event === "consolidation_failed") phase = "failed";
-      else phase = data.phase as Phase;
-      setLivePhases((prev) => {
-        const next = { ...prev };
-        next[id] = [
-          ...(prev[id] ?? []),
-          { ...data, phase, runId: id, ts: evt.at },
-        ];
-        return next;
-      });
-    }
-  });
-
-  async function triggerManual() {
-    setTriggering(true);
-    try {
-      await fetch("/api/consolidate", { method: "POST" });
-    } finally {
-      setTimeout(() => setTriggering(false), 1500);
-    }
+function statusTone(status: MemorySyncStatus, isDark: boolean): string {
+  if (status === "completed") {
+    return isDark
+      ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-300"
+      : "border-emerald-200 bg-emerald-50 text-emerald-700";
   }
+  if (status === "failed") {
+    return isDark
+      ? "border-amber-400/20 bg-amber-400/10 text-amber-300"
+      : "border-amber-200 bg-amber-50 text-amber-700";
+  }
+  if (status === "dead_letter") {
+    return isDark
+      ? "border-rose-400/20 bg-rose-400/10 text-rose-300"
+      : "border-rose-200 bg-rose-50 text-rose-700";
+  }
+  return isDark
+    ? "border-sky-400/20 bg-sky-400/10 text-sky-300"
+    : "border-sky-200 bg-sky-50 text-sky-700";
+}
 
-  const list = runs ?? [];
-  const hoverBg = isDark ? "hover:bg-white/5" : "hover:bg-zinc-50";
-  const muted = mutedTextClass(isDark);
+async function retryMemoryJob(job: MemorySyncJobSummary): Promise<void> {
+  const endpoint =
+    job.status === "dead_letter"
+      ? "/api/memory/retry-dead-letter"
+      : "/api/memory/retry-job";
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    body: JSON.stringify({ jobId: job.jobId }),
+  });
+  const payload = (await response.json().catch(() => null)) as
+    | { ok?: boolean; error?: { message?: string } | string }
+    | null;
+  if (!response.ok || payload?.ok !== true) {
+    const error = payload?.error;
+    const message =
+      typeof error === "string"
+        ? error
+        : error?.message ?? `Retry failed (${response.status})`;
+    throw new Error(message);
+  }
+}
 
-  if (selectedId) {
-    return (
-      <ConsolidationDetail
-        runId={selectedId}
-        phases={livePhases[selectedId] ?? []}
-        onBack={() => setSelectedId(null)}
-        isDark={isDark}
-      />
-    );
+export function MemorySyncPanel({ isDark }: { isDark: boolean }) {
+  const data = useQuery(api.dashboard.metrics, {}) as SyncDashboardData | undefined;
+  const [retryingJobId, setRetryingJobId] = useState<string | null>(null);
+  const [retryMessage, setRetryMessage] = useState("Select a failed job to retry it.");
+  const sync = data?.sync;
+
+  async function retry(job: MemorySyncJobSummary) {
+    setRetryingJobId(job.jobId);
+    setRetryMessage(`Retrying ${job.jobId}…`);
+    try {
+      await retryMemoryJob(job);
+      setRetryMessage(`${job.jobId} was queued for another attempt.`);
+    } catch (cause) {
+      setRetryMessage(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setRetryingJobId(null);
+    }
   }
 
   return (
     <PanelPage
-      eyebrow="Maintenance"
-      title="Consolidation"
-      description="Memory cleanup runs that merge duplicates, prune stale records, and preserve reasoning."
-      stat={<HeaderPill isDark={isDark}>{list.length} run{list.length === 1 ? "" : "s"}</HeaderPill>}
-      action={
-        <button
-          onClick={triggerManual}
-          disabled={triggering}
-          className={`rounded-xl px-3 py-1.5 text-xs font-medium transition disabled:opacity-50 ${
-            isDark ? "bg-zinc-100 text-zinc-950 hover:bg-white" : "bg-zinc-950 text-white hover:bg-zinc-800"
-          }`}
-        >
-          {triggering ? "Running…" : "Run now"}
-        </button>
-      }
+      eyebrow="Durable outbox"
+      title="Memory sync"
+      description="Synchronization state between Convex application data and the Supermemory provider."
+      stat={<HeaderPill isDark={isDark}>{sync?.active ?? 0} active</HeaderPill>}
+      maxWidth="max-w-[1120px]"
     >
+      <section aria-label="Synchronization counts" className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
+        {STATUS_ORDER.map(({ key, label }) => (
+          <div key={key} className={panelCardClass(isDark, "min-w-0 p-4")}>
+            <div className={`text-[11px] font-medium ${isDark ? "text-zinc-500" : "text-zinc-500"}`}>{label}</div>
+            <div className={`mt-1 text-2xl font-semibold mono ${key === "deadLetter" && (sync?.[key] ?? 0) > 0 ? "text-rose-400" : isDark ? "text-zinc-100" : "text-zinc-950"}`}>
+              {sync?.[key] ?? 0}
+            </div>
+          </div>
+        ))}
+      </section>
 
-      <div className="space-y-3">
-        {runs === undefined ? (
-          <div className="space-y-3">
-            {[1, 2].map((i) => (
-              <div key={i} className={panelCardClass(isDark, "h-20 shimmer")} />
+      <section className={panelCardClass(isDark, "overflow-hidden")} aria-labelledby="sync-summary-heading">
+        <div className={`flex flex-col gap-3 border-b px-5 py-4 sm:flex-row sm:items-center sm:justify-between ${isDark ? "border-white/10" : "border-zinc-200"}`}>
+          <div>
+            <h2 id="sync-summary-heading" className={`text-sm font-semibold ${isDark ? "text-zinc-100" : "text-zinc-950"}`}>Outbox health</h2>
+            <p className={`mt-1 text-xs ${isDark ? "text-zinc-500" : "text-zinc-500"}`}>
+              {sync?.captureCompletionRate === null || sync?.captureCompletionRate === undefined
+                ? "Completion rate is unavailable until terminal jobs exist."
+                : `${(sync.captureCompletionRate * 100).toFixed(1)}% terminal-job completion rate.`}
+              {data?.truncated ? " Counts are a bounded snapshot." : ""}
+            </p>
+          </div>
+          <p role="status" aria-live="polite" className={`max-w-lg text-xs ${isDark ? "text-zinc-400" : "text-zinc-600"}`}>
+            {retryMessage}
+          </p>
+        </div>
+
+        {!data ? (
+          <div className="space-y-3 p-5" aria-label="Loading synchronization jobs">
+            {[1, 2, 3].map((item) => (
+              <div key={item} className={`h-20 rounded-xl shimmer ${isDark ? "bg-white/5" : "bg-zinc-100"}`} />
             ))}
           </div>
-        ) : list.length === 0 ? (
+        ) : data.sync.recentJobs.length === 0 ? (
           <EmptyState isDark={isDark}>
-            No consolidation runs yet. The loop runs daily, or hit "Run now" to
-            trigger one.
-            <p className={`text-xs mt-2 ${muted}`}>
-              Consolidation reviews your memories for duplicates and
-              contradictions, then merges or prunes via a proposer and judge pipeline.
-            </p>
+            No synchronization jobs yet. Completed conversations and explicit memory operations will enqueue durable work.
           </EmptyState>
         ) : (
-          list.map((run: any) => {
-            const isActive = run.status === "running";
-            const statusCfg =
-              run.status === "completed"
-                ? PHASE_CONFIG.completed
-                : run.status === "failed"
-                  ? PHASE_CONFIG.failed
-                  : PHASE_CONFIG.started;
-            const durationMs =
-              run.completedAt && run.startedAt
-                ? run.completedAt - run.startedAt
-                : Date.now() - run.startedAt;
-            return (
-              <div
-                key={run._id}
-                onClick={() => setSelectedId(run.runId)}
-                className={`${panelCardClass(isDark, "cursor-pointer px-4 py-3.5 transition-colors fade-in")} ${hoverBg}`}
-              >
-                <div className="flex items-center gap-2.5 mb-1.5">
-                  <span className="relative flex h-2.5 w-2.5 shrink-0">
-                    {isActive && (
-                      <span
-                        className={`absolute inline-flex h-full w-full rounded-full ${statusCfg.dot} pulse-ring`}
-                      />
-                    )}
-                    <span
-                      className={`relative inline-flex rounded-full h-2.5 w-2.5 ${statusCfg.dot}`}
-                    />
-                  </span>
-                  <span
-                    className={`text-sm font-medium ${
-                      isDark ? "text-zinc-100" : "text-zinc-900"
-                    }`}
-                  >
-                    {statusCfg.label}
-                  </span>
-                  <span className={`text-[10px] mono ${muted}`}>
-                    trigger: {run.trigger}
-                  </span>
-                  <span className={`text-xs ml-auto mono ${muted}`}>
-                    {timeAgo(run.startedAt)} · {(durationMs / 1000).toFixed(1)}s
-                  </span>
-                </div>
-
-                <div className="flex items-center gap-4 ml-5 text-[11px] mono">
-                  <Metric
-                    label="proposals"
-                    value={run.proposalsCount}
-                    color={isDark ? "text-emerald-400" : "text-emerald-600"}
-                  />
-                  <Metric
-                    label="merged"
-                    value={run.mergedCount}
-                    color={isDark ? "text-sky-400" : "text-sky-600"}
-                  />
-                  <Metric
-                    label="pruned"
-                    value={run.prunedCount}
-                    color={isDark ? "text-rose-400" : "text-rose-600"}
-                  />
-                  {run.notes && (
-                    <span className={`${muted} truncate`}>{run.notes}</span>
-                  )}
-                </div>
-              </div>
-            );
-          })
-        )}
-      </div>
-    </PanelPage>
-  );
-}
-
-function Metric({
-  label,
-  value,
-  color,
-}: {
-  label: string;
-  value: number;
-  color: string;
-}) {
-  return (
-    <span>
-      <span className={color}>{value ?? 0}</span>
-      <span className="opacity-60 ml-1">{label}</span>
-    </span>
-  );
-}
-
-function ConsolidationDetail({
-  runId,
-  phases,
-  onBack,
-  isDark,
-}: {
-  runId: string;
-  phases: LivePhase[];
-  onBack: () => void;
-  isDark: boolean;
-}) {
-  const runs = useQuery(api.consolidation.listRuns, { limit: 80 });
-  const run = runs?.find((r: any) => r.runId === runId);
-  const [allPhases, setAllPhases] = useState<LivePhase[]>(phases);
-
-  // Keep absorbing live phases that arrive while the detail is open
-  useSocket((evt: SocketEvent) => {
-    const data = evt.data as any;
-    if (data?.runId !== runId) return;
-    if (
-      evt.event === "consolidation_phase" ||
-      evt.event === "consolidation_started" ||
-      evt.event === "consolidation_completed" ||
-      evt.event === "consolidation_failed"
-    ) {
-      let phase: Phase;
-      if (evt.event === "consolidation_started") phase = "loaded";
-      else if (evt.event === "consolidation_completed") phase = "completed";
-      else if (evt.event === "consolidation_failed") phase = "failed";
-      else phase = data.phase as Phase;
-      setAllPhases((prev) => [...prev, { ...data, phase, runId, ts: evt.at }]);
-    }
-  });
-
-  useEffect(() => {
-    setAllPhases(phases);
-  }, [runId]);
-
-  const muted = mutedTextClass(isDark);
-
-  if (!run) {
-    return (
-      <div className="mx-auto max-w-[1040px] pb-10">
-        <button
-          onClick={onBack}
-          className={`mb-3 rounded-xl px-2.5 py-1.5 text-xs ${
-            isDark
-              ? "bg-white/5 text-zinc-400"
-              : "bg-zinc-100 text-zinc-500"
-          }`}
-        >
-          Back
-        </button>
-        <div
-          className={`text-sm ${mutedTextClass(isDark)}`}
-        >
-          Loading run {runId}…
-        </div>
-      </div>
-    );
-  }
-
-  const statusCfg =
-    run.status === "completed"
-      ? PHASE_CONFIG.completed
-      : run.status === "failed"
-        ? PHASE_CONFIG.failed
-        : PHASE_CONFIG.started;
-
-  return (
-    <div className="mx-auto max-w-[1040px] space-y-4 pb-10 fade-in">
-      <div className="flex flex-wrap items-center gap-2">
-        <button
-          onClick={onBack}
-          className={`rounded-xl px-2.5 py-1.5 text-xs transition-colors ${
-            isDark
-              ? "bg-white/5 text-zinc-400 hover:bg-white/10 hover:text-zinc-200"
-              : "bg-zinc-100 text-zinc-500 hover:bg-zinc-200 hover:text-zinc-800"
-          }`}
-        >
-          Back
-        </button>
-        <span
-          className={`relative flex h-2.5 w-2.5 shrink-0 ${statusCfg.color}`}
-        >
-          {run.status === "running" && (
-            <span
-              className={`absolute inline-flex h-full w-full rounded-full ${statusCfg.dot} pulse-ring`}
-            />
-          )}
-          <span
-            className={`relative inline-flex rounded-full h-2.5 w-2.5 ${statusCfg.dot}`}
-          />
-        </span>
-        <span
-          className={`text-sm font-medium ${
-            isDark ? "text-zinc-100" : "text-zinc-900"
-          }`}
-        >
-          Consolidation {runId.slice(-6)}
-        </span>
-        <span className={`text-xs ${statusCfg.color}`}>{statusCfg.label}</span>
-        <span className={`text-xs mono ml-auto ${muted}`}>
-          trigger: {run.trigger}
-        </span>
-      </div>
-
-      <div className={panelCardClass(isDark, "grid grid-cols-4 gap-4 px-5 py-3 text-center")}>
-        <SummaryStat
-          label="proposals"
-          value={run.proposalsCount}
-          color="text-emerald-400"
-          isDark={isDark}
-        />
-        <SummaryStat
-          label="merged"
-          value={run.mergedCount}
-          color="text-sky-400"
-          isDark={isDark}
-        />
-        <SummaryStat
-          label="pruned"
-          value={run.prunedCount}
-          color="text-rose-400"
-          isDark={isDark}
-        />
-        <SummaryStat
-          label="duration"
-          value={
-            run.completedAt && run.startedAt
-              ? `${((run.completedAt - run.startedAt) / 1000).toFixed(1)}s`
-              : "…"
-          }
-          color={isDark ? "text-slate-300" : "text-slate-700"}
-          isDark={isDark}
-        />
-      </div>
-
-      <div className={panelCardClass(isDark, "space-y-6 px-5 py-4")}>
-          <section>
-          <div
-            className={`text-[10px] font-semibold uppercase tracking-wider mb-3 ${muted}`}
-          >
-            Pipeline Timeline
-          </div>
-          {allPhases.length === 0 ? (
-            <div className={`text-sm ${muted}`}>
-              {run.status === "completed" || run.status === "failed"
-                ? "Phase events stream live; this run already finished. The full result is preserved below."
-                : "Waiting for phase events…"}
-            </div>
-          ) : (
-            <div className="space-y-0">
-              {allPhases.map((p, i) => {
-                const cfg = PHASE_CONFIG[p.phase] ?? PHASE_CONFIG.started;
-                const isLast = i === allPhases.length - 1;
-                return (
-                  <div key={`${p.ts}-${i}`} className="flex gap-3 slide-down">
-                    <div className="flex flex-col items-center shrink-0 w-5">
-                      <div className="mt-1.5 text-[14px] leading-none">
-                        {cfg.icon}
-                      </div>
-                      {!isLast && (
-                        <div
-                          className={`flex-1 w-px mt-1 ${
-                            isDark ? "bg-white/10" : "bg-zinc-200"
-                          }`}
-                        />
-                      )}
-                    </div>
-                    <div className="flex-1 min-w-0 pb-4">
-                      <div className="flex items-center gap-2 mb-0.5">
-                        <span
-                          className={`text-[10px] font-bold mono tracking-wider ${cfg.color}`}
-                        >
-                          {cfg.label}
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[820px] border-collapse text-start text-xs">
+              <thead className={isDark ? "bg-black/20 text-zinc-500" : "bg-zinc-50 text-zinc-500"}>
+                <tr>
+                  <th scope="col" className="px-5 py-3 text-start font-medium">Job</th>
+                  <th scope="col" className="px-3 py-3 text-start font-medium">State</th>
+                  <th scope="col" className="px-3 py-3 text-start font-medium">Attempts</th>
+                  <th scope="col" className="px-3 py-3 text-start font-medium">Next attempt</th>
+                  <th scope="col" className="px-3 py-3 text-start font-medium">Provider references</th>
+                  <th scope="col" className="px-5 py-3 text-end font-medium">Action</th>
+                </tr>
+              </thead>
+              <tbody className={isDark ? "divide-y divide-white/10" : "divide-y divide-zinc-200"}>
+                {data.sync.recentJobs.map((job) => {
+                  const retryable = job.status === "failed" || job.status === "dead_letter";
+                  const busy = retryingJobId === job.jobId;
+                  return (
+                    <tr key={job.jobId} className={isDark ? "text-zinc-300" : "text-zinc-700"}>
+                      <td className="max-w-[260px] px-5 py-4 align-top">
+                        <div className="truncate font-medium mono" title={job.jobId}>{job.jobId}</div>
+                        <div className={`mt-1 capitalize ${isDark ? "text-zinc-500" : "text-zinc-500"}`}>{humanize(job.kind)}</div>
+                        {job.lastError && <p className="mt-2 break-words text-rose-400">{job.lastError}</p>}
+                      </td>
+                      <td className="px-3 py-4 align-top">
+                        <span className={`inline-flex rounded-full border px-2 py-1 text-[10px] font-semibold uppercase ${statusTone(job.status, isDark)}`}>
+                          {humanize(job.status)}
                         </span>
-                        <span className={`text-[10px] mono ${muted}`}>
-                          {new Date(p.ts).toLocaleTimeString()}
-                        </span>
-                      </div>
-                      <div
-                        className={`text-xs ${
-                          bodyTextClass(isDark)
-                        } mono`}
-                      >
-                        {p.memoriesCount !== undefined &&
-                          `memories scanned: ${p.memoriesCount}`}
-                        {p.proposalsCount !== undefined &&
-                          `proposals: ${p.proposalsCount}`}
-                        {p.approvedCount !== undefined &&
-                          `approved: ${p.approvedCount} · rejected: ${p.rejectedCount ?? 0}`}
-                        {p.mergedCount !== undefined &&
-                          `merged: ${p.mergedCount} · pruned: ${p.prunedCount ?? 0}`}
-                        {p.error && (
-                          <span className="text-rose-400">{p.error}</span>
+                      </td>
+                      <td className="px-3 py-4 align-top mono">{job.attempts}</td>
+                      <td className="px-3 py-4 align-top">{formatTime(job.nextAttemptAt)}</td>
+                      <td className="max-w-[260px] px-3 py-4 align-top">
+                        {job.providerDocumentId ? (
+                          <div className="truncate mono" title={job.providerDocumentId}>doc:{job.providerDocumentId}</div>
+                        ) : (
+                          <span className={isDark ? "text-zinc-600" : "text-zinc-400"}>No document ID</span>
                         )}
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-          )}
-        </section>
-
-        <ReasoningSection run={run} isDark={isDark} />
-
-        {run.notes && (
-          <section>
-            <div
-              className={`text-[10px] font-semibold uppercase tracking-wider mb-2 ${muted}`}
-            >
-              Notes
-            </div>
-            <div
-              className={`text-xs ${
-                isDark ? "text-slate-400" : "text-slate-600"
-              }`}
-            >
-              {run.notes}
-            </div>
-          </section>
+                        {job.providerMemoryIds.length > 0 && (
+                          <div className="mt-1 truncate mono" title={job.providerMemoryIds.join(", ")}>
+                            {job.providerMemoryIds.length} provider {job.providerMemoryIds.length === 1 ? "memory" : "memories"}
+                          </div>
+                        )}
+                      </td>
+                      <td className="px-5 py-4 text-end align-top">
+                        {retryable ? (
+                          <button
+                            type="button"
+                            onClick={() => void retry(job)}
+                            aria-busy={busy}
+                            className={`min-h-9 rounded-xl border px-3 font-medium outline-none transition focus-visible:ring-2 focus-visible:ring-emerald-500 ${
+                              isDark
+                                ? "border-white/10 bg-white/5 text-zinc-200 hover:bg-white/10"
+                                : "border-zinc-200 bg-white text-zinc-700 hover:bg-zinc-50"
+                            }`}
+                          >
+                            {busy
+                              ? "Retrying…"
+                              : job.status === "dead_letter"
+                                ? "Retry dead letter"
+                                : "Retry job"}
+                          </button>
+                        ) : (
+                          <span className={isDark ? "text-zinc-600" : "text-zinc-400"}>No action</span>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
         )}
-      </div>
-    </div>
-  );
-}
-
-function ReasoningSection({ run, isDark }: { run: any; isDark: boolean }) {
-  const muted = isDark ? "text-slate-500" : "text-slate-400";
-  let details: any = null;
-  try {
-    details = run.details ? JSON.parse(run.details) : null;
-  } catch {
-    /* invalid JSON */
-  }
-
-  if (!details || !details.proposals?.length) {
-    return (
-      <section>
-        <div
-          className={`text-[10px] font-semibold uppercase tracking-wider mb-2 ${muted}`}
-        >
-          Proposals & Decisions
-        </div>
-        <div className={`text-sm ${muted}`}>
-          {run.status === "running"
-            ? "Proposals will appear here when the proposer finishes."
-            : run.proposalsCount === 0
-              ? "Proposer found nothing to change."
-              : "No stored reasoning for this run (this was likely a pre-upgrade run)."}
-        </div>
       </section>
-    );
-  }
-
-  const decisions: any[] = details.decisions ?? [];
-  const applied: any[] = details.applied ?? [];
-  const snapshots: Record<string, { content: string; segment: string; tier: string }> =
-    details.memorySnapshots ?? {};
-  const decisionByIdx = new Map<number, any>();
-  for (const d of decisions) decisionByIdx.set(d.proposalIndex, d);
-  const appliedByIdx = new Set<number>(applied.map((a) => a.proposalIndex));
-
-  const renderRef = (id: string) => (
-    <MemoryRef id={id} snap={snapshots[id]} isDark={isDark} />
-  );
-  const renderRefList = (ids: string[]) =>
-    ids.length === 0 ? (
-      <span className={muted}>(none)</span>
-    ) : (
-      <div className="space-y-1 mt-0.5">
-        {ids.map((id) => (
-          <div key={id}>{renderRef(id)}</div>
-        ))}
-      </div>
-    );
-
-  return (
-    <section>
-      <div
-        className={`text-[10px] font-semibold uppercase tracking-wider mb-3 ${muted}`}
-      >
-        Proposals & Decisions · {details.proposals.length} total
-      </div>
-      <div className="space-y-2">
-        {details.proposals.map((p: any, idx: number) => {
-          const d = decisionByIdx.get(idx);
-          const wasApplied = appliedByIdx.has(idx);
-          const outcome =
-            !d
-              ? { label: "NO DECISION", color: "text-slate-400", bg: "bg-slate-500/10", border: "border-slate-500/20" }
-              : d.approve && wasApplied
-                ? { label: "APPLIED", color: "text-emerald-400", bg: "bg-emerald-500/10", border: "border-emerald-500/20" }
-                : d.approve
-                  ? { label: "APPROVED (skipped)", color: "text-amber-400", bg: "bg-amber-500/10", border: "border-amber-500/20" }
-                  : { label: "REJECTED", color: "text-rose-400", bg: "bg-rose-500/10", border: "border-rose-500/20" };
-
-          return (
-            <div
-              key={idx}
-              className={`border rounded-lg p-3 ${
-                isDark
-                  ? "bg-slate-900/50 border-slate-800"
-                  : "bg-slate-50 border-slate-200"
-              }`}
-            >
-              <div className="flex items-center gap-2 mb-1.5">
-                <span
-                  className={`text-[10px] px-1.5 py-0.5 rounded border font-semibold mono ${outcome.color} ${outcome.bg} ${outcome.border}`}
-                >
-                  {outcome.label}
-                </span>
-                <span
-                  className={`text-[10px] mono uppercase ${
-                    isDark ? "text-slate-400" : "text-slate-500"
-                  }`}
-                >
-                  {p.type}
-                </span>
-                <span className={`text-[10px] mono ml-auto ${muted}`}>
-                  #{idx}
-                </span>
-              </div>
-
-              {/* Proposal body */}
-              <div className={`text-xs space-y-1 mono`}>
-                {p.type === "merge" && (
-                  <>
-                    <div className={isDark ? "text-slate-300" : "text-slate-700"}>
-                      <span className={muted}>keep:</span>
-                      <div className="mt-0.5">{p.keep && renderRef(p.keep)}</div>
-                    </div>
-                    <div className={isDark ? "text-slate-300" : "text-slate-700"}>
-                      <span className={muted}>absorb:</span>
-                      {renderRefList(p.absorb ?? [])}
-                    </div>
-                    {p.rewriteContent && (
-                      <div
-                        className={`mt-1 p-2 rounded ${
-                          isDark ? "bg-slate-950/60 text-slate-300" : "bg-white text-slate-700"
-                        } text-[11px]`}
-                      >
-                        → {p.rewriteContent}
-                      </div>
-                    )}
-                  </>
-                )}
-                {p.type === "supersede" && (
-                  <>
-                    <div className={isDark ? "text-slate-300" : "text-slate-700"}>
-                      <span className={muted}>newer:</span>
-                      <div className="mt-0.5">{p.newer && renderRef(p.newer)}</div>
-                    </div>
-                    <div className={isDark ? "text-slate-300" : "text-slate-700"}>
-                      <span className={muted}>older:</span>
-                      {renderRefList(p.older ?? [])}
-                    </div>
-                  </>
-                )}
-                {p.type === "prune" && (
-                  <>
-                    <div className={isDark ? "text-slate-300" : "text-slate-700"}>
-                      <span className={muted}>memoryId:</span>
-                      <div className="mt-0.5">{p.memoryId && renderRef(p.memoryId)}</div>
-                    </div>
-                    {p.reason && (
-                      <div className={isDark ? "text-slate-400" : "text-slate-600"}>
-                        <span className={muted}>reason:</span> {p.reason}
-                      </div>
-                    )}
-                  </>
-                )}
-              </div>
-
-              {/* Judge rationale */}
-              {d && (
-                <div
-                  className={`mt-2 pt-2 border-t text-[11px] ${
-                    isDark
-                      ? "border-slate-800 text-slate-400"
-                      : "border-slate-200 text-slate-600"
-                  }`}
-                >
-                  <span
-                    className={`text-[10px] font-bold mono ${
-                      d.approve
-                        ? isDark
-                          ? "text-emerald-400"
-                          : "text-emerald-600"
-                        : isDark
-                          ? "text-rose-400"
-                          : "text-rose-600"
-                    }`}
-                  >
-                    JUDGE{" "}
-                  </span>
-                  {d.rationale}
-                </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
-    </section>
-  );
-}
-
-function SummaryStat({
-  label,
-  value,
-  color,
-  isDark,
-}: {
-  label: string;
-  value: number | string;
-  color: string;
-  isDark: boolean;
-}) {
-  return (
-    <div>
-      <div className={`text-xl font-bold mono ${color}`}>{value ?? 0}</div>
-      <div className={`text-[10px] uppercase tracking-wider ${isDark ? "text-slate-500" : "text-slate-400"}`}>
-        {label}
-      </div>
-    </div>
-  );
-}
-
-function MemoryRef({
-  id,
-  snap,
-  isDark,
-}: {
-  id: string;
-  snap?: { content: string; segment: string; tier: string };
-  isDark: boolean;
-}) {
-  const muted = isDark ? "text-slate-500" : "text-slate-400";
-  const idColor = isDark ? "text-slate-500" : "text-slate-400";
-  const contentColor = isDark ? "text-slate-200" : "text-slate-800";
-  const tagColor = isDark ? "text-sky-400" : "text-sky-600";
-
-  if (!snap) {
-    return (
-      <span className={`text-[11px] mono ${idColor}`}>
-        {id} <span className={muted}>· (no snapshot)</span>
-      </span>
-    );
-  }
-
-  return (
-    <div
-      className={`rounded border px-2 py-1.5 ${
-        isDark ? "bg-slate-950/40 border-slate-800/80" : "bg-white border-slate-200"
-      }`}
-    >
-      <div className="flex items-center gap-1.5 mb-0.5">
-        <span className={`text-[10px] mono ${idColor}`}>{id}</span>
-        <span className={`text-[9px] mono uppercase ${tagColor}`}>
-          {snap.tier}/{snap.segment}
-        </span>
-      </div>
-      <div className={`text-[11px] ${contentColor}`}>{snap.content}</div>
-    </div>
+    </PanelPage>
   );
 }
