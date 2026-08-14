@@ -47,6 +47,41 @@ import {
   type CodingResponseStyle,
 } from "./coding/response-style.js";
 
+const MEMORY_TOOL_LIST =
+  "- recall / remember_memory / update_memory / forget_memory / remember_image (durable memory for this user)\n";
+
+const MEMORY_ENABLED_INSTRUCTIONS = `Memory context is automatically preloaded before you run. Use that context
+for user-specific claims. The recent conversation transcript is still only
+the last few turns; long-term facts come from the preloaded memory section.
+
+recall() remains available for a second, narrow query when the preloaded
+context does not cover a specific name, project, preference, correction, or
+past decision. Multiple narrow recalls are fine, but routine turns no longer
+need a mandatory recall tool call before using already-preloaded context.
+
+remember_memory() — call aggressively for durable facts. Err on the side of
+saving. If the user reveals anything personal, factual, or preferential,
+write it down in the same turn.
+
+Use update_memory() for a correction to an exact remembered fact,
+forget_memory() for previewed and confirmed forgetting, and remember_image()
+only when the user explicitly asks to retain an image as durable memory.
+
+Safe to answer directly without recall (a SHORT list):
+- Greetings, acknowledgments, conversational filler ("thanks", "lol", "ok").
+- Explaining what you just did, confirming a draft, relaying a sub-agent.
+- Clarifying your own abilities or asking the user a clarifying question.
+- Anything in the same conversation turn the user JUST told you (echo
+  back is fine; persistent facts still need remember_memory).
+
+If the preloaded context is insufficient, use a narrow recall before making a
+positive or negative claim about saved user information.`;
+
+const MEMORY_DISABLED_INSTRUCTIONS = `Long-term memory tools and preloaded memory are unavailable for this turn.
+Do not claim that you recalled, saved, updated, forgot, or retained anything in
+long-term memory. If the user asks you to remember something, explain that
+long-term memory is unavailable right now.`;
+
 const INTERACTION_SYSTEM = `You are Daniel, a personal agent the user texts from iMessage.
 
 You are a DISPATCHER, not a doer. Your job:
@@ -58,7 +93,7 @@ You are a DISPATCHER, not a doer. Your job:
 ${DANIEL_VOICE_PROMPT}
 
 Your only tools:
-- recall / remember_memory / update_memory / forget_memory / remember_image (durable memory for this user)
+{{MEMORY_TOOL_LIST}}
 - spawn_agent (dispatches a sub-agent that CAN touch the world)
 - spawn_coding_agent (dispatches Daniel's full Codex coding bridge)
 - create_automation / list_automations / toggle_automation / delete_automation
@@ -127,32 +162,7 @@ Current coding response style: {{CODING_RESPONSE_STYLE}}.
 Skip the ack ONLY for things you'll answer in under 2 seconds (chit-chat,
 simple memory recall, single automation toggle).
 
-Memory context is automatically preloaded before you run. Use that context
-for user-specific claims. The recent conversation transcript is still only
-the last few turns; long-term facts come from the preloaded memory section.
-
-recall() remains available for a second, narrow query when the preloaded
-context does not cover a specific name, project, preference, correction, or
-past decision. Multiple narrow recalls are fine, but routine turns no longer
-need a mandatory recall tool call before using already-preloaded context.
-
-remember_memory() — call aggressively for durable facts. Err on the side of
-saving. If the user reveals anything personal, factual, or preferential,
-write it down in the same turn.
-
-Use update_memory() for a correction to an exact remembered fact,
-forget_memory() for previewed and confirmed forgetting, and remember_image()
-only when the user explicitly asks to retain an image as durable memory.
-
-Safe to answer directly without recall (a SHORT list):
-- Greetings, acknowledgments, conversational filler ("thanks", "lol", "ok").
-- Explaining what you just did, confirming a draft, relaying a sub-agent.
-- Clarifying your own abilities or asking the user a clarifying question.
-- Anything in the same conversation turn the user JUST told you (echo
-  back is fine; persistent facts still need remember_memory).
-
-If the preloaded context is insufficient, use a narrow recall before making a
-positive or negative claim about saved user information.
+{{MEMORY_INSTRUCTIONS}}
 
 Never invent URLs, site names, or a Sources section. If a live fact (price,
 news, score, hours) would go stale, spawn instead of guessing. Do not add
@@ -259,6 +269,28 @@ storage IDs to imageRefs. If the user sends a photo with no caption, ask a
 short clarifying question rather than guessing what they want.
 
 Format: Plain iMessage-friendly text. Markdown sparingly. Keep replies under ~400 chars when you can.`;
+
+export function buildInteractionSystemPrompt(input: {
+  integrations: string[];
+  codingResponseStyle: CodingResponseStyle;
+  memoryEnabled: boolean;
+}): string {
+  return INTERACTION_SYSTEM.replace(
+    "{{MEMORY_TOOL_LIST}}",
+    input.memoryEnabled ? MEMORY_TOOL_LIST.trimEnd() : "",
+  )
+    .replace(
+      "{{MEMORY_INSTRUCTIONS}}",
+      input.memoryEnabled
+        ? MEMORY_ENABLED_INSTRUCTIONS
+        : MEMORY_DISABLED_INSTRUCTIONS,
+    )
+    .replace(
+      "{{INTEGRATIONS}}",
+      input.integrations.join(", ") || "(no integrations configured yet)",
+    )
+    .replace("{{CODING_RESPONSE_STYLE}}", input.codingResponseStyle);
+}
 
 interface HandleOpts extends MemoryHandleOpts {
   turnTag?: string;
@@ -672,10 +704,11 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
     opts.kind === "proactive"
       ? DEFAULT_CODING_RESPONSE_STYLE
       : await resolveCodingResponseStyleForTurn(opts.conversationId, opts.content);
-  const systemPrompt = INTERACTION_SYSTEM.replace(
-    "{{INTEGRATIONS}}",
-    integrations.join(", ") || "(no integrations configured yet)",
-  ).replace("{{CODING_RESPONSE_STYLE}}", codingResponseStyle);
+  const systemPrompt = buildInteractionSystemPrompt({
+    integrations,
+    codingResponseStyle,
+    memoryEnabled: memoryService !== null,
+  });
 
   if (opts.kind !== "proactive") {
     const codingResult = await continueCodingAgentWithAnswer({

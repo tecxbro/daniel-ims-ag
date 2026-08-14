@@ -121,8 +121,6 @@ async function main() {
       console.log(`[supermemory-sync] worker started (${memorySync.backlog.total} queued)`);
     }
   } catch (err) {
-    // The server and legacy Convex memory path stay available. Any durable
-    // jobs already in Convex remain pending for the next successful start.
     console.error("[supermemory-sync] startup failed", err);
   }
   let stopImessageBridge: (() => Promise<void>) | undefined;

@@ -1,11 +1,26 @@
-import { existsSync, readFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { lstatSync, readFileSync, readlinkSync } from "node:fs";
 import { resolve } from "node:path";
 import { describe, expect, it } from "vitest";
 import { isAllowedControlOrigin } from "../server/index.js";
+import { buildInteractionSystemPrompt } from "../server/interaction-agent.js";
 import { isLocalMemoryRouteRequest } from "../server/memory/supermemory/routes.js";
 
 function source(path: string): string {
   return readFileSync(resolve(process.cwd(), path), "utf8");
+}
+
+function trackedFiles(): string[] {
+  return execFileSync("git", ["ls-files", "-z"], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+  })
+    .split("\0")
+    .filter(Boolean);
+}
+
+function token(...parts: string[]): string {
+  return parts.join("");
 }
 
 describe("Implementation 10 runtime decommission", () => {
@@ -33,22 +48,56 @@ describe("Implementation 10 runtime decommission", () => {
     expect(composioSource).toContain('req.path === "/webhook"');
   });
 
-  it("uses durable assistant persistence and has no retired runtime modules", () => {
+  it("only advertises long-term memory when the service is available", () => {
+    const base = {
+      integrations: [],
+      codingResponseStyle: "daniel_summary" as const,
+    };
+    const enabled = buildInteractionSystemPrompt({ ...base, memoryEnabled: true });
+    const disabled = buildInteractionSystemPrompt({ ...base, memoryEnabled: false });
+
+    expect(enabled).toContain("recall / remember_memory / update_memory");
+    expect(enabled).toContain("Memory context is automatically preloaded");
+    expect(enabled).not.toContain("Long-term memory tools and preloaded memory are unavailable");
+    expect(disabled).not.toContain("remember_memory");
+    expect(disabled).not.toContain("Memory context is automatically preloaded");
+    expect(disabled).toContain("Do not claim that you recalled, saved, updated, forgot");
+  });
+
+  it("uses durable assistant persistence and has no retired runtime tokens", () => {
     const interactionSource = source("server/interaction-agent.ts");
     expect(interactionSource).toContain("finalizeAssistantTurnCapture({");
     expect(interactionSource).toContain('opts.kind === "proactive"');
 
-    const retired = [
-      ["server", "memory", "extract.ts"],
-      ["server", "memory", "clean.ts"],
-      ["server", "consolidation.ts"],
-      ["server", "embeddings.ts"],
-      ["server", "memory", "read-strategy.ts"],
-      ["server", "memory", "write-strategy.ts"],
-      ["server", "memory", "runtime-context.ts"],
+    const prohibited = [
+      token("memory", "Records"),
+      token("memory", "Events"),
+      token("memory", "MigrationRows"),
+      token("legacyMemory", "CleanupRuns"),
+      token("consolidation", "Runs"),
+      token("DANIEL_MEMORY_", "READ_MODE"),
+      token("DANIEL_MEMORY_", "WRITE_MODE"),
+      token("DANIEL_MEMORY_", "LEGACY_FALLBACK"),
+      token("DANIEL_SUPERMEMORY_", "HISTORY_BACKFILL_DAYS"),
+      token("@huggingface/", "transformers"),
+      token("createMemory", "ReadStrategy"),
+      token("createMemory", "WriteStrategy"),
+      token("prepareRuntimeMemory", "Context"),
+      token("recallLegacy", "Memory"),
     ];
-    for (const segments of retired) {
-      expect(existsSync(resolve(process.cwd(), ...segments))).toBe(false);
+
+    const violations: string[] = [];
+    for (const path of trackedFiles()) {
+      const absolutePath = resolve(process.cwd(), path);
+      const contents = lstatSync(absolutePath).isSymbolicLink()
+        ? Buffer.from(readlinkSync(absolutePath))
+        : readFileSync(absolutePath);
+      for (const prohibitedToken of prohibited) {
+        if (contents.includes(Buffer.from(prohibitedToken))) {
+          violations.push(`${path}: ${prohibitedToken}`);
+        }
+      }
     }
+    expect(violations).toEqual([]);
   });
 });

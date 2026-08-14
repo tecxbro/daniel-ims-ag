@@ -24,6 +24,8 @@ updates.
 - Preserved the operational SuperMemory dashboard, durable capture recovery,
   retry/fencing/dead-letter controls, rendered UI coverage, and Liquid Glass
   accessibility behavior while removing inactive cutover controls.
+- Recorded the verified legacy-memory deletion proof:
+  `12/44/1/0 → 0/0/0/0` before runtime and schema decommission.
 
 ## 0.1.0 — 2026-07-25
 
