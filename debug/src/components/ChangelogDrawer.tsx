@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { HugeiconsIcon } from "@hugeicons/react";
 import {
   ArrowReloadHorizontalIcon,
@@ -181,6 +181,8 @@ export function ChangelogDrawer({ open, onClose, isDark }: ChangelogDrawerProps)
   const [payload, setPayload] = useState<ChangelogPayload | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const drawerRef = useRef<HTMLElement>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
 
   const load = useCallback(async (refresh = false) => {
     setLoading(true);
@@ -205,18 +207,37 @@ export function ChangelogDrawer({ open, onClose, isDark }: ChangelogDrawerProps)
 
   useEffect(() => {
     if (!open) return;
+    const previousFocus = document.activeElement as HTMLElement | null;
+    requestAnimationFrame(() => closeRef.current?.focus());
     function onKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape") onClose();
+      if (event.key !== "Tab" || !drawerRef.current) return;
+      const focusable = Array.from(
+        drawerRef.current.querySelectorAll<HTMLElement>(
+          'a[href], button:not(:disabled), input, select, textarea, [tabindex]:not([tabindex="-1"])',
+        ),
+      );
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
     }
     window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      previousFocus?.focus();
+    };
   }, [onClose, open]);
 
   if (!open) return null;
 
-  const surface = isDark
-    ? "border-white/10 bg-[#1f1f23] text-zinc-100 shadow-black/30"
-    : "border-zinc-200 bg-white text-zinc-950 shadow-zinc-300/40";
+  const surface = "glass-inspector-surface";
   const muted = isDark ? "text-zinc-500" : "text-zinc-500";
   const buttonClass = isDark
     ? "border-white/10 bg-white/5 text-zinc-300 hover:bg-white/10 hover:text-zinc-100"
@@ -231,8 +252,11 @@ export function ChangelogDrawer({ open, onClose, isDark }: ChangelogDrawerProps)
         className="absolute inset-0 z-30 cursor-default bg-black/10 opacity-0"
       />
       <aside
+        ref={drawerRef}
         className={`changelog-drawer absolute inset-y-0 right-0 z-40 flex w-[min(480px,calc(100vw-2rem))] flex-col border-l shadow-2xl ${surface}`}
-        aria-label="Changelog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="changelog-title"
       >
         <div
           className={`flex shrink-0 items-start justify-between gap-4 border-b px-4 py-4 ${
@@ -244,7 +268,7 @@ export function ChangelogDrawer({ open, onClose, isDark }: ChangelogDrawerProps)
               <HugeiconsIcon icon={GithubIcon} size={14} />
               <span className="truncate">{payload?.repo ?? "GitHub"}</span>
             </div>
-            <h2 className="mt-1 flex items-center gap-2 text-base font-semibold">
+            <h2 id="changelog-title" className="mt-1 flex items-center gap-2 text-base font-semibold">
               <HugeiconsIcon icon={BookOpen01Icon} size={18} />
               Changelog
             </h2>
@@ -279,7 +303,9 @@ export function ChangelogDrawer({ open, onClose, isDark }: ChangelogDrawerProps)
               />
             </button>
             <button
+              ref={closeRef}
               onClick={onClose}
+              aria-label="Close changelog"
               className={`inline-flex h-8 w-8 items-center justify-center rounded-xl border ${buttonClass}`}
               title="Close"
             >

@@ -1,9 +1,9 @@
-import { useState } from "react";
+import { Suspense, lazy, useState } from "react";
 import { useQuery } from "convex/react";
 import { api } from "../../../convex/_generated/api.js";
 import type { Id } from "../../../convex/_generated/dataModel.js";
-import MemoryGraphView from "./MemoryGraphView.js";
 import { EmbeddingBanner } from "./EmbeddingBanner.js";
+import { SegmentedControl } from "./GlassPrimitives.js";
 import {
   EmptyState,
   HeaderPill,
@@ -12,6 +12,8 @@ import {
   panelCardClass,
   subtlePanelClass,
 } from "./PanelPrimitives.js";
+
+const MemoryGraphView = lazy(() => import("./MemoryGraphView.js"));
 
 type Tier = "all" | "short" | "long" | "permanent";
 type Segment = "all" | "identity" | "preference" | "relationship" | "project" | "knowledge" | "context";
@@ -101,13 +103,6 @@ export function MemoryPanel({ isDark }: { isDark: boolean }) {
     return true;
   });
 
-  const btnActive = isDark
-    ? "bg-zinc-100 text-zinc-950 shadow-sm"
-    : "bg-white text-zinc-950 shadow-sm";
-  const btnInactive = isDark
-    ? "text-zinc-400 hover:bg-white/5 hover:text-zinc-200"
-    : "text-zinc-500 hover:bg-white/70 hover:text-zinc-800";
-
   return (
     <PanelPage
       eyebrow="Store"
@@ -117,42 +112,30 @@ export function MemoryPanel({ isDark }: { isDark: boolean }) {
       maxWidth={viewMode === "graph" ? "max-w-none" : "max-w-[1040px]"}
     >
       <EmbeddingBanner isDark={isDark} />
-      <div className={panelCardClass(isDark, "flex flex-wrap items-center gap-2 px-3 py-3")}>
-        <div
-          className={`segmented-control flex items-center rounded-2xl border p-1 ${
-            isDark ? "border-white/10 bg-[#17171a]" : "border-zinc-200 bg-zinc-100"
-          }`}
-        >
-          {(["table", "graph"] as const).map((mode) => (
-            <button
-              key={mode}
-              onClick={() => setViewMode(mode)}
-              className={`segmented-button px-2.5 py-1 text-xs capitalize ${
-                viewMode === mode ? btnActive : btnInactive
-              } rounded-xl`}
-            >
-              {mode}
-            </button>
-          ))}
-        </div>
+      <div className={panelCardClass(isDark, "memory-toolbar flex flex-wrap items-center gap-2 px-3 py-3")}>
+        <SegmentedControl
+          lensId="memory-view"
+          label="Memory view"
+          value={viewMode}
+          onChange={setViewMode}
+          options={[
+            { value: "table", label: "Table" },
+            { value: "graph", label: "Graph" },
+          ]}
+        />
 
         {viewMode === "table" && (
           <>
-            <div className="flex items-center gap-1">
-              {TIER_OPTIONS.map((t) => (
-                <button
-                  key={t.value}
-                  onClick={() => setTierFilter(t.value)}
-                  className={`segmented-button rounded-xl px-2.5 py-1 text-xs ${
-                    tierFilter === t.value ? btnActive : btnInactive
-                  }`}
-                >
-                  {t.label}
-                </button>
-              ))}
-            </div>
+            <SegmentedControl
+              lensId="memory-tier"
+              label="Memory tier"
+              value={tierFilter}
+              onChange={setTierFilter}
+              options={TIER_OPTIONS}
+            />
 
             <select
+              aria-label="Memory segment"
               value={segmentFilter}
               onChange={(e) => setSegmentFilter(e.target.value as Segment)}
               className={`rounded-xl border px-2.5 py-1.5 text-xs focus:outline-none ${
@@ -168,24 +151,29 @@ export function MemoryPanel({ isDark }: { isDark: boolean }) {
               ))}
             </select>
 
-            <input
-              type="text"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search memories…"
-              className={`min-w-[200px] flex-1 rounded-xl border px-3 py-1.5 text-sm focus:outline-none ${
-                isDark
-                  ? "border-white/10 bg-[#17171a] text-zinc-300 placeholder:text-zinc-600"
-                  : "border-zinc-200 bg-white text-zinc-700 placeholder:text-zinc-400"
-              }`}
-            />
+            <label className="memory-search min-w-[200px] flex-1">
+              <span className="sr-only">Search memories</span>
+              <input
+                type="search"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder="Search memories…"
+                className={`w-full rounded-xl border px-3 py-1.5 text-sm focus:outline-none ${
+                  isDark
+                    ? "border-white/10 bg-[#17171a] text-zinc-300 placeholder:text-zinc-600"
+                    : "border-zinc-200 bg-white text-zinc-700 placeholder:text-zinc-400"
+                }`}
+              />
+            </label>
           </>
         )}
       </div>
 
       {viewMode === "graph" && (
         <div className={panelCardClass(isDark, "h-[calc(100vh-190px)] min-h-[520px] overflow-hidden")}>
-          <MemoryGraphView records={allRecords as any} isDark={isDark} />
+          <Suspense fallback={<div className="view-loading">Loading memory graph…</div>}>
+            <MemoryGraphView records={allRecords as any} isDark={isDark} />
+          </Suspense>
         </div>
       )}
 

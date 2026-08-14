@@ -154,7 +154,7 @@ export function ConsolidationPanel({ isDark }: { isDark: boolean }) {
       }
     >
 
-      <div className="space-y-3">
+      <div className="source-table" role="list" aria-label="Consolidation runs">
         {runs === undefined ? (
           <div className="space-y-3">
             {[1, 2].map((i) => (
@@ -187,7 +187,15 @@ export function ConsolidationPanel({ isDark }: { isDark: boolean }) {
               <div
                 key={run._id}
                 onClick={() => setSelectedId(run.runId)}
-                className={`${panelCardClass(isDark, "cursor-pointer px-4 py-3.5 transition-colors fade-in")} ${hoverBg}`}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    setSelectedId(run.runId);
+                  }
+                }}
+                className={`${panelCardClass(isDark, "source-row cursor-pointer px-4 py-3.5 transition-colors fade-in")} ${hoverBg}`}
               >
                 <div className="flex items-center gap-2.5 mb-1.5">
                   <span className="relative flex h-2.5 w-2.5 shrink-0">

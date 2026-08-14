@@ -39,9 +39,9 @@ export function EventsPanel({ isDark }: { isDark: boolean }) {
           No events yet. Chat with the agent to see memory events stream in.
         </EmptyState>
       ) : (
-        <div className="space-y-2">
+        <div className="source-table" role="list" aria-label="Memory events">
           {events.map((e) => (
-            <div key={e._id} className={panelCardClass(isDark, "px-3 py-2.5")}>
+            <div key={e._id} role="listitem" className={panelCardClass(isDark, "source-row px-3 py-2.5")}>
               <div className="flex items-center gap-2 text-[10px] mono">
                 <span
                   className={`rounded-full px-1.5 py-0.5 ${EVENT_COLOR[e.eventType] ?? "bg-zinc-500/10 text-zinc-400"}`}

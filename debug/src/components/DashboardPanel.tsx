@@ -12,8 +12,12 @@ import {
   WorkflowCircle03Icon,
 } from "@hugeicons/core-free-icons";
 import { api } from "../../../convex/_generated/api.js";
-
-type TimeRange = "all" | "7d" | "30d" | "90d";
+import { SegmentedControl, StatusBadge } from "./GlassPrimitives.js";
+import {
+  deriveDashboardMetrics,
+  type DailyBucket,
+  type TimeRange,
+} from "../lib/dashboardMetrics.js";
 
 type DashboardSurface = {
   page: string;
@@ -29,18 +33,6 @@ type DashboardSurface = {
   segmentActive: string;
   segmentInactive: string;
   iconBox: string;
-};
-
-type DailyBucket = {
-  day: string;
-  agentCost: number;
-  inputTokens: number;
-  outputTokens: number;
-  agentsSpawned: number;
-  agentsCompleted: number;
-  agentsFailed: number;
-  agentsCancelled: number;
-  automationRuns: number;
 };
 
 type DashboardMetrics = {
@@ -77,12 +69,6 @@ const RANGES: { id: TimeRange; label: string }[] = [
   { id: "all", label: "All time" },
 ];
 
-function cutoffDate(range: TimeRange): string | null {
-  if (range === "all") return null;
-  const days = range === "7d" ? 7 : range === "30d" ? 30 : 90;
-  return new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
-}
-
 function fmt(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
@@ -105,45 +91,7 @@ export function DashboardPanel({ isDark }: { isDark: boolean }) {
 
   const filtered = useMemo(() => {
     if (!data) return null;
-    const cutoff = cutoffDate(range);
-    const days = cutoff
-      ? data.dailyBuckets.filter((d) => d.day >= cutoff)
-      : data.dailyBuckets;
-
-    let agentCost = 0;
-    let inputTokens = 0;
-    let outputTokens = 0;
-    let agentsSpawned = 0;
-    let agentsCompleted = 0;
-    let agentsFailed = 0;
-    let agentsCancelled = 0;
-    let automationRuns = 0;
-
-    for (const d of days) {
-      agentCost += d.agentCost;
-      inputTokens += d.inputTokens;
-      outputTokens += d.outputTokens;
-      agentsSpawned += d.agentsSpawned;
-      agentsCompleted += d.agentsCompleted;
-      agentsFailed += d.agentsFailed;
-      agentsCancelled += d.agentsCancelled;
-      automationRuns += d.automationRuns;
-    }
-
-    const totalTokens = inputTokens + outputTokens;
-    return {
-      days,
-      cost: { total: agentCost, agents: agentCost },
-      tokens: { input: inputTokens, output: outputTokens, total: totalTokens },
-      agents: {
-        total: agentsSpawned,
-        completed: agentsCompleted,
-        failed: agentsFailed,
-        cancelled: agentsCancelled,
-        failureRate: agentsSpawned > 0 ? agentsFailed / agentsSpawned : 0,
-      },
-      automationRuns,
-    };
+    return deriveDashboardMetrics(data.dailyBuckets, range);
   }, [data, range]);
 
   if (!data || !filtered) {
@@ -158,37 +106,21 @@ export function DashboardPanel({ isDark }: { isDark: boolean }) {
     );
   }
 
-  const c: DashboardSurface = isDark
-    ? {
-        page: "bg-[#18181b]",
-        panel: "bg-[#1d1d20] border-white/10",
-        tile: "bg-[#1d1d20] border-white/10",
-        label: "text-zinc-500",
-        value: "text-zinc-100",
-        sub: "text-zinc-400",
-        heading: "text-zinc-100",
-        border: "border-white/10",
-        divider: "divide-white/10",
-        segment: "border-white/10 bg-black/30",
-        segmentActive: "bg-zinc-100 text-zinc-950",
-        segmentInactive: "text-zinc-500 hover:text-zinc-200",
-        iconBox: "bg-zinc-800/80 text-zinc-300 border-white/10",
-      }
-    : {
-        page: "bg-[#fbfbfa]",
-        panel: "bg-white border-zinc-200",
-        tile: "bg-white border-zinc-200",
-        label: "text-zinc-500",
-        value: "text-zinc-950",
-        sub: "text-zinc-600",
-        heading: "text-zinc-950",
-        border: "border-zinc-200",
-        divider: "divide-zinc-200",
-        segment: "border-zinc-200 bg-zinc-100",
-        segmentActive: "bg-white text-zinc-950 shadow-sm",
-        segmentInactive: "text-zinc-500 hover:text-zinc-900",
-        iconBox: "bg-zinc-100 text-zinc-700 border-zinc-200",
-      };
+  const c: DashboardSurface = {
+    page: "",
+    panel: "dashboard-panel",
+    tile: "dashboard-panel",
+    label: "dashboard-label",
+    value: "dashboard-value",
+    sub: "dashboard-secondary",
+    heading: "dashboard-heading",
+    border: "dashboard-border",
+    divider: "dashboard-divider",
+    segment: "",
+    segmentActive: "",
+    segmentInactive: "",
+    iconBox: "dashboard-icon-box",
+  };
 
   const rangeLabel = RANGES.find((r) => r.id === range)?.label ?? "All time";
   const failPctNumber = filtered.agents.failureRate * 100;
@@ -196,50 +128,38 @@ export function DashboardPanel({ isDark }: { isDark: boolean }) {
   const completionRate =
     filtered.agents.total > 0 ? filtered.agents.completed / filtered.agents.total : 0;
   return (
-    <div className={`min-h-full ${c.page}`}>
-      <div className="mx-auto max-w-[1440px] space-y-4">
-        <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-          <div>
-            <div className={`text-[11px] font-medium uppercase ${c.label}`}>
-              Operations
-            </div>
-            <h2 className={`mt-1 text-[22px] font-semibold ${c.heading}`}>
-              Debug dashboard
-            </h2>
-          </div>
-
-          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-            {data.truncated && (
-              <StatusPill
-                label={`Latest ${fmt(data.scanLimit)} rows`}
-                tone="amber"
-                isDark={isDark}
-              />
-            )}
-            <RangePicker value={range} onChange={setRange} c={c} />
-          </div>
+    <section className="dashboard-workspace" aria-label="Operations overview">
+      <div className="dashboard-context-bar">
+        <div>
+          <span className="dashboard-context-label">Reporting window</span>
+          <strong>{rangeLabel}</strong>
         </div>
+        <div className="dashboard-context-controls">
+          {data.truncated && (
+            <StatusBadge tone="warning">Latest {fmt(data.scanLimit)} rows</StatusBadge>
+          )}
+          <RangePicker value={range} onChange={setRange} />
+        </div>
+      </div>
 
-        <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1.65fr)_minmax(320px,0.85fr)]">
-          <section className={`overflow-hidden rounded-2xl border ${c.panel}`}>
+      <section className="dashboard-summary" aria-label="Key metrics">
+        <SummaryCell label="Estimated cost" value={`$${filtered.cost.total.toFixed(2)}`} c={c} />
+        <SummaryCell label="Total tokens" value={fmtTokens(filtered.tokens.total)} c={c} />
+        <SummaryCell label="Active days" value={fmt(filtered.days.length)} c={c} />
+        <SummaryCell label="Messages" value={fmt(data.messages)} c={c} />
+        <SummaryCell label="Memories" value={fmt(data.memories.total)} c={c} />
+        <SummaryCell label="Automation runs" value={fmt(filtered.automationRuns)} c={c} />
+      </section>
+
+      <div className="dashboard-primary-grid">
+          <section className={`dashboard-usage overflow-hidden ${c.panel}`}>
             <PanelHeader
               icon={Activity01Icon}
-              title="Usage"
-              meta={`${rangeLabel} window`}
+              title="Usage trend"
+              meta="API-equivalent LLM spend"
               c={c}
             />
-            <div
-              className={`grid divide-y ${c.divider} md:grid-cols-3 md:divide-x md:divide-y-0`}
-            >
-              <SummaryCell
-                label="Estimated cost"
-                value={`$${filtered.cost.total.toFixed(2)}`}
-                c={c}
-              />
-              <SummaryCell label="Total tokens" value={fmtTokens(filtered.tokens.total)} c={c} />
-              <SummaryCell label="Active days" value={fmt(filtered.days.length)} c={c} />
-            </div>
-            <div className="p-4">
+            <div className="dashboard-chart-wrap">
               {filtered.days.length > 1 ? (
                 <StackedAreaChart
                   data={filtered.days}
@@ -255,14 +175,14 @@ export function DashboardPanel({ isDark }: { isDark: boolean }) {
             </div>
           </section>
 
-          <section className={`overflow-hidden rounded-2xl border ${c.panel}`}>
+          <section className={`dashboard-health overflow-hidden ${c.panel}`}>
             <PanelHeader
               icon={MachineRobotIcon}
               title="Agent health"
               meta={`${fmt(data.agents.running)} running`}
               c={c}
             />
-            <div className="p-4">
+            <div className="dashboard-panel-body">
               <div className="flex items-end justify-between gap-4">
                 <div>
                   <div className={`text-[11px] font-medium uppercase ${c.label}`}>
@@ -282,7 +202,7 @@ export function DashboardPanel({ isDark }: { isDark: boolean }) {
                 </div>
                 <div className={`text-right text-xs ${c.sub}`}>
                   <div>{plural(filtered.agents.total, "agent")} spawned</div>
-                  <div>{plural(filtered.automationRuns, "automation run")}</div>
+                  <div>{fmt(data.agents.running)} running now</div>
                 </div>
               </div>
 
@@ -325,95 +245,10 @@ export function DashboardPanel({ isDark }: { isDark: boolean }) {
               </div>
             </div>
           </section>
-        </div>
+      </div>
 
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
-          <MetricTile
-            label="Messages"
-            value={fmt(data.messages)}
-            sub="conversation rows"
-            icon={DashboardSquare01Icon}
-            c={c}
-          />
-          <MetricTile
-            label="Memories"
-            value={fmt(data.memories.total)}
-            sub={`${fmt(data.memories.shortTerm)} short / ${fmt(
-              data.memories.longTerm,
-            )} long / ${fmt(data.memories.permanent)} perm`}
-            icon={AiBrain02Icon}
-            c={c}
-          />
-          <MetricTile
-            label="Agents"
-            value={fmt(filtered.agents.total)}
-            sub={`${fmt(data.agents.running)} running now`}
-            icon={MachineRobotIcon}
-            c={c}
-          />
-          <MetricTile
-            label="Estimated cost"
-            value={`$${filtered.cost.total.toFixed(2)}`}
-            sub="API-equivalent spend"
-            icon={WorkflowCircle03Icon}
-            color={isDark ? "text-emerald-400" : "text-emerald-600"}
-            c={c}
-            isDark={isDark}
-            info={{
-              title: "Estimated/API-equivalent cost",
-              body: (
-                <>
-                  <p className="mb-1.5">
-                    Claude rows use SDK-reported cost when available. Codex rows are
-                    estimated from token counts and configured token pricing.
-                  </p>
-                  <p>
-                    Subscription-backed runtimes still bill through the subscription,
-                    so treat this as a usage proxy.
-                  </p>
-                </>
-              ),
-            }}
-          />
-          <MetricTile
-            label="Tokens"
-            value={fmtTokens(filtered.tokens.total)}
-            sub={`${fmtTokens(filtered.tokens.input)} in / ${fmtTokens(filtered.tokens.output)} out`}
-            icon={ArrowShrink02Icon}
-            c={c}
-          />
-          <MetricTile
-            label="Failure rate"
-            value={`${failPct}%`}
-            sub={`${filtered.agents.failed} of ${filtered.agents.total}`}
-            icon={Activity01Icon}
-            color={
-              failPctNumber > 20
-                ? isDark
-                  ? "text-rose-400"
-                  : "text-rose-600"
-                : undefined
-            }
-            c={c}
-          />
-          <MetricTile
-            label="Automations"
-            value={fmt(filtered.automationRuns)}
-            sub={`${rangeLabel} runs`}
-            icon={WorkflowCircle03Icon}
-            c={c}
-          />
-          <MetricTile
-            label="Completion"
-            value={`${(completionRate * 100).toFixed(1)}%`}
-            sub={`${fmt(filtered.agents.completed)} completed`}
-            icon={CheckmarkCircle02Icon}
-            c={c}
-          />
-        </div>
-
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1.2fr)_minmax(320px,0.8fr)]">
-          <section className={`overflow-hidden rounded-2xl border ${c.panel}`}>
+      <div className="dashboard-secondary-grid">
+          <section className={`overflow-hidden ${c.panel}`}>
             <PanelHeader
               icon={ArrowShrink02Icon}
               title="Token usage"
@@ -422,7 +257,7 @@ export function DashboardPanel({ isDark }: { isDark: boolean }) {
               )} output`}
               c={c}
             />
-            <div className="p-4">
+            <div className="dashboard-chart-wrap">
               {filtered.days.length > 1 ? (
                 <StackedAreaChart
                   data={filtered.days}
@@ -438,9 +273,9 @@ export function DashboardPanel({ isDark }: { isDark: boolean }) {
             </div>
           </section>
 
-          <section className={`overflow-hidden rounded-2xl border ${c.panel}`}>
-            <PanelHeader icon={AiBrain02Icon} title="Breakdown" meta="Current range" c={c} />
-            <div className="p-4 space-y-4">
+          <section className={`overflow-hidden ${c.panel}`}>
+            <PanelHeader icon={AiBrain02Icon} title="Operational breakdown" meta="Current range" c={c} />
+            <div className="dashboard-panel-body space-y-4">
               <div className="space-y-2.5">
                 <BarRow
                   label="Input"
@@ -461,75 +296,33 @@ export function DashboardPanel({ isDark }: { isDark: boolean }) {
               </div>
 
               <div className={`grid grid-cols-2 gap-3 border-t pt-4 ${c.border}`}>
-                <MiniFact label="Messages" value={fmt(data.messages)} c={c} />
-                <MiniFact label="Memories" value={fmt(data.memories.total)} c={c} />
-                <MiniFact label="Automations" value={fmt(filtered.automationRuns)} c={c} />
                 <MiniFact label="Completed" value={fmt(filtered.agents.completed)} c={c} />
+                <MiniFact label="Failed" value={fmt(filtered.agents.failed)} c={c} />
+                <MiniFact label="Short memory" value={fmt(data.memories.shortTerm)} c={c} />
+                <MiniFact label="Long + permanent" value={fmt(data.memories.longTerm + data.memories.permanent)} c={c} />
               </div>
             </div>
           </section>
-        </div>
       </div>
-    </div>
+    </section>
   );
 }
 
 function RangePicker({
   value,
   onChange,
-  c,
 }: {
   value: TimeRange;
   onChange: (value: TimeRange) => void;
-  c: DashboardSurface;
 }) {
   return (
-    <div
-      className={`segmented-control inline-flex h-9 items-center rounded-2xl border p-0.5 text-xs ${c.segment}`}
-    >
-      {RANGES.map((r) => (
-        <button
-          key={r.id}
-          onClick={() => onChange(r.id)}
-          className={`segmented-button h-7 min-w-[64px] rounded-xl px-2.5 ${
-            value === r.id ? c.segmentActive : c.segmentInactive
-          }`}
-        >
-          {r.label}
-        </button>
-      ))}
-    </div>
-  );
-}
-
-function StatusPill({
-  label,
-  tone,
-  isDark,
-}: {
-  label: string;
-  tone: "emerald" | "amber" | "slate";
-  isDark: boolean;
-}) {
-  const toneClass =
-    tone === "emerald"
-      ? isDark
-        ? "border-emerald-400/20 bg-emerald-400/10 text-emerald-300"
-        : "border-emerald-200 bg-emerald-50 text-emerald-700"
-      : tone === "amber"
-        ? isDark
-          ? "border-amber-400/20 bg-amber-400/10 text-amber-300"
-          : "border-amber-200 bg-amber-50 text-amber-700"
-        : isDark
-          ? "border-white/10 bg-white/5 text-slate-400"
-          : "border-slate-200 bg-white text-slate-600";
-
-  return (
-    <div
-      className={`inline-flex h-9 items-center rounded-2xl border px-3 text-xs ${toneClass}`}
-    >
-      {label}
-    </div>
+    <SegmentedControl
+      lensId="dashboard-range"
+      label="Dashboard reporting window"
+      value={value}
+      onChange={onChange}
+      options={RANGES.map((range) => ({ value: range.id, label: range.label }))}
+    />
   );
 }
 
@@ -722,7 +515,7 @@ function BarRow({
         }`}
       >
         <div
-          className={`h-full rounded-full transition-all ${color}`}
+          className={`metric-bar-fill h-full rounded-full ${color}`}
           style={{ width: value > 0 ? `${Math.max(pct, 1)}%` : "0%" }}
         />
       </div>
@@ -834,14 +627,30 @@ function StackedAreaChart({
   const tooltipLeft = hoverIdx !== null ? (x(hoverIdx) / W) * 100 : 0;
   const flipTooltip = hoverIdx !== null && tooltipLeft > 65;
 
+  const accessibleSummary = `${labels.join(" and ")} from ${stacked[0].day} through ${stacked[stacked.length - 1].day}. Peak total ${format(maxVal)}.`;
+
   return (
-    <div ref={containerRef} className="relative">
+    <figure ref={containerRef} className="relative">
+      <figcaption className="sr-only">{accessibleSummary}</figcaption>
       <svg
         viewBox={`0 0 ${W} ${H}`}
         className="w-full"
         preserveAspectRatio="none"
+        role="img"
+        aria-label={accessibleSummary}
+        tabIndex={0}
         onMouseMove={handleMouseMove}
         onMouseLeave={() => setHoverIdx(null)}
+        onFocus={() => setHoverIdx((index) => index ?? stacked.length - 1)}
+        onKeyDown={(event) => {
+          if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+          event.preventDefault();
+          const direction = event.key === "ArrowRight" ? 1 : -1;
+          setHoverIdx((index) => {
+            const current = index ?? 0;
+            return Math.max(0, Math.min(stacked.length - 1, current + direction));
+          });
+        }}
       >
         {yTicks.map((v, i) => (
           <g key={i}>
@@ -852,7 +661,7 @@ function StackedAreaChart({
               textAnchor="end"
               fill={textColor}
               fontSize={10}
-              fontFamily="'Geist Mono', ui-monospace, SFMono-Regular, monospace"
+              fontFamily="'SF Mono', ui-monospace, Menlo, monospace"
             >
               {format(v)}
             </text>
@@ -886,7 +695,7 @@ function StackedAreaChart({
             textAnchor="middle"
             fill={textColor}
             fontSize={10}
-            fontFamily="'Geist Mono', ui-monospace, SFMono-Regular, monospace"
+            fontFamily="'SF Mono', ui-monospace, Menlo, monospace"
           >
             {label}
           </text>
@@ -976,6 +785,33 @@ function StackedAreaChart({
           </div>
         ))}
       </div>
-    </div>
+      <details className="chart-data">
+        <summary>View data table</summary>
+        <div className="overflow-x-auto">
+          <table>
+            <thead>
+              <tr>
+                <th scope="col">Day</th>
+                {labels.map((label) => (
+                  <th key={label} scope="col">{label}</th>
+                ))}
+                {labels.length > 1 && <th scope="col">Total</th>}
+              </tr>
+            </thead>
+            <tbody>
+              {stacked.map((point) => (
+                <tr key={point.day}>
+                  <th scope="row">{point.day}</th>
+                  {point.raw.map((value, index) => (
+                    <td key={`${point.day}-${labels[index]}`}>{format(value)}</td>
+                  ))}
+                  {labels.length > 1 && <td>{format(point.total)}</td>}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </details>
+    </figure>
   );
 }

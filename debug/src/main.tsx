@@ -3,16 +3,16 @@ import ReactDOM from "react-dom/client";
 import { ConvexProvider, ConvexReactClient } from "convex/react";
 import { App } from "./App.js";
 import { ErrorBoundary } from "./ErrorBoundary.js";
+import { LiquidGlassProvider } from "./components/LiquidGlassProvider.js";
+import { applyTheme, readStoredTheme, resolveTheme } from "./lib/theme.js";
 import "./styles.css";
 
-const storedTheme = (() => {
-  try {
-    return localStorage.getItem("daniel-debug-theme");
-  } catch {
-    return null;
-  }
-})();
-document.documentElement.classList.add(storedTheme === "light" ? "light" : "dark");
+const initialThemeMode = readStoredTheme();
+const initialTheme = resolveTheme(
+  initialThemeMode,
+  window.matchMedia("(prefers-color-scheme: dark)").matches,
+);
+applyTheme(initialThemeMode, initialTheme);
 
 const convexUrl = import.meta.env.VITE_CONVEX_URL;
 if (!convexUrl) {
@@ -27,7 +27,9 @@ if (!convexUrl) {
     <React.StrictMode>
       <ErrorBoundary>
         <ConvexProvider client={convex}>
-          <App />
+          <LiquidGlassProvider>
+            <App />
+          </LiquidGlassProvider>
         </ConvexProvider>
       </ErrorBoundary>
     </React.StrictMode>,
