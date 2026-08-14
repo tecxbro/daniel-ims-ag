@@ -7,6 +7,7 @@ import {
   listToolsForToolkit,
 } from "./composio.js";
 import { readMemoryProviderConfiguration } from "./memory/supermemory/client.js";
+import { ensureMemoryIdentityRuntime } from "./memory/supermemory/primary-owner.js";
 import type { MemoryProviderConfiguration } from "./memory/supermemory/types.js";
 import { listEnabledIntegrations } from "./integrations/registry.js";
 import { createClaudeMcpServer } from "./runtimes/claude.js";
@@ -37,8 +38,8 @@ const NAMESPACE = "daniel-self";
 const reasoningEffortSchema = z.enum(["minimal", "low", "medium", "high", "xhigh"]);
 
 type MemoryProviderHealth =
-  | "disabled"
   | "unconfigured"
+  | "recovery_required"
   | "healthy"
   | "degraded"
   | "unavailable"
@@ -48,7 +49,7 @@ interface MemoryProviderDeploymentState {
   healthStatus: Exclude<MemoryProviderHealth, "unknown"> | null;
   lastSuccessfulSubmissionAt: number | null;
   lastFailedSubmissionAt: number | null;
-  lastError: string | null;
+  hasError: boolean;
   lastWorkerActivityAt: number | null;
   updatedAt: number | null;
 }
@@ -100,8 +101,8 @@ function normalizeProviderState(value: unknown): MemoryProviderDeploymentState |
   if (!state) return null;
   const rawHealth = state.healthStatus;
   const healthStatus =
-    rawHealth === "disabled" ||
     rawHealth === "unconfigured" ||
+    rawHealth === "recovery_required" ||
     rawHealth === "healthy" ||
     rawHealth === "degraded" ||
     rawHealth === "unavailable"
@@ -111,7 +112,7 @@ function normalizeProviderState(value: unknown): MemoryProviderDeploymentState |
     healthStatus,
     lastSuccessfulSubmissionAt: numberOrNull(state.lastSuccessfulSubmissionAt),
     lastFailedSubmissionAt: numberOrNull(state.lastFailedSubmissionAt),
-    lastError: typeof state.lastError === "string" ? state.lastError : null,
+    hasError: state.hasError === true,
     lastWorkerActivityAt: numberOrNull(state.lastWorkerActivityAt),
     updatedAt: numberOrNull(state.updatedAt),
   };
@@ -177,43 +178,37 @@ export async function readMemoryProviderOperationalStatus(
 export function buildMemoryRuntimeStatus(
   memory: MemoryProviderConfiguration,
   operational: MemoryProviderOperationalStatus,
+  identityStatus?: "ready" | "unconfigured" | "recovery_required" | "unknown",
 ) {
-  const memoryProvider =
-    memory.readMode === "convex" && memory.writeMode === "convex"
-      ? ("convex" as const)
-      : ("supermemory" as const);
   const memoryProviderHealth: MemoryProviderHealth =
-    memoryProvider === "convex"
-      ? "disabled"
-      : !memory.apiKeyConfigured
-        ? "unconfigured"
+    !memory.apiKeyConfigured
+      ? "unconfigured"
+      : identityStatus === "recovery_required" || identityStatus === "unconfigured"
+        ? identityStatus
         : (operational.providerState?.healthStatus ?? "unknown");
-  const fallbackActive =
-    memory.readMode === "supermemory" && memory.legacyFallback;
+  const identityReady =
+    identityStatus === undefined || identityStatus === "ready";
+  const captureConfigured =
+    memory.apiKeyConfigured &&
+    identityReady &&
+    memoryProviderHealth !== "recovery_required" &&
+    memoryProviderHealth !== "unconfigured";
 
   return {
-    memoryProvider,
-    memoryReadMode: memory.readMode,
-    memoryCaptureMode: memory.writeMode,
-    memoryWriteMode: memory.writeMode,
+    memoryProvider: "supermemory" as const,
     memoryProviderHealth,
+    memoryCaptureKind: captureConfigured ? "conversation_turn" : null,
     memorySyncBacklog: operational.syncBacklog,
     memoryLastProviderSuccessAt:
       operational.providerState?.lastSuccessfulSubmissionAt ?? null,
     memoryLastProviderFailureAt:
       operational.providerState?.lastFailedSubmissionAt ?? null,
-    memoryLastProviderFailure: operational.providerState?.lastError ?? null,
+    memoryProviderHasError: operational.providerState?.hasError ?? false,
     memoryLastWorkerActivityAt:
       operational.providerState?.lastWorkerActivityAt ?? null,
     memoryProviderStateUpdatedAt: operational.providerState?.updatedAt ?? null,
     memoryProviderStateAvailable: operational.providerStateAvailable,
     memorySyncBacklogAvailable: operational.syncBacklogAvailable,
-    memoryLegacyRuntime: "retired" as const,
-    memoryLegacyFallback: {
-      enabled: memory.legacyFallback,
-      active: fallbackActive,
-      status: fallbackActive ? ("provider_errors_only" as const) : ("inactive" as const),
-    },
     supermemoryConfigured: memory.apiKeyConfigured,
   };
 }
@@ -231,9 +226,15 @@ export function createSelfTools(): RuntimeTool[] {
         const runtime = await getRuntimeConfig();
         const browser = await getBrowserSettings();
         const memory = readMemoryProviderConfiguration();
+        const identityStatus = memory.apiKeyConfigured
+          ? await ensureMemoryIdentityRuntime()
+              .then((result) => result.status)
+              .catch(() => "unknown" as const)
+          : ("unconfigured" as const);
         const memoryStatus = buildMemoryRuntimeStatus(
           memory,
           await readMemoryProviderOperationalStatus(),
+          identityStatus,
         );
         const config = {
           runtime: runtime.runtime,
@@ -260,11 +261,6 @@ export function createSelfTools(): RuntimeTool[] {
             extraArgs: browser.extraArgs,
           },
           composioEnabled: Boolean(process.env.COMPOSIO_API_KEY),
-          // Deprecated compatibility fields. They remain present for old
-          // dashboards, but accurately show that the runtime is retired at
-          // the Supermemory-only cutover and do not import the local model.
-          embeddingsEnabled: false,
-          embeddingsProvider: "retired",
           ...memoryStatus,
           photonEnabled: Boolean(process.env.PHOTON_PROJECT_ID && process.env.PHOTON_PROJECT_SECRET),
         };

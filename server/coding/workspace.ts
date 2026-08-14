@@ -101,7 +101,6 @@ async function writeEnvExample(workspacePath: string): Promise<void> {
       "# Photon Spectrum",
       "PHOTON_PROJECT_ID=",
       "PHOTON_PROJECT_SECRET=",
-      "PHOTON_IMESSAGE_PHONE=",
       "",
       "# Convex",
       "CONVEX_DEPLOYMENT=",

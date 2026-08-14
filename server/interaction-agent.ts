@@ -1,19 +1,16 @@
 import { z } from "zod";
 import { api } from "../convex/_generated/api.js";
 import { convex } from "./convex-client.js";
-import { createMemoryTools, recallLegacyMemory } from "./memory/tools.js";
-import { prepareRuntimeMemoryContext } from "./memory/runtime-context.js";
+import { createMemoryTools } from "./memory/tools.js";
 import { finalizeAssistantTurnCapture } from "./memory/supermemory/capture-recovery.js";
-import {
-  getSupermemoryProvider,
-  readMemoryProviderConfiguration,
-} from "./memory/supermemory/client.js";
+import { readMemoryProviderConfiguration } from "./memory/supermemory/client.js";
 import type { MemoryContextInstrumentationEvent } from "./memory/supermemory/context.js";
+import { deriveMemoryIdentity } from "./memory/supermemory/identity.js";
+import { ensureMemoryIdentityRuntime } from "./memory/supermemory/primary-owner.js";
+import { createConfiguredSupermemoryService } from "./memory/supermemory/service.js";
 import type {
   HandleOpts as MemoryHandleOpts,
   MemoryProviderConfiguration,
-  MemoryReadMode,
-  MemoryWriteMode,
 } from "./memory/supermemory/types.js";
 import { recordProviderRead } from "./memory/supermemory/provider-observability.js";
 import { spawnExecutionAgent } from "./execution-agent.js";
@@ -34,7 +31,6 @@ import {
   type RuntimeConfig,
 } from "./runtime-config.js";
 import { broadcast } from "./broadcast.js";
-import { sendImessage } from "./imessage.js";
 import { defineRuntimeTool } from "./runtimes/tool.js";
 import { runAgentRuntime } from "./runtimes/index.js";
 import { runtimeText } from "./runtimes/types.js";
@@ -62,7 +58,7 @@ You are a DISPATCHER, not a doer. Your job:
 ${DANIEL_VOICE_PROMPT}
 
 Your only tools:
-- recall / write_memory / update_memory / forget_memory / remember_image (durable memory for this user)
+- recall / remember_memory / update_memory / forget_memory / remember_image (durable memory for this user)
 - spawn_agent (dispatches a sub-agent that CAN touch the world)
 - spawn_coding_agent (dispatches Daniel's full Codex coding bridge)
 - create_automation / list_automations / toggle_automation / delete_automation
@@ -140,7 +136,7 @@ context does not cover a specific name, project, preference, correction, or
 past decision. Multiple narrow recalls are fine, but routine turns no longer
 need a mandatory recall tool call before using already-preloaded context.
 
-write_memory() — call aggressively for durable facts. Err on the side of
+remember_memory() — call aggressively for durable facts. Err on the side of
 saving. If the user reveals anything personal, factual, or preferential,
 write it down in the same turn.
 
@@ -153,7 +149,7 @@ Safe to answer directly without recall (a SHORT list):
 - Explaining what you just did, confirming a draft, relaying a sub-agent.
 - Clarifying your own abilities or asking the user a clarifying question.
 - Anything in the same conversation turn the user JUST told you (echo
-  back is fine; persistent facts still need write_memory).
+  back is fine; persistent facts still need remember_memory).
 
 If the preloaded context is insufficient, use a narrow recall before making a
 positive or negative claim about saved user information.
@@ -277,19 +273,12 @@ interface HandleOpts extends MemoryHandleOpts {
   persistAssistantReply?: boolean;
   images?: Array<{ storageId: string; mediaType: string }>;
   mediaError?: string;
+  /** Inbound transports use this to keep acknowledgements on the same Space. */
+  sendAcknowledgement?: (message: string) => Promise<void>;
 }
 
 function randomId(prefix: string): string {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
-function supportedMode<T extends string>(
-  value: string | undefined,
-  allowed: readonly T[],
-  fallback: T,
-): T {
-  const normalized = value?.trim().toLowerCase();
-  return allowed.includes(normalized as T) ? (normalized as T) : fallback;
 }
 
 function readTurnMemoryConfiguration(): {
@@ -299,25 +288,14 @@ function readTurnMemoryConfiguration(): {
   try {
     return { config: readMemoryProviderConfiguration() };
   } catch (error) {
-    // Preserve the selected migration source while replacing malformed tuning
-    // values with safe defaults. The original configuration error is routed
-    // through the context adapter, where it is sanitized and fails open.
-    const readMode = supportedMode<MemoryReadMode>(
-      process.env.DANIEL_MEMORY_READ_MODE,
-      ["convex", "shadow", "supermemory"],
-      "supermemory",
-    );
-    const writeMode = supportedMode<MemoryWriteMode>(
-      process.env.DANIEL_MEMORY_WRITE_MODE,
-      ["convex", "dual", "supermemory"],
-      "supermemory",
-    );
     return {
-      config: readMemoryProviderConfiguration({
-        DANIEL_MEMORY_READ_MODE: readMode,
-        DANIEL_MEMORY_WRITE_MODE: writeMode,
-        SUPERMEMORY_API_KEY: process.env.SUPERMEMORY_API_KEY,
-      }),
+      config: {
+        timeoutMs: 1_200,
+        threshold: 0.6,
+        searchLimit: 8,
+        dreaming: "dynamic",
+        apiKeyConfigured: false,
+      },
       error,
     };
   }
@@ -599,65 +577,60 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
   const tag = opts.turnTag ?? turnId.slice(-6);
   const log = (msg: string) => console.log(`[turn ${tag}] ${msg}`);
   const memoryConfiguration = readTurnMemoryConfiguration();
-  let memoryProvider = null;
-  let memoryProviderError = memoryConfiguration.error;
-  if (
-    !memoryProviderError &&
-    (memoryConfiguration.config.readMode !== "convex" ||
-      memoryConfiguration.config.writeMode !== "convex")
-  ) {
-    try {
-      memoryProvider = getSupermemoryProvider();
-    } catch (error) {
-      memoryProviderError = error;
-    }
-  }
   const memoryInstrumentation = (event: MemoryContextInstrumentationEvent): void => {
     log(
       `${event.name}: ${JSON.stringify({
         operation: event.operation,
-        mode: event.mode,
         status: event.status,
         latencyMs: event.latencyMs,
         resultCount: event.resultCount,
         profileFactCount: event.profileFactCount,
-        fallbackEligible: event.fallbackEligible,
         errorCode: event.errorCode,
       })}`,
     );
   };
-  const runtimeMemory =
-    opts.kind === "proactive"
-      ? undefined
-      : await prepareRuntimeMemoryContext(
-          {
-            conversationId: opts.conversationId,
-            memoryOwnerId: opts.memoryOwnerId,
-            currentUserMessage: opts.content,
-            config: memoryConfiguration.config,
-          },
-          {
-            provider: memoryProvider,
-            providerError: memoryProviderError,
-            recallLegacy: recallLegacyMemory,
-            ensureIdentitySaltFingerprint: async (saltFingerprint) =>
-              await convex.mutation(
-                api.memoryProviderState.ensureIdentitySaltFingerprint,
-                { saltFingerprint },
-              ),
-            instrumentation: memoryInstrumentation,
-            recordHydration: (observation) =>
-              recordProviderRead({ operation: "hydration", ...observation }),
-          },
-        );
-  if (runtimeMemory?.shadowComparison) {
-    log(`memory.shadow.comparison: ${JSON.stringify(runtimeMemory.shadowComparison)}`);
+  let memoryService = null;
+  if (
+    opts.kind !== "proactive" &&
+    !memoryConfiguration.error &&
+    memoryConfiguration.config.apiKeyConfigured
+  ) {
+    try {
+      const identityState = await ensureMemoryIdentityRuntime();
+      if (identityState.status !== "ready" || !identityState.saltFingerprint) {
+        throw new Error(`memory identity ${identityState.status}`);
+      }
+      const owner = deriveMemoryIdentity(
+        {
+          conversationId: opts.conversationId,
+          memoryOwnerId: opts.memoryOwnerId,
+        },
+        { expectedSaltFingerprint: identityState.saltFingerprint },
+      );
+      memoryService = createConfiguredSupermemoryService({
+        owner,
+        turnId,
+        configuration: memoryConfiguration.config,
+        instrumentation: memoryInstrumentation,
+      });
+    } catch (error) {
+      log(
+        `memory unavailable: ${JSON.stringify({
+          errorName: error instanceof Error ? error.name : "UnknownError",
+        })}`,
+      );
+    }
   }
-  if (runtimeMemory?.error && !runtimeMemory.providerResult) {
-    log(`memory.recall.failed: ${JSON.stringify({ errorCode: runtimeMemory.error.code })}`);
-  }
-  if (runtimeMemory?.fallbackUsed) {
-    log("memory legacy fallback used after provider failure");
+  const hydrationStartedAt = Date.now();
+  const runtimeMemory = memoryService
+    ? await memoryService.hydrate(opts.content)
+    : undefined;
+  if (memoryService) {
+    await recordProviderRead({
+      operation: "hydration",
+      startedAt: hydrationStartedAt,
+      error: runtimeMemory?.error,
+    });
   }
 
   const userText = opts.mediaError
@@ -671,7 +644,7 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
         : userText;
   const promptText = composePreloadedMemoryPrompt(
     conversationPrompt,
-    runtimeMemory?.promptContext,
+    runtimeMemory?.formattedContext,
   );
   const turnStart = Date.now();
   // Snapshot runtime for this top-level turn so same-turn set_runtime/set_model
@@ -763,14 +736,12 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
     const text = message.trim();
     if (!text) return;
     if (opts.conversationId.startsWith("sms:") && opts.kind !== "proactive") {
-      const number = opts.conversationId.slice(4);
-      await sendImessage(number, text);
+      await opts.sendAcknowledgement?.(text);
     }
     await convex.mutation(api.messages.send, {
       conversationId: opts.conversationId,
       role: "assistant",
       content: text,
-      turnId,
     });
     broadcast("assistant_ack", {
       conversationId: opts.conversationId,
@@ -794,14 +765,10 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
   const lastCodingResult: { current: SpawnCodingAgentResult | null } = { current: null };
 
   const tools = [
-    ...(runtimeMemory?.owner
+    ...(memoryService
       ? createMemoryTools({
-          owner: runtimeMemory.owner,
-          turnId,
+          service: memoryService,
           imageStorageIds: inboundImageStorageIds,
-          config: memoryConfiguration.config,
-          provider: memoryProvider,
-          instrumentation: memoryInstrumentation,
         })
       : []),
     ...createAutomationTools(opts.conversationId),
@@ -928,11 +895,15 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
         opts.kind === "proactive"
           ? []
           : [
-              "mcp__daniel-memory__write_memory",
-              "mcp__daniel-memory__recall",
-              "mcp__daniel-memory__update_memory",
-              "mcp__daniel-memory__forget_memory",
-              "mcp__daniel-memory__remember_image",
+              ...(memoryService
+                ? [
+                    "mcp__daniel-memory__remember_memory",
+                    "mcp__daniel-memory__recall",
+                    "mcp__daniel-memory__update_memory",
+                    "mcp__daniel-memory__forget_memory",
+                    "mcp__daniel-memory__remember_image",
+                  ]
+                : []),
               "mcp__daniel-spawn__spawn_agent",
               "mcp__daniel-coding__spawn_coding_agent",
               "mcp__daniel-automations__create_automation",

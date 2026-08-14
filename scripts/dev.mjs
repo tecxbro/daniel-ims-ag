@@ -162,11 +162,8 @@ async function waitForNgrokUrl(timeoutMs = 15000) {
 function showBanner(url, stable) {
   const line = "═".repeat(68);
   const photonReady = Boolean(envVars.PHOTON_PROJECT_ID && envVars.PHOTON_PROJECT_SECRET);
-  const from = envVars.PHOTON_IMESSAGE_PHONE;
   const photonLine = photonReady
-    ? from
-      ? `  📱 Photon iMessage line:        ${from}`
-      : `  📱 Photon Spectrum iMessage:   configured`
+    ? `  📱 Photon Spectrum iMessage:   configured`
     : `  ⚠ PHOTON_PROJECT_ID / PHOTON_PROJECT_SECRET are not set — iMessage is disabled.`;
 
   const headline = stable

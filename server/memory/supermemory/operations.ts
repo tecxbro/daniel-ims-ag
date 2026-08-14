@@ -1,29 +1,8 @@
 import { createHash, randomUUID } from "node:crypto";
-import { validateProviderIdentifier } from "./identity.js";
 import {
-  buildExplicitMemoryOutboxPayload,
-  buildImageOutboxPayload,
-  buildMemoryForgetOutboxPayload,
-  buildMemoryUpdateOutboxPayload,
-  type DurableImageReason,
-  type ExplicitMemoryOutboxPayload,
-  type ImageOutboxPayload,
-  type MemoryForgetOutboxPayload,
-  type MemoryUpdateOutboxPayload,
-} from "./job-contract.js";
-export {
-  buildExplicitMemoryOutboxPayload,
-  buildImageOutboxPayload,
-  buildMemoryForgetOutboxPayload,
-  buildMemoryUpdateOutboxPayload,
-} from "./job-contract.js";
-export type {
-  DurableImageReason,
-  ExplicitMemoryOutboxPayload,
-  ImageOutboxPayload,
-  MemoryForgetOutboxPayload,
-  MemoryUpdateOutboxPayload,
-} from "./job-contract.js";
+  memoryPairingAuthorityProof,
+  validateProviderIdentifier,
+} from "./identity.js";
 import type {
   CreateExactMemoryInput,
   ForgetMemoryInput,
@@ -50,6 +29,11 @@ export type DurableStaticMemoryKind =
   | "core_identity"
   | "long_term_role"
   | "home_timezone";
+
+export type DurableImageReason =
+  | "explicit_request"
+  | "durable_object"
+  | "remember_image_tool";
 
 export interface CreatedMemoriesResult {
   documentId: string | null;
@@ -606,7 +590,7 @@ export interface CreateExactMemoryOperationInput {
 export async function createExactMemory(
   input: CreateExactMemoryOperationInput,
   dependencies: MemoryOperationDependencies,
-): Promise<CreatedMemoriesResult & { isStatic: boolean; outboxPayload: ExplicitMemoryOutboxPayload }> {
+): Promise<CreatedMemoriesResult & { isStatic: boolean }> {
   assertOwnerContainerScope(input.ownerKey, input.containerTag);
   const content = input.content.trim();
   if (!content) throw new Error("Explicit memory content must not be empty");
@@ -630,7 +614,6 @@ export async function createExactMemory(
   return {
     ...created,
     isStatic,
-    outboxPayload: buildExplicitMemoryOutboxPayload(providerInput),
   };
 }
 
@@ -666,7 +649,6 @@ export async function updateExactMemory(
   oldIsLatest: false;
   newIsLatest: true;
   confirmation: string;
-  outboxPayload: MemoryUpdateOutboxPayload;
 }> {
   assertOwnerContainerScope(input.ownerKey, input.containerTag);
   const updated = await dependencies.provider.updateExact({
@@ -687,12 +669,6 @@ export async function updateExactMemory(
     oldIsLatest: false,
     newIsLatest: true,
     confirmation: `Updated memory ${input.memoryId} as version ${updated.version ?? "new"} (${updated.id}).`,
-    outboxPayload: buildMemoryUpdateOutboxPayload({
-      containerTag: input.containerTag,
-      memoryId: input.memoryId,
-      newContent: input.newContent,
-      metadata: input.metadata,
-    }),
   };
 }
 
@@ -758,7 +734,6 @@ export async function applyExactForget(
   operationId: string;
   forgottenIds: string[];
   confirmation: string;
-  outboxPayload: MemoryForgetOutboxPayload;
 }> {
   assertOwnerContainerScope(input.ownerKey, input.containerTag);
   const now = (dependencies.now ?? Date.now)();
@@ -793,11 +768,6 @@ export async function applyExactForget(
     operationId: input.operationId,
     forgottenIds,
     confirmation: `Forgot ${forgottenIds.length} confirmed ${forgottenIds.length === 1 ? "memory" : "memories"}.`,
-    outboxPayload: buildMemoryForgetOutboxPayload({
-      containerTag: input.containerTag,
-      providerMemoryIds: expectedIds,
-      reason: input.reason,
-    }),
   };
 }
 
@@ -828,7 +798,6 @@ export async function rememberDurableImage(
 ): Promise<{
   anchor: ImageAnchor;
   providerDocumentId: string;
-  outboxPayload: ImageOutboxPayload;
 }> {
   assertOwnerContainerScope(input.ownerKey, input.containerTag);
   const customId = input.customId ?? stableImageCustomId(input.ownerKey, input.storageId);
@@ -841,20 +810,11 @@ export async function rememberDurableImage(
     customId,
     reason: input.reason,
   });
-  const outboxPayload = buildImageOutboxPayload({
-    containerTag: input.containerTag,
-    storageId: input.storageId,
-    customId,
-    reason: input.reason,
-    conversationId: input.conversationId,
-    turnId: input.turnId,
-  });
   if (pending.status === "active") {
     if (!pending.providerDocumentId) throw new Error("Active image anchor is missing providerDocumentId");
     return {
       anchor: pending,
       providerDocumentId: pending.providerDocumentId,
-      outboxPayload,
     };
   }
   const image = await dependencies.fetchImageBytes(input.storageId);
@@ -880,7 +840,6 @@ export async function rememberDurableImage(
   return {
     anchor,
     providerDocumentId: uploaded.id,
-    outboxPayload,
   };
 }
 
@@ -956,6 +915,7 @@ export function createConvexPendingOperationStore(): PendingOperationStore {
       ]);
       return (await convex.mutation(api.memoryPendingOperations.createPending, {
         ...input,
+        pairingAuthorityProof: memoryPairingAuthorityProof(),
       } as never)) as PendingOperation;
     },
     async confirm(input) {
@@ -963,28 +923,40 @@ export function createConvexPendingOperationStore(): PendingOperationStore {
         import("../../convex-client.js"),
         import("../../../convex/_generated/api.js"),
       ]);
-      return (await convex.mutation(api.memoryPendingOperations.confirm, input as never)) as PendingOperationTransitionResult;
+      return (await convex.mutation(api.memoryPendingOperations.confirm, {
+        ...input,
+        pairingAuthorityProof: memoryPairingAuthorityProof(),
+      } as never)) as PendingOperationTransitionResult;
     },
     async complete(input) {
       const [{ convex }, { api }] = await Promise.all([
         import("../../convex-client.js"),
         import("../../../convex/_generated/api.js"),
       ]);
-      return (await convex.mutation(api.memoryPendingOperations.complete, input as never)) as PendingOperationTransitionResult;
+      return (await convex.mutation(api.memoryPendingOperations.complete, {
+        ...input,
+        pairingAuthorityProof: memoryPairingAuthorityProof(),
+      } as never)) as PendingOperationTransitionResult;
     },
     async cancel(input) {
       const [{ convex }, { api }] = await Promise.all([
         import("../../convex-client.js"),
         import("../../../convex/_generated/api.js"),
       ]);
-      return (await convex.mutation(api.memoryPendingOperations.cancel, input as never)) as PendingOperationTransitionResult;
+      return (await convex.mutation(api.memoryPendingOperations.cancel, {
+        ...input,
+        pairingAuthorityProof: memoryPairingAuthorityProof(),
+      } as never)) as PendingOperationTransitionResult;
     },
     async expire(input) {
       const [{ convex }, { api }] = await Promise.all([
         import("../../convex-client.js"),
         import("../../../convex/_generated/api.js"),
       ]);
-      return (await convex.mutation(api.memoryPendingOperations.expire, input as never)) as PendingOperationTransitionResult;
+      return (await convex.mutation(api.memoryPendingOperations.expire, {
+        ...input,
+        pairingAuthorityProof: memoryPairingAuthorityProof(),
+      } as never)) as PendingOperationTransitionResult;
     },
   };
 }
@@ -996,21 +968,30 @@ export function createConvexImageAnchorStore(): ImageAnchorStore {
         import("../../convex-client.js"),
         import("../../../convex/_generated/api.js"),
       ]);
-      return (await convex.mutation(api.memoryImageAnchors.createPending, input as never)) as ImageAnchor;
+      return (await convex.mutation(api.memoryImageAnchors.createPending, {
+        ...input,
+        pairingAuthorityProof: memoryPairingAuthorityProof(),
+      } as never)) as ImageAnchor;
     },
     async activate(input) {
       const [{ convex }, { api }] = await Promise.all([
         import("../../convex-client.js"),
         import("../../../convex/_generated/api.js"),
       ]);
-      return (await convex.mutation(api.memoryImageAnchors.activate, input as never)) as ImageAnchor;
+      return (await convex.mutation(api.memoryImageAnchors.activate, {
+        ...input,
+        pairingAuthorityProof: memoryPairingAuthorityProof(),
+      } as never)) as ImageAnchor;
     },
     async loadActiveByCustomId(input) {
       const [{ convex }, { api }] = await Promise.all([
         import("../../convex-client.js"),
         import("../../../convex/_generated/api.js"),
       ]);
-      return (await convex.query(api.memoryImageAnchors.loadActiveByCustomId, input as never)) as ImageAnchor | null;
+      return (await convex.query(api.memoryImageAnchors.loadActiveByCustomId, {
+        ...input,
+        pairingAuthorityProof: memoryPairingAuthorityProof(),
+      } as never)) as ImageAnchor | null;
     },
     async releaseAfterProviderDeletion(input) {
       const [{ convex }, { api }] = await Promise.all([
@@ -1019,7 +1000,10 @@ export function createConvexImageAnchorStore(): ImageAnchorStore {
       ]);
       return (await convex.mutation(
         api.memoryImageAnchors.releaseAfterProviderDeletion,
-        input as never,
+        {
+          ...input,
+          pairingAuthorityProof: memoryPairingAuthorityProof(),
+        } as never,
       )) as ImageAnchor;
     },
   };

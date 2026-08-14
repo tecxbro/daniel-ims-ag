@@ -6,7 +6,7 @@ import {
 
 /**
  * Compatibility export for the existing `/memory` mount in server/index.ts.
- * Legacy embedding and re-embedding endpoints intentionally are not mounted.
+ * Only the active Supermemory administrative surface is mounted.
  */
 export function createMemoryRouter(
   options: CreateSupermemoryRouterOptions = {},

@@ -1,9 +1,10 @@
 #!/usr/bin/env tsx
 import prompts from "prompts";
-import { spawn } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { execFileSync, spawn } from "node:child_process";
+import { createHmac, randomBytes } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { isValidMemoryIdSalt } from "../server/memory/supermemory/identity.js";
 
 const ROOT = resolve(new URL(".", import.meta.url).pathname, "..");
 const ENV_PATH = resolve(ROOT, ".env.local");
@@ -14,6 +15,8 @@ type RuntimeChoice = "claude" | "codex";
 const DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6";
 const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const DEFAULT_CODEX_REASONING_EFFORT = "medium";
+const MEMORY_FINGERPRINT_CONTEXT = "daniel-memory-id-salt-fingerprint-v1";
+const PAIRING_AUTHORITY_CONTEXT = "daniel-primary-owner-pairing-authority-v1";
 
 const CLAUDE_MODEL_CHOICES = [
   { title: "claude-sonnet-4-6 (recommended)", value: "claude-sonnet-4-6" },
@@ -96,6 +99,65 @@ function writeEnv(path: string, env: Record<string, string>): void {
     out += s + "\n";
   }
   writeFileSync(path, out.trim() + "\n");
+}
+
+function memoryIdentityMaterial(salt: string): {
+  saltFingerprint: string;
+  pairingAuthorityProof: string;
+} {
+  const saltFingerprint = createHmac("sha256", salt)
+    .update(MEMORY_FINGERPRINT_CONTEXT, "utf8")
+    .digest("hex")
+    .slice(0, 32);
+  const pairingAuthorityProof = createHmac("sha256", salt)
+    .update(PAIRING_AUTHORITY_CONTEXT, "utf8")
+    .digest("hex");
+  return { saltFingerprint, pairingAuthorityProof };
+}
+
+function runMemoryIdentityCommand(
+  functionName: string,
+  salt: string,
+): { status?: string } {
+  const output = execFileSync(
+    "npx",
+    [
+      "convex",
+      "run",
+      functionName,
+      JSON.stringify(memoryIdentityMaterial(salt)),
+      "--typecheck",
+      "disable",
+      "--codegen",
+      "disable",
+    ],
+    { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+  );
+  return JSON.parse(output.trim()) as { status?: string };
+}
+
+function initializePersistedMemoryIdentity(salt: string): void {
+  const result = runMemoryIdentityCommand(
+    "memoryProviderState:initializeIdentityConfiguration",
+    salt,
+  );
+  if (result.status !== "ready") {
+    throw new Error(
+      "Memory identity recovery is required. Setup did not replace the existing identity.",
+    );
+  }
+}
+
+function verifyPersistedMemoryIdentity(salt: string): void {
+  const result = runMemoryIdentityCommand(
+    "memoryProviderState:verifyIdentityConfiguration",
+    salt,
+  );
+  if (result.status !== "ready") {
+    throw new Error(
+      "Memory identity recovery is required. Setup did not replace the existing identity.",
+    );
+  }
 }
 
 function cleanConvexUrlEnv(path: string): void {
@@ -191,16 +253,6 @@ function runCapture(cmd: string, args: string[]): Promise<string> {
   });
 }
 
-function normalizeOptionalE164(raw: string | undefined): string {
-  const trimmed = raw?.trim() ?? "";
-  if (!trimmed) return "";
-  if (trimmed.startsWith("+")) return trimmed;
-  const digits = trimmed.replace(/\D/g, "");
-  if (/^\d{10}$/.test(digits)) return `+1${digits}`;
-  if (/^\d{11,15}$/.test(digits)) return `+${digits}`;
-  return trimmed;
-}
-
 async function main() {
   banner("daniel setup");
 
@@ -225,9 +277,8 @@ Before you start:
   banner("Photon Spectrum — iMessage bridge");
   console.log(`
 Daniel uses Photon Spectrum's cloud iMessage provider. Find PROJECT_ID and
-SECRET_KEY in your Photon project settings. PHOTON_IMESSAGE_PHONE is optional;
-set it only when you have a dedicated line and want all outbound DMs pinned
-to that line.
+SECRET_KEY in your Photon project settings. Spectrum selects the correct
+shared or dedicated line for each conversation.
 `);
 
   const answers = await prompts(
@@ -243,12 +294,6 @@ to that line.
         name: "PHOTON_PROJECT_SECRET",
         message: "Photon project secret",
         initial: existing.PHOTON_PROJECT_SECRET ?? "",
-      },
-      {
-        type: "text",
-        name: "PHOTON_IMESSAGE_PHONE",
-        message: "Photon dedicated iMessage line (optional, e.g. +1XXXXXXXXXX)",
-        initial: existing.PHOTON_IMESSAGE_PHONE ?? "",
       },
       {
         type: "select",
@@ -330,9 +375,6 @@ to that line.
     PHOTON_PROJECT_ID: answers.PHOTON_PROJECT_ID ?? existing.PHOTON_PROJECT_ID ?? "",
     PHOTON_PROJECT_SECRET:
       answers.PHOTON_PROJECT_SECRET ?? existing.PHOTON_PROJECT_SECRET ?? "",
-    PHOTON_IMESSAGE_PHONE: normalizeOptionalE164(
-      answers.PHOTON_IMESSAGE_PHONE ?? existing.PHOTON_IMESSAGE_PHONE,
-    ),
   });
 
   // ---- Composio API key ---------------------------------------------------
@@ -398,12 +440,66 @@ to that line.
   banner("SuperMemory — semantic memory");
   console.log(`
 SuperMemory is Daniel's semantic memory provider. Convex remains the application
-database and stores the durable memory-sync outbox and migration audit state.
+database and stores the durable conversation-capture outbox.
 
-The memory ID salt privately derives stable per-user container IDs. Treat it
-like a deployment secret and never rotate it after SuperMemory data is written.
+Setup manages Daniel's private memory identity automatically. If existing
+identity state cannot be verified, setup stops instead of replacing it.
 `);
-  const generatedMemorySalt = randomBytes(32).toString("hex");
+  let persistedIdentity:
+    | {
+        hasSaltFingerprint: boolean;
+        hasPairingAuthority: boolean;
+        hasPrimaryOwner: boolean;
+      }
+    | undefined;
+  if (existing.CONVEX_DEPLOYMENT) {
+    try {
+      const output = execFileSync(
+        "npx",
+        [
+          "convex",
+          "run",
+          "memoryProviderState:getIdentityPresence",
+          "{}",
+          "--typecheck",
+          "disable",
+          "--codegen",
+          "disable",
+        ],
+        { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+      );
+      persistedIdentity = JSON.parse(output.trim()) as typeof persistedIdentity;
+    } catch {
+      throw new Error(
+        "Memory identity state could not be verified. Restore the existing DANIEL_MEMORY_ID_SALT and Convex access before rerunning setup; a replacement will not be generated.",
+      );
+    }
+  }
+  const hasPersistedIdentity = Boolean(
+    persistedIdentity?.hasSaltFingerprint ||
+      persistedIdentity?.hasPairingAuthority ||
+      persistedIdentity?.hasPrimaryOwner,
+  );
+  const hasValidExistingMemoryIdSalt = isValidMemoryIdSalt(
+    existing.DANIEL_MEMORY_ID_SALT,
+  );
+  if (hasPersistedIdentity && !hasValidExistingMemoryIdSalt) {
+    throw new Error(
+      "Memory identity recovery is required: persisted identity state exists but DANIEL_MEMORY_ID_SALT is missing or invalid.",
+    );
+  }
+  if (hasPersistedIdentity && hasValidExistingMemoryIdSalt) {
+    if (persistedIdentity?.hasPairingAuthority) {
+      verifyPersistedMemoryIdentity(existing.DANIEL_MEMORY_ID_SALT);
+    } else if (persistedIdentity?.hasPrimaryOwner || !answers.runConvex) {
+      throw new Error(
+        "Memory identity recovery is required. Run Convex setup to initialize the server-only pairing authority.",
+      );
+    }
+  }
+  const memoryIdSalt =
+    (hasValidExistingMemoryIdSalt ? existing.DANIEL_MEMORY_ID_SALT : undefined) ||
+    (!hasPersistedIdentity ? randomBytes(32).toString("hex") : "");
   const memoryAnswers = await prompts(
     [
       {
@@ -411,14 +507,6 @@ like a deployment secret and never rotate it after SuperMemory data is written.
         name: "SUPERMEMORY_API_KEY",
         message: "SuperMemory API key",
         initial: existing.SUPERMEMORY_API_KEY ?? "",
-        validate: (value: string) =>
-          Boolean(value?.trim()) || "SuperMemory API key is required",
-      },
-      {
-        type: "password",
-        name: "DANIEL_MEMORY_ID_SALT",
-        message: "Stable Daniel memory ID salt (generated if this is first setup)",
-        initial: existing.DANIEL_MEMORY_ID_SALT || generatedMemorySalt,
       },
       {
         type: "number",
@@ -454,12 +542,8 @@ like a deployment secret and never rotate it after SuperMemory data is written.
     },
   );
   Object.assign(answers, memoryAnswers, {
-    DANIEL_MEMORY_READ_MODE: "supermemory",
-    DANIEL_MEMORY_WRITE_MODE: "supermemory",
+    DANIEL_MEMORY_ID_SALT: memoryIdSalt,
     DANIEL_SUPERMEMORY_DREAMING: existing.DANIEL_SUPERMEMORY_DREAMING ?? "dynamic",
-    DANIEL_SUPERMEMORY_HISTORY_BACKFILL_DAYS:
-      existing.DANIEL_SUPERMEMORY_HISTORY_BACKFILL_DAYS ?? "0",
-    DANIEL_MEMORY_LEGACY_FALLBACK: "false",
   });
 
   // ---- Local browser use ---------------------------------------------------
@@ -620,6 +704,7 @@ ${claudeInstalled ? "✓ Claude Code found on PATH." : "⚠ Claude Code was not 
 
   if (answers.runConvex) {
     await runConvexDev();
+    initializePersistedMemoryIdentity(env.DANIEL_MEMORY_ID_SALT);
     const after = readEnv(ENV_PATH);
 
     // VITE_CONVEX_URL is written to .env.local as part of `convex dev`. The
@@ -669,7 +754,6 @@ the tunnel is live, you'll see a banner with your public URL.
 
 Photon iMessage:
   • Make sure PHOTON_PROJECT_ID and PHOTON_PROJECT_SECRET are set.
-  • PHOTON_IMESSAGE_PHONE is optional; set it only for a dedicated line.
   • No inbound webhook needs to be pasted anywhere.
 
 Test it:

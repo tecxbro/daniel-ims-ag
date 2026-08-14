@@ -1,12 +1,12 @@
 import type { Doc, Id } from "./_generated/dataModel";
 import {
-  internalMutation,
   mutation,
   query,
   type MutationCtx,
   type QueryCtx,
 } from "./_generated/server";
 import { v } from "convex/values";
+import { requireMemoryServerAuthority } from "./memoryProviderState";
 
 const MAX_BATCH_STORAGE_IDS = 200;
 const OWNER_SUMMARY_COUNT_LIMIT = 10_000;
@@ -63,6 +63,7 @@ async function requireStoredFile(ctx: MutationCtx, storageId: Id<"_storage">): P
 
 export const createPending = mutation({
   args: {
+    pairingAuthorityProof: v.string(),
     storageId: v.id("_storage"),
     ownerKey: v.string(),
     conversationId: v.optional(v.string()),
@@ -71,6 +72,7 @@ export const createPending = mutation({
     reason: v.string(),
   },
   handler: async (ctx, args) => {
+    await requireMemoryServerAuthority(ctx, args.pairingAuthorityProof);
     await requireStoredFile(ctx, args.storageId);
     const ownerKey = requireText(args.ownerKey, "ownerKey");
     const customId = requireText(args.customId, "customId", 100);
@@ -111,11 +113,13 @@ export const createPending = mutation({
 
 export const activate = mutation({
   args: {
+    pairingAuthorityProof: v.string(),
     customId: v.string(),
     ownerKey: v.string(),
     providerDocumentId: v.string(),
   },
   handler: async (ctx, args) => {
+    await requireMemoryServerAuthority(ctx, args.pairingAuthorityProof);
     const anchor = assertOwner(await anchorByCustomId(ctx, args.customId), args.ownerKey);
     if (!anchor) throw new Error("Image anchor not found");
     const providerDocumentId = requireText(args.providerDocumentId, "providerDocumentId");
@@ -132,8 +136,13 @@ export const activate = mutation({
 });
 
 export const getActiveByStorageId = query({
-  args: { storageId: v.id("_storage"), ownerKey: v.string() },
+  args: {
+    storageId: v.id("_storage"),
+    ownerKey: v.string(),
+    pairingAuthorityProof: v.string(),
+  },
   handler: async (ctx, args) => {
+    await requireMemoryServerAuthority(ctx, args.pairingAuthorityProof);
     const anchors = await ctx.db
       .query("memoryImageAnchors")
       .withIndex("by_storage_id", (q) => q.eq("storageId", args.storageId))
@@ -146,16 +155,27 @@ export const getActiveByStorageId = query({
 });
 
 export const loadActiveByCustomId = query({
-  args: { customId: v.string(), ownerKey: v.string() },
+  args: {
+    customId: v.string(),
+    ownerKey: v.string(),
+    pairingAuthorityProof: v.string(),
+  },
   handler: async (ctx, args) => {
+    await requireMemoryServerAuthority(ctx, args.pairingAuthorityProof);
     const anchor = assertOwner(await anchorByCustomId(ctx, args.customId), args.ownerKey);
     return anchor?.status === "active" ? anchor : null;
   },
 });
 
 export const listByCustomId = query({
-  args: { customId: v.string(), ownerKey: v.string(), status: v.optional(statusV) },
+  args: {
+    customId: v.string(),
+    ownerKey: v.string(),
+    status: v.optional(statusV),
+    pairingAuthorityProof: v.string(),
+  },
   handler: async (ctx, args) => {
+    await requireMemoryServerAuthority(ctx, args.pairingAuthorityProof);
     const anchors = await anchorsByCustomId(ctx, args.customId);
     const foreign = anchors.some((anchor) => anchor.ownerKey !== args.ownerKey);
     if (foreign) throw new Error("Image anchor not found");
@@ -164,8 +184,13 @@ export const listByCustomId = query({
 });
 
 export const listByStatus = query({
-  args: { status: statusV, limit: v.optional(v.number()) },
+  args: {
+    status: statusV,
+    limit: v.optional(v.number()),
+    pairingAuthorityProof: v.string(),
+  },
   handler: async (ctx, args) => {
+    await requireMemoryServerAuthority(ctx, args.pairingAuthorityProof);
     const limit = Math.max(1, Math.min(500, Math.floor(args.limit ?? 100)));
     return await ctx.db
       .query("memoryImageAnchors")
@@ -177,8 +202,12 @@ export const listByStatus = query({
 
 /** Aggregate-only verification data for the local cutover control plane. */
 export const getOwnerSummary = query({
-  args: { ownerKey: v.string() },
+  args: {
+    ownerKey: v.string(),
+    pairingAuthorityProof: v.string(),
+  },
   handler: async (ctx, args) => {
+    await requireMemoryServerAuthority(ctx, args.pairingAuthorityProof);
     const statuses = ["pending", "active", "released"] as const;
     const entries = await Promise.all(
       statuses.map(async (status) => {
@@ -232,6 +261,7 @@ export const findRetainedStorageIds = query({
 
 export const releaseAfterProviderDeletion = mutation({
   args: {
+    pairingAuthorityProof: v.string(),
     customId: v.string(),
     ownerKey: v.string(),
     providerDocumentId: v.string(),
@@ -239,6 +269,7 @@ export const releaseAfterProviderDeletion = mutation({
     now: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
+    await requireMemoryServerAuthority(ctx, args.pairingAuthorityProof);
     if (!args.providerDeletionConfirmed) {
       throw new Error("Provider deletion must be confirmed before releasing an image anchor");
     }
@@ -254,46 +285,6 @@ export const releaseAfterProviderDeletion = mutation({
     const releasedAt = args.now ?? Date.now();
     await ctx.db.patch(anchor._id, { status: "released", releasedAt });
     return { ...anchor, status: "released" as const, releasedAt };
-  },
-});
-
-/** Narrow insertion point for the migration implementation; it does not choose policy. */
-export const insertForMigration = internalMutation({
-  args: {
-    storageId: v.id("_storage"),
-    ownerKey: v.string(),
-    conversationId: v.optional(v.string()),
-    turnId: v.optional(v.string()),
-    customId: v.string(),
-    providerDocumentId: v.optional(v.string()),
-    status: v.union(v.literal("pending"), v.literal("active")),
-    reason: v.string(),
-    createdAt: v.optional(v.number()),
-  },
-  handler: async (ctx, args) => {
-    await requireStoredFile(ctx, args.storageId);
-    if (args.status === "active" && !args.providerDocumentId) {
-      throw new Error("Active migrated anchors require providerDocumentId");
-    }
-    const existing = assertOwner(await anchorByCustomId(ctx, args.customId), args.ownerKey);
-    if (existing) {
-      if (existing.storageId !== args.storageId) throw new Error("Image anchor customId collision");
-      return existing;
-    }
-    const id = await ctx.db.insert("memoryImageAnchors", {
-      storageId: args.storageId,
-      ownerKey: requireText(args.ownerKey, "ownerKey"),
-      conversationId: args.conversationId,
-      turnId: args.turnId,
-      customId: requireText(args.customId, "customId", 100),
-      providerDocumentId: args.providerDocumentId,
-      status: args.status,
-      reason: requireText(args.reason, "reason", 1_000),
-      createdAt: args.createdAt ?? Date.now(),
-    });
-    const created = await ctx.db.get(id);
-    if (!created) throw new Error("Failed to insert migrated image anchor");
-    return created;
   },
 });
 

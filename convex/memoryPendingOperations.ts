@@ -1,6 +1,7 @@
 import type { Doc } from "./_generated/dataModel";
 import { mutation, query, type MutationCtx, type QueryCtx } from "./_generated/server";
 import { v } from "convex/values";
+import { requireMemoryServerAuthority } from "./memoryProviderState";
 
 const MAX_PROVIDER_MEMORY_IDS = 500;
 const MAX_PREVIEW_LENGTH = 8_000;
@@ -80,6 +81,7 @@ async function byOperationId(
 
 export const createPending = mutation({
   args: {
+    pairingAuthorityProof: v.string(),
     operationId: v.string(),
     ownerKey: v.string(),
     conversationId: v.string(),
@@ -90,6 +92,7 @@ export const createPending = mutation({
     now: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
+    await requireMemoryServerAuthority(ctx, args.pairingAuthorityProof);
     const now = nowOr(args.now);
     const operationId = requireText(args.operationId, "operationId");
     const ownerKey = requireText(args.ownerKey, "ownerKey");
@@ -132,12 +135,14 @@ export const createPending = mutation({
 
 export const loadByOperationId = query({
   args: {
+    pairingAuthorityProof: v.string(),
     operationId: v.string(),
     ownerKey: v.string(),
     conversationId: v.optional(v.string()),
     now: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
+    await requireMemoryServerAuthority(ctx, args.pairingAuthorityProof);
     const operation = await byOperationId(ctx, args.operationId);
     return inspectPendingOperation(operation, {
       ownerKey: args.ownerKey,
@@ -149,11 +154,13 @@ export const loadByOperationId = query({
 
 export const loadCurrentPendingByConversation = query({
   args: {
+    pairingAuthorityProof: v.string(),
     ownerKey: v.string(),
     conversationId: v.string(),
     now: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
+    await requireMemoryServerAuthority(ctx, args.pairingAuthorityProof);
     const now = nowOr(args.now);
     const candidates = await ctx.db
       .query("memoryPendingOperations")
@@ -171,12 +178,14 @@ export const loadCurrentPendingByConversation = query({
 
 export const confirm = mutation({
   args: {
+    pairingAuthorityProof: v.string(),
     operationId: v.string(),
     ownerKey: v.string(),
     conversationId: v.string(),
     now: v.optional(v.number()),
   },
   handler: async (ctx, args): Promise<PendingOperationAccess> => {
+    await requireMemoryServerAuthority(ctx, args.pairingAuthorityProof);
     const now = nowOr(args.now);
     const operation = assertOwner(
       await byOperationId(ctx, args.operationId),
@@ -199,12 +208,14 @@ export const confirm = mutation({
 
 export const complete = mutation({
   args: {
+    pairingAuthorityProof: v.string(),
     operationId: v.string(),
     ownerKey: v.string(),
     conversationId: v.string(),
     now: v.optional(v.number()),
   },
   handler: async (ctx, args): Promise<PendingOperationAccess> => {
+    await requireMemoryServerAuthority(ctx, args.pairingAuthorityProof);
     const operation = assertOwner(
       await byOperationId(ctx, args.operationId),
       args.ownerKey,
@@ -234,12 +245,14 @@ export const complete = mutation({
 
 export const cancel = mutation({
   args: {
+    pairingAuthorityProof: v.string(),
     operationId: v.string(),
     ownerKey: v.string(),
     conversationId: v.string(),
     now: v.optional(v.number()),
   },
   handler: async (ctx, args): Promise<PendingOperationAccess> => {
+    await requireMemoryServerAuthority(ctx, args.pairingAuthorityProof);
     const now = nowOr(args.now);
     const operation = assertOwner(
       await byOperationId(ctx, args.operationId),
@@ -265,12 +278,14 @@ export const cancel = mutation({
 
 export const expire = mutation({
   args: {
+    pairingAuthorityProof: v.string(),
     operationId: v.string(),
     ownerKey: v.string(),
     conversationId: v.string(),
     now: v.optional(v.number()),
   },
   handler: async (ctx, args): Promise<PendingOperationAccess> => {
+    await requireMemoryServerAuthority(ctx, args.pairingAuthorityProof);
     const now = nowOr(args.now);
     const operation = assertOwner(
       await byOperationId(ctx, args.operationId),

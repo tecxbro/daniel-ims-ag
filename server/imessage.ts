@@ -4,6 +4,7 @@ import { api } from "../convex/_generated/api.js";
 import { convex } from "./convex-client.js";
 import { handleUserMessage } from "./interaction-agent.js";
 import { finalizeAssistantTurnCapture } from "./memory/supermemory/capture-recovery.js";
+import { consumePrimaryOwnerPairingCommand } from "./memory/supermemory/primary-owner.js";
 import { broadcast } from "./broadcast.js";
 import { validateImageHeader, MAX_IMAGE_BYTES, type ImageMediaType } from "./images/mime.js";
 import { Spectrum, type Message, type Space } from "spectrum-ts";
@@ -30,7 +31,6 @@ interface SendOptions {
 
 let appPromise: Promise<SpectrumApp | null> | null = null;
 let bridgeStarted = false;
-const dmSpaceCache = new Map<string, Space>();
 
 export function stripMarkdown(text: string): string {
   return text
@@ -78,21 +78,6 @@ export function messageDedupKey(message: Pick<Message, "id" | "platform">): stri
   return `photon:${message.platform}:${message.id}`;
 }
 
-function dedicatedPhone(): string | undefined {
-  return normalizeE164(process.env.PHOTON_IMESSAGE_PHONE);
-}
-
-function dmCacheKey(toNumber: string, phone?: string): string {
-  return `${phone ?? "auto"}:${toNumber}`;
-}
-
-function rememberDmSpace(toNumber: string, space: Space): void {
-  const narrowed = imessage(space);
-  dmSpaceCache.set(dmCacheKey(toNumber, narrowed.phone), space);
-  dmSpaceCache.set(dmCacheKey(toNumber, dedicatedPhone()), space);
-  dmSpaceCache.set(dmCacheKey(toNumber), space);
-}
-
 async function getSpectrumApp(): Promise<SpectrumApp | null> {
   const projectId = process.env.PHOTON_PROJECT_ID;
   const projectSecret = process.env.PHOTON_PROJECT_SECRET;
@@ -109,18 +94,12 @@ async function getSpectrumApp(): Promise<SpectrumApp | null> {
 }
 
 async function resolveDmSpace(toNumber: string): Promise<Space | null> {
-  const phone = dedicatedPhone();
-  const cached = dmSpaceCache.get(dmCacheKey(toNumber, phone)) ?? dmSpaceCache.get(dmCacheKey(toNumber));
-  if (cached) return cached;
-
   const app = await getSpectrumApp();
   if (!app) return null;
 
   const im = imessage(app);
   const user = await im.user(toNumber);
-  const space = phone ? await im.space(user, { phone }) : await im.space(user);
-  rememberDmSpace(toNumber, space);
-  return space;
+  return await im.space(user);
 }
 
 export async function sendImessage(
@@ -281,8 +260,6 @@ async function handleSpectrumMessage(space: Space, message: Message): Promise<vo
   });
   if (!claimed) return;
 
-  rememberDmSpace(fromNumber, space);
-
   const { textParts, attachments } = collectMessageParts(message);
   if (textParts.length === 0 && attachments.length === 0) return;
 
@@ -298,7 +275,12 @@ async function handleSpectrumMessage(space: Space, message: Message): Promise<vo
   const turnId = `turn_${randomUUID()}`;
   const turnTag = Math.random().toString(36).slice(2, 8);
   const textForLog = textParts.join("\n").trim();
-  const preview = textForLog.length > 100 ? textForLog.slice(0, 100) + "..." : textForLog;
+  const pairingIntent = /^PAIR(?:\s|$)/.test(textForLog);
+  const preview = pairingIntent
+    ? "[pairing command]"
+    : textForLog.length > 100
+      ? textForLog.slice(0, 100) + "..."
+      : textForLog;
   console.log(`[turn ${turnTag}] <- ${fromNumber}: ${JSON.stringify(preview)}`);
   const start = Date.now();
 
@@ -308,6 +290,47 @@ async function handleSpectrumMessage(space: Space, message: Message): Promise<vo
     from_number: fromNumber,
     handle: message.id,
   });
+
+  if (pairingIntent) {
+    await convex.mutation(api.messages.send, {
+      conversationId,
+      role: "user",
+      content: textForLog,
+      turnId,
+      imageStorageIds:
+        ingested.length > 0
+          ? (ingested.map((image) => image.storageId) as never)
+          : undefined,
+      mediaError: ingestErrors.length > 0 ? ingestErrors.join("; ") : undefined,
+    });
+    const result = await consumePrimaryOwnerPairingCommand({
+      content: textForLog,
+      conversationId,
+    });
+    const reply =
+      result.status === "registered"
+        ? "Primary owner paired. The local memory dashboard and proactive notices are now available."
+        : result.status === "existing"
+          ? "This conversation is already paired as the primary owner."
+          : result.status === "conflict"
+            ? "A different primary owner is already paired. Use the local dashboard to review pairing status."
+            : result.status === "recovery_required"
+              ? "Memory identity recovery is required before pairing can continue."
+              : result.status === "expired"
+                ? "That pairing code expired. Generate a new code in the local dashboard."
+                : result.status === "inactive"
+                  ? "No pairing code is active. Generate one in the local dashboard."
+                  : "That pairing code is invalid.";
+    const delivered = await sendImessage(fromNumber, reply, { space });
+    if (delivered) {
+      await convex.mutation(api.messages.persistAssistantTurn, {
+        conversationId,
+        content: reply,
+        turnId,
+      });
+    }
+    return;
+  }
 
   const stopTyping = startTypingLoop(space);
   let deliveredTurn = false;
@@ -321,6 +344,10 @@ async function handleSpectrumMessage(space: Space, message: Message): Promise<vo
       images: ingested,
       mediaError: ingestErrors.length > 0 ? ingestErrors.join("; ") : undefined,
       onThinking: (t) => broadcast("thinking", { conversationId, t }),
+      sendAcknowledgement: async (text) => {
+        const delivered = await sendImessage(fromNumber, text, { space });
+        if (!delivered) throw new Error("iMessage acknowledgement was not delivered");
+      },
     });
     if (reply) {
       const elapsed = ((Date.now() - start) / 1000).toFixed(1);

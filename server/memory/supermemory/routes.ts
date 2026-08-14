@@ -12,20 +12,27 @@ import {
   type CaptureRecoveryStatus,
 } from "./capture-recovery.js";
 import {
-  deriveMemoryIdentity,
   MemoryIdentityConfigurationError,
   validateProviderIdentifier,
 } from "./identity.js";
 import type {
   DanielMemoryProvider,
   MemoryHydrationResult,
-  MemoryOwnerContext,
   MemorySearchResult,
 } from "./types.js";
 import {
   recordProviderRead,
   type ProviderReadOperation,
 } from "./provider-observability.js";
+import {
+  confirmPrimaryOwnerCandidate,
+  ensureMemoryIdentityRuntime,
+  getPrimaryOwnerScope,
+  listPrimaryOwnerCandidates,
+  primaryOwnerPairingStatus,
+  rotatePrimaryOwnerPairingCode,
+  type PrimaryOwnerScope,
+} from "./primary-owner.js";
 
 type Environment = Record<string, string | undefined>;
 type RetryableJobStatus = "failed" | "dead_letter";
@@ -45,11 +52,7 @@ export interface MemoryRouteControlPlane {
     containerTag: string;
     expectedStatus: RetryableJobStatus;
   }): Promise<unknown>;
-  verifyMigration(input: {
-    ownerKey: string;
-    containerTag: string;
-  }): Promise<unknown>;
-  getImageAnchorSummary(ownerKey: string): Promise<unknown>;
+  getPrimaryOwnerScope(): Promise<PrimaryOwnerScope | null>;
 }
 
 export interface CreateSupermemoryRouterOptions {
@@ -57,12 +60,19 @@ export interface CreateSupermemoryRouterOptions {
   provider?: MemoryRouteProvider | null;
   getProvider?: () => MemoryRouteProvider | null;
   controlPlane?: MemoryRouteControlPlane;
-  resolveOwner?: (request: Request) => Promise<MemoryOwnerContext>;
+  resolveOwner?: (request: Request) => Promise<Pick<PrimaryOwnerScope, "ownerKey" | "containerTag">>;
   /** Tests and a future authenticated parent router may provide an equivalent boundary. */
   localOnly?: boolean;
   now?: () => number;
   getRecoveryStatus?: () => Promise<CaptureRecoveryStatus>;
   recordProviderRead?: typeof recordProviderRead;
+  getIdentityStatus?: typeof ensureMemoryIdentityRuntime;
+  pairing?: {
+    status: typeof primaryOwnerPairingStatus;
+    rotateCode: typeof rotatePrimaryOwnerPairingCode;
+    listCandidates: typeof listPrimaryOwnerCandidates;
+    confirmCandidate: typeof confirmPrimaryOwnerCandidate;
+  };
 }
 
 const MAX_QUERY_LENGTH = 8_000;
@@ -164,16 +174,21 @@ function createDefaultControlPlane(): MemoryRouteControlPlane {
       convex.query(api.memoryProviderState.getDeploymentState, {}),
     getBacklog: () =>
       convex.query(api.memoryProviderState.getBacklogSummary, {}),
-    retryJob: (input) =>
-      convex.mutation(api.memorySyncJobs.retryOwned, input),
-    verifyMigration: (input) =>
-      convex.query(api.memoryMigration.verifyOwnerCutover, input),
-    getImageAnchorSummary: (ownerKey) =>
-      convex.query(api.memoryImageAnchors.getOwnerSummary, { ownerKey }),
+    retryJob: async (input) => {
+      const identity = await ensureMemoryIdentityRuntime();
+      if (identity.status !== "ready" || !identity.pairingAuthorityProof) {
+        throw new MemoryRouteError(503, "owner_unavailable", "Memory owner is unavailable.");
+      }
+      return await convex.mutation(api.memorySyncJobs.retryOwned, {
+        ...input,
+        pairingAuthorityProof: identity.pairingAuthorityProof,
+      });
+    },
+    getPrimaryOwnerScope,
   };
 }
 
-function assertOwnerScope(owner: MemoryOwnerContext): void {
+function assertOwnerScope(owner: Pick<PrimaryOwnerScope, "ownerKey" | "containerTag">): void {
   try {
     validateProviderIdentifier(owner.ownerKey, "ownerKey");
     validateProviderIdentifier(owner.containerTag, "containerTag");
@@ -189,38 +204,22 @@ function assertOwnerScope(owner: MemoryOwnerContext): void {
 }
 
 async function resolveConfiguredOwner(
-  env: Environment,
   controlPlane: MemoryRouteControlPlane,
-): Promise<MemoryOwnerContext> {
-  const memoryOwnerId = env.DANIEL_USER_PHONE?.trim();
-  if (!memoryOwnerId) {
+): Promise<PrimaryOwnerScope> {
+  let owner: PrimaryOwnerScope | null;
+  try {
+    owner = await controlPlane.getPrimaryOwnerScope();
+  } catch {
+    throw new MemoryRouteError(503, "owner_unavailable", "Memory owner is unavailable.");
+  }
+  if (!owner) {
     throw new MemoryRouteError(
       503,
-      "owner_not_configured",
-      "The dashboard memory owner is not configured.",
+      "owner_not_paired",
+      "Pair a primary owner before using the memory dashboard.",
     );
   }
-  let providerState: Record<string, unknown> | null;
-  try {
-    providerState = asRecord(await controlPlane.getProviderState());
-  } catch {
-    throw new MemoryRouteError(503, "owner_unavailable", "Memory owner is unavailable.");
-  }
-  const expectedSaltFingerprint = providerState?.saltFingerprint;
-  if (typeof expectedSaltFingerprint !== "string") {
-    throw new MemoryRouteError(503, "owner_unavailable", "Memory owner is unavailable.");
-  }
-  try {
-    return deriveMemoryIdentity(
-      { memoryOwnerId, conversationId: "memory-dashboard" },
-      {
-        salt: env.DANIEL_MEMORY_ID_SALT,
-        expectedSaltFingerprint,
-      },
-    );
-  } catch {
-    throw new MemoryRouteError(503, "owner_unavailable", "Memory owner is unavailable.");
-  }
+  return owner;
 }
 
 function requiredString(value: unknown, label: string, maxLength: number): string {
@@ -385,14 +384,17 @@ function route(
 
 function providerHealth(
   configured: boolean,
-  readMode: string,
-  writeMode: string,
   providerState: Record<string, unknown> | null,
-): "disabled" | "unconfigured" | "healthy" | "degraded" | "unavailable" {
-  if (readMode === "convex" && writeMode === "convex") return "disabled";
+  identityStatus: "ready" | "unconfigured" | "recovery_required" | null,
+): "unconfigured" | "recovery_required" | "healthy" | "degraded" | "unavailable" {
   if (!configured) return "unconfigured";
+  if (identityStatus === "recovery_required") return "recovery_required";
+  if (identityStatus === "unconfigured") return "unconfigured";
   const value = providerState?.healthStatus;
-  return value === "healthy" || value === "degraded" || value === "unavailable"
+  return value === "healthy" ||
+    value === "degraded" ||
+    value === "unavailable" ||
+    value === "recovery_required"
     ? value
     : "unavailable";
 }
@@ -410,7 +412,7 @@ export function createSupermemoryRouter(
   const now = options.now ?? Date.now;
   const getRecoveryStatus = options.getRecoveryStatus ?? inspectCaptureRecoveryJournal;
   const resolveOwner =
-    options.resolveOwner ?? (() => resolveConfiguredOwner(env, controlPlane));
+    options.resolveOwner ?? (() => resolveConfiguredOwner(controlPlane));
   const getProvider =
     options.getProvider ??
     (() => (options.provider === undefined ? getSupermemoryProvider() : options.provider));
@@ -419,10 +421,18 @@ export function createSupermemoryRouter(
     (options.provider === undefined && options.getProvider === undefined
       ? recordProviderRead
       : async () => undefined);
+  const pairing = options.pairing ?? {
+    status: primaryOwnerPairingStatus,
+    rotateCode: rotatePrimaryOwnerPairingCode,
+    listCandidates: listPrimaryOwnerCandidates,
+    confirmCandidate: confirmPrimaryOwnerCandidate,
+  };
 
   if (options.localOnly !== false) router.use(requireLocalRequest);
 
-  const ownerFor = async (request: Request): Promise<MemoryOwnerContext> => {
+  const ownerFor = async (
+    request: Request,
+  ): Promise<Pick<PrimaryOwnerScope, "ownerKey" | "containerTag">> => {
     const owner = await resolveOwner(request);
     assertOwnerScope(owner);
     return owner;
@@ -455,11 +465,16 @@ export function createSupermemoryRouter(
     "/provider-status",
     route(async (_request, response) => {
       const config = readMemoryProviderConfiguration(env);
-      const [providerStateResult, backlogResult, recoveryResult] = await Promise.allSettled([
-        controlPlane.getProviderState(),
-        controlPlane.getBacklog(),
-        getRecoveryStatus(),
-      ]);
+      const identityStatus = options.getIdentityStatus ?? ensureMemoryIdentityRuntime;
+      const [providerStateResult, backlogResult, recoveryResult, identityResult] =
+        await Promise.allSettled([
+          controlPlane.getProviderState(),
+          controlPlane.getBacklog(),
+          getRecoveryStatus(),
+          config.apiKeyConfigured
+            ? identityStatus()
+            : Promise.resolve({ status: "unconfigured" as const }),
+        ]);
       const state =
         providerStateResult.status === "fulfilled"
           ? asRecord(providerStateResult.value)
@@ -470,21 +485,17 @@ export function createSupermemoryRouter(
         ok: true,
         provider: "supermemory",
         configured: config.apiKeyConfigured,
-        readMode: config.readMode,
-        writeMode: config.writeMode,
-        legacyFallback: config.legacyFallback,
         health: {
           status: providerHealth(
             config.apiKeyConfigured,
-            config.readMode,
-            config.writeMode,
             state,
+            identityResult.status === "fulfilled" ? identityResult.value.status : null,
           ),
           lastSuccessAt: numberOrNull(state?.lastSuccessfulSubmissionAt),
           lastFailureAt: numberOrNull(state?.lastFailedSubmissionAt),
           lastWorkerActivityAt: numberOrNull(state?.lastWorkerActivityAt),
           updatedAt: numberOrNull(state?.updatedAt),
-          hasError: typeof state?.lastError === "string" && state.lastError.length > 0,
+          hasError: state?.hasError === true,
         },
         backlog,
         recoveryJournal:
@@ -495,6 +506,7 @@ export function createSupermemoryRouter(
           providerState: providerStateResult.status === "fulfilled",
           backlog: backlogResult.status === "fulfilled",
           recoveryJournal: recoveryResult.status === "fulfilled",
+          identity: identityResult.status === "fulfilled",
         },
         checkedAt: now(),
       });
@@ -508,11 +520,13 @@ export function createSupermemoryRouter(
       const q = optionalString(request.query.q, "q", MAX_QUERY_LENGTH);
       const threshold = optionalNumber(request.query.threshold, "threshold", 0, 1);
       const profile = normalizeProfile(
-        await observedProviderRead("profile", () => providerForRequest().profile({
-          containerTag: owner.containerTag,
-          ...(q ? { q } : {}),
-          ...(threshold === undefined ? {} : { threshold }),
-        })),
+        await observedProviderRead("profile", () =>
+          providerForRequest().profile({
+            containerTag: owner.containerTag,
+            ...(q ? { q } : {}),
+            ...(threshold === undefined ? {} : { threshold }),
+          }),
+        ),
       );
       const factCount = profile.profile.static.length + profile.profile.dynamic.length;
       response.json({
@@ -540,13 +554,15 @@ export function createSupermemoryRouter(
         throw new MemoryRouteError(400, "invalid_request", "searchMode is invalid.");
       }
       const results = normalizeResults(
-        await observedProviderRead("search", () => providerForRequest().search({
-          containerTag: owner.containerTag,
-          q,
-          searchMode,
-          ...(threshold === undefined ? {} : { threshold }),
-          ...(limit === undefined ? {} : { limit }),
-        })),
+        await observedProviderRead("search", () =>
+          providerForRequest().search({
+            containerTag: owner.containerTag,
+            q,
+            searchMode,
+            ...(threshold === undefined ? {} : { threshold }),
+            ...(limit === undefined ? {} : { limit }),
+          }),
+        ),
       );
       response.json({ ok: true, provider: "supermemory", searchMode, results });
     }),
@@ -567,9 +583,9 @@ export function createSupermemoryRouter(
       const limit = optionalNumber(request.query.limit, "limit", 1, 100, true);
       const result = await observedProviderRead("documents", () =>
         providerForRequest().listDocuments({
-        containerTag: owner.containerTag,
-        ...(page === undefined ? {} : { page }),
-        ...(limit === undefined ? {} : { limit }),
+          containerTag: owner.containerTag,
+          ...(page === undefined ? {} : { page }),
+          ...(limit === undefined ? {} : { limit }),
         }),
       );
       response.json({
@@ -602,13 +618,15 @@ export function createSupermemoryRouter(
           "Memory history is unavailable from the configured provider.",
         );
       }
-      const result = await observedProviderRead("entries", () => provider.listMemories!({
-        containerTag: owner.containerTag,
-        ...(page === undefined ? {} : { page }),
-        ...(limit === undefined ? {} : { limit }),
-        order,
-        sort,
-      }));
+      const result = await observedProviderRead("entries", () =>
+        provider.listMemories!({
+          containerTag: owner.containerTag,
+          ...(page === undefined ? {} : { page }),
+          ...(limit === undefined ? {} : { limit }),
+          order,
+          sort,
+        }),
+      );
       response.json({ ok: true, provider: "supermemory", ...result });
     }),
   );
@@ -659,51 +677,38 @@ export function createSupermemoryRouter(
   router.post("/retry-job", retryHandler("failed"));
   router.post("/retry-dead-letter", retryHandler("dead_letter"));
 
+  router.get(
+    "/pairing/status",
+    route(async (_request, response) => {
+      response.json({ ok: true, ...(await pairing.status()) });
+    }),
+  );
+
   router.post(
-    "/migration/verify",
+    "/pairing/code",
+    route(async (_request, response) => {
+      const result = await pairing.rotateCode();
+      response
+        .status(result.status === "ready" ? 200 : 409)
+        .json({ ok: result.status === "ready", ...result });
+    }),
+  );
+
+  router.get(
+    "/pairing/candidates",
+    route(async (_request, response) => {
+      response.json({ ok: true, candidates: await pairing.listCandidates(now()) });
+    }),
+  );
+
+  router.post(
+    "/pairing/confirm",
     route(async (request, response) => {
-      const owner = await ownerFor(request);
-      const [migrationValue, imageAnchorValue] = await Promise.all([
-        controlPlane.verifyMigration({
-          ownerKey: owner.ownerKey,
-          containerTag: owner.containerTag,
-        }),
-        controlPlane.getImageAnchorSummary(owner.ownerKey),
-      ]);
-      const migration = asRecord(migrationValue);
-      const imageAnchors = asRecord(imageAnchorValue);
-      if (!migration || !imageAnchors) {
-        throw new MemoryRouteError(503, "verification_unavailable", "Migration verification is unavailable.");
-      }
-      const ready =
-        migration.reconciled === true &&
-        migration.truncated !== true &&
-        imageAnchors.truncated !== true &&
-        nonNegativeCount(imageAnchors.activeWithoutProviderId) === 0;
-      response.status(ready ? 200 : 409).json({
-        ok: ready,
-        ready,
-        migration: {
-          total: nonNegativeCount(migration.total),
-          pending: nonNegativeCount(migration.pending),
-          migrated: nonNegativeCount(migration.migrated),
-          failed: nonNegativeCount(migration.failed),
-          skipped: nonNegativeCount(migration.skipped),
-          migratedWithoutProviderId: nonNegativeCount(
-            migration.migratedWithoutProviderId,
-          ),
-          truncated: migration.truncated === true,
-        },
-        imageAnchors: {
-          pending: nonNegativeCount(imageAnchors.pending),
-          active: nonNegativeCount(imageAnchors.active),
-          released: nonNegativeCount(imageAnchors.released),
-          activeWithoutProviderId: nonNegativeCount(
-            imageAnchors.activeWithoutProviderId,
-          ),
-          truncated: imageAnchors.truncated === true,
-        },
-      });
+      const body = asRecord(request.body) ?? {};
+      const token = requiredString(body.token, "token", 128);
+      const status = await pairing.confirmCandidate(token, now());
+      const ok = status === "registered" || status === "existing";
+      response.status(ok ? 200 : status === "conflict" ? 409 : 400).json({ ok, status });
     }),
   );
 
