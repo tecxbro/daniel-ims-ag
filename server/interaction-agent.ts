@@ -2,7 +2,17 @@ import { z } from "zod";
 import { api } from "../convex/_generated/api.js";
 import { convex } from "./convex-client.js";
 import { createMemoryTools } from "./memory/tools.js";
-import { extractAndStore } from "./memory/extract.js";
+import { finalizeAssistantTurnCapture } from "./memory/supermemory/capture-recovery.js";
+import { readMemoryProviderConfiguration } from "./memory/supermemory/client.js";
+import type { MemoryContextInstrumentationEvent } from "./memory/supermemory/context.js";
+import { deriveMemoryIdentity } from "./memory/supermemory/identity.js";
+import { ensureMemoryIdentityRuntime } from "./memory/supermemory/primary-owner.js";
+import { createConfiguredSupermemoryService } from "./memory/supermemory/service.js";
+import type {
+  HandleOpts as MemoryHandleOpts,
+  MemoryProviderConfiguration,
+} from "./memory/supermemory/types.js";
+import { recordProviderRead } from "./memory/supermemory/provider-observability.js";
 import { spawnExecutionAgent } from "./execution-agent.js";
 import {
   continueCodingAgentWithAnswer,
@@ -21,7 +31,6 @@ import {
   type RuntimeConfig,
 } from "./runtime-config.js";
 import { broadcast } from "./broadcast.js";
-import { sendImessage } from "./imessage.js";
 import { defineRuntimeTool } from "./runtimes/tool.js";
 import { runAgentRuntime } from "./runtimes/index.js";
 import { runtimeText } from "./runtimes/types.js";
@@ -38,6 +47,41 @@ import {
   type CodingResponseStyle,
 } from "./coding/response-style.js";
 
+const MEMORY_TOOL_LIST =
+  "- recall / remember_memory / update_memory / forget_memory / remember_image (durable memory for this user)\n";
+
+const MEMORY_ENABLED_INSTRUCTIONS = `Memory context is automatically preloaded before you run. Use that context
+for user-specific claims. The recent conversation transcript is still only
+the last few turns; long-term facts come from the preloaded memory section.
+
+recall() remains available for a second, narrow query when the preloaded
+context does not cover a specific name, project, preference, correction, or
+past decision. Multiple narrow recalls are fine, but routine turns no longer
+need a mandatory recall tool call before using already-preloaded context.
+
+remember_memory() — call aggressively for durable facts. Err on the side of
+saving. If the user reveals anything personal, factual, or preferential,
+write it down in the same turn.
+
+Use update_memory() for a correction to an exact remembered fact,
+forget_memory() for previewed and confirmed forgetting, and remember_image()
+only when the user explicitly asks to retain an image as durable memory.
+
+Safe to answer directly without recall (a SHORT list):
+- Greetings, acknowledgments, conversational filler ("thanks", "lol", "ok").
+- Explaining what you just did, confirming a draft, relaying a sub-agent.
+- Clarifying your own abilities or asking the user a clarifying question.
+- Anything in the same conversation turn the user JUST told you (echo
+  back is fine; persistent facts still need remember_memory).
+
+If the preloaded context is insufficient, use a narrow recall before making a
+positive or negative claim about saved user information.`;
+
+const MEMORY_DISABLED_INSTRUCTIONS = `Long-term memory tools and preloaded memory are unavailable for this turn.
+Do not claim that you recalled, saved, updated, forgot, or retained anything in
+long-term memory. If the user asks you to remember something, explain that
+long-term memory is unavailable right now.`;
+
 const INTERACTION_SYSTEM = `You are Daniel, a personal agent the user texts from iMessage.
 
 You are a DISPATCHER, not a doer. Your job:
@@ -49,7 +93,7 @@ You are a DISPATCHER, not a doer. Your job:
 ${DANIEL_VOICE_PROMPT}
 
 Your only tools:
-- recall / write_memory (durable memory for this user)
+{{MEMORY_TOOL_LIST}}
 - spawn_agent (dispatches a sub-agent that CAN touch the world)
 - spawn_coding_agent (dispatches Daniel's full Codex coding bridge)
 - create_automation / list_automations / toggle_automation / delete_automation
@@ -118,36 +162,7 @@ Current coding response style: {{CODING_RESPONSE_STYLE}}.
 Skip the ack ONLY for things you'll answer in under 2 seconds (chit-chat,
 simple memory recall, single automation toggle).
 
-Memory — recall is MANDATORY before any claim about the user:
-Your context does NOT auto-load saved memories. You must call recall()
-explicitly. Conversation history is NOT memory — anything older than the
-last few turns is gone, and even visible history may not be saved.
-
-Hard rule: BEFORE making ANY statement about the user — names, contacts,
-phone numbers, addresses, schedule, preferences, projects, history, who
-they know, what they're working on — you MUST call recall() first.
-
-This applies to NEGATIVE claims TOO. Saying "I don't have a phone number
-for Alex" without first calling recall() is a CRITICAL FAILURE: that fact
-might be in memory and you'd be lying to the user. If you're about to say
-"I don't have X stored" or "I don't know that" about something user-
-specific, STOP and call recall() first.
-
-Recall is cheap. Overuse is correct. Underuse is a bug. Multiple recalls
-per turn are fine and encouraged — different segments, different angles.
-
-write_memory() — call aggressively for durable facts. Err on the side of
-saving. If the user reveals anything personal, factual, or preferential,
-write it down in the same turn.
-
-Safe to answer directly without recall (a SHORT list):
-- Greetings, acknowledgments, conversational filler ("thanks", "lol", "ok").
-- Explaining what you just did, confirming a draft, relaying a sub-agent.
-- Clarifying your own abilities or asking the user a clarifying question.
-- Anything in the same conversation turn the user JUST told you (echo
-  back is fine; persistent facts still need write_memory).
-
-Everything else about the user — SPAWN or RECALL FIRST.
+{{MEMORY_INSTRUCTIONS}}
 
 Never invent URLs, site names, or a Sources section. If a live fact (price,
 news, score, hours) would go stale, spawn instead of guessing. Do not add
@@ -255,9 +270,29 @@ short clarifying question rather than guessing what they want.
 
 Format: Plain iMessage-friendly text. Markdown sparingly. Keep replies under ~400 chars when you can.`;
 
-interface HandleOpts {
-  conversationId: string;
-  content: string;
+export function buildInteractionSystemPrompt(input: {
+  integrations: string[];
+  codingResponseStyle: CodingResponseStyle;
+  memoryEnabled: boolean;
+}): string {
+  return INTERACTION_SYSTEM.replace(
+    "{{MEMORY_TOOL_LIST}}",
+    input.memoryEnabled ? MEMORY_TOOL_LIST.trimEnd() : "",
+  )
+    .replace(
+      "{{MEMORY_INSTRUCTIONS}}",
+      input.memoryEnabled
+        ? MEMORY_ENABLED_INSTRUCTIONS
+        : MEMORY_DISABLED_INSTRUCTIONS,
+    )
+    .replace(
+      "{{INTEGRATIONS}}",
+      input.integrations.join(", ") || "(no integrations configured yet)",
+    )
+    .replace("{{CODING_RESPONSE_STYLE}}", input.codingResponseStyle);
+}
+
+interface HandleOpts extends MemoryHandleOpts {
   turnTag?: string;
   onThinking?: (chunk: string) => void;
   // "proactive" persists the inbound message with role=system instead of
@@ -270,10 +305,40 @@ interface HandleOpts {
   persistAssistantReply?: boolean;
   images?: Array<{ storageId: string; mediaType: string }>;
   mediaError?: string;
+  /** Inbound transports use this to keep acknowledgements on the same Space. */
+  sendAcknowledgement?: (message: string) => Promise<void>;
 }
 
 function randomId(prefix: string): string {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function readTurnMemoryConfiguration(): {
+  config: MemoryProviderConfiguration;
+  error?: unknown;
+} {
+  try {
+    return { config: readMemoryProviderConfiguration() };
+  } catch (error) {
+    return {
+      config: {
+        timeoutMs: 1_200,
+        threshold: 0.6,
+        searchLimit: 8,
+        dreaming: "dynamic",
+        apiKeyConfigured: false,
+      },
+      error,
+    };
+  }
+}
+
+export function composePreloadedMemoryPrompt(
+  conversationPrompt: string,
+  memoryContext: string | undefined,
+): string {
+  const context = memoryContext?.trim();
+  return context ? `${context}\n\n${conversationPrompt}` : conversationPrompt;
 }
 
 function runtimeLabel(runtime: "claude" | "codex"): string {
@@ -508,7 +573,7 @@ async function recordDispatcherUsage(args: {
 }
 
 export async function handleUserMessage(opts: HandleOpts): Promise<string> {
-  const turnId = randomId("turn");
+  const turnId = opts.turnId ?? randomId("turn");
   const integrations = (await listEnabledIntegrations()).map((i) => i.name);
 
   const inboundRole = opts.kind === "proactive" ? "system" : "user";
@@ -541,30 +606,109 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
     .map((m: any) => `${m.role.toUpperCase()}: ${m.content}`)
     .join("\n");
 
+  const tag = opts.turnTag ?? turnId.slice(-6);
+  const log = (msg: string) => console.log(`[turn ${tag}] ${msg}`);
+  const memoryConfiguration = readTurnMemoryConfiguration();
+  const memoryInstrumentation = (event: MemoryContextInstrumentationEvent): void => {
+    log(
+      `${event.name}: ${JSON.stringify({
+        operation: event.operation,
+        status: event.status,
+        latencyMs: event.latencyMs,
+        resultCount: event.resultCount,
+        profileFactCount: event.profileFactCount,
+        errorCode: event.errorCode,
+      })}`,
+    );
+  };
+  let memoryService = null;
+  if (
+    opts.kind !== "proactive" &&
+    !memoryConfiguration.error &&
+    memoryConfiguration.config.apiKeyConfigured
+  ) {
+    try {
+      const identityState = await ensureMemoryIdentityRuntime();
+      if (identityState.status !== "ready" || !identityState.saltFingerprint) {
+        throw new Error(`memory identity ${identityState.status}`);
+      }
+      const owner = deriveMemoryIdentity(
+        {
+          conversationId: opts.conversationId,
+          memoryOwnerId: opts.memoryOwnerId,
+        },
+        { expectedSaltFingerprint: identityState.saltFingerprint },
+      );
+      memoryService = createConfiguredSupermemoryService({
+        owner,
+        turnId,
+        configuration: memoryConfiguration.config,
+        instrumentation: memoryInstrumentation,
+      });
+    } catch (error) {
+      log(
+        `memory unavailable: ${JSON.stringify({
+          errorName: error instanceof Error ? error.name : "UnknownError",
+        })}`,
+      );
+    }
+  }
+  const hydrationStartedAt = Date.now();
+  const runtimeMemory = memoryService
+    ? await memoryService.hydrate(opts.content)
+    : undefined;
+  if (memoryService) {
+    await recordProviderRead({
+      operation: "hydration",
+      startedAt: hydrationStartedAt,
+      error: runtimeMemory?.error,
+    });
+  }
+
   const userText = opts.mediaError
     ? `[user sent images but they couldn't be downloaded: ${opts.mediaError}]\n${opts.content}`
     : opts.content;
-  const promptText =
+  const conversationPrompt =
     opts.kind === "proactive"
       ? `Standalone proactive notice. Write a concise user-facing iMessage from this notice only. Do not research, spawn agents, or continue any prior conversation.\n\n${userText}`
       : historyBlock
         ? `Prior turns:\n${historyBlock}\n\nCurrent message:\n${userText}`
         : userText;
-
-  const tag = opts.turnTag ?? turnId.slice(-6);
-  const log = (msg: string) => console.log(`[turn ${tag}] ${msg}`);
+  const promptText = composePreloadedMemoryPrompt(
+    conversationPrompt,
+    runtimeMemory?.formattedContext,
+  );
   const turnStart = Date.now();
   // Snapshot runtime for this top-level turn so same-turn set_runtime/set_model
   // changes do not split the dispatcher and any spawned execution agent.
   const runtimeConfig = await getRuntimeConfig();
+  const finalizeTurnMemory = async (assistantReply: string): Promise<void> => {
+    if (opts.kind === "proactive") return;
+
+    // Local callers atomically persist the assistant row and outbox job here.
+    // iMessage defers this same operation until its caller confirms delivery.
+    if (opts.persistAssistantReply) {
+      await finalizeAssistantTurnCapture({
+        conversationId: opts.conversationId,
+        memoryOwnerId: opts.memoryOwnerId,
+        turnId,
+        userMessage: opts.content,
+        assistantReply,
+        imageStorageIds: inboundImageStorageIds,
+        kind: opts.kind,
+        channel: "local",
+      });
+    }
+  };
   const codingResponseStyle =
     opts.kind === "proactive"
       ? DEFAULT_CODING_RESPONSE_STYLE
       : await resolveCodingResponseStyleForTurn(opts.conversationId, opts.content);
-  const systemPrompt = INTERACTION_SYSTEM.replace(
-    "{{INTEGRATIONS}}",
-    integrations.join(", ") || "(no integrations configured yet)",
-  ).replace("{{CODING_RESPONSE_STYLE}}", codingResponseStyle);
+  const systemPrompt = buildInteractionSystemPrompt({
+    integrations,
+    codingResponseStyle,
+    memoryEnabled: memoryService !== null,
+  });
 
   if (opts.kind !== "proactive") {
     const codingResult = await continueCodingAgentWithAnswer({
@@ -587,14 +731,7 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
         conversationId: opts.conversationId,
         content: codingReply,
       });
-      if (opts.persistAssistantReply) {
-        await convex.mutation(api.messages.send, {
-          conversationId: opts.conversationId,
-          role: "assistant",
-          content: codingReply,
-          turnId,
-        });
-      }
+      await finalizeTurnMemory(codingReply);
       return codingReply;
     }
   }
@@ -611,14 +748,7 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
         : `Switched to ${label}. Next turn will use ${nextConfig.model}.`;
     log(`runtime switch: ${runtimeConfig.runtime} -> ${directRuntimeSwitch}`);
     broadcast("assistant_message", { conversationId: opts.conversationId, content: reply });
-    if (opts.persistAssistantReply) {
-      await convex.mutation(api.messages.send, {
-        conversationId: opts.conversationId,
-        role: "assistant",
-        content: reply,
-        turnId,
-      });
-    }
+    await finalizeTurnMemory(reply);
     return reply;
   }
 
@@ -631,14 +761,7 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
       "Local browser use is off right now. Turn it on in Settings → Local browser use, then resend this and I can use Chrome on your machine.";
     log("browser requested but disabled");
     broadcast("assistant_message", { conversationId: opts.conversationId, content: reply });
-    if (opts.persistAssistantReply) {
-      await convex.mutation(api.messages.send, {
-        conversationId: opts.conversationId,
-        role: "assistant",
-        content: reply,
-        turnId,
-      });
-    }
+    await finalizeTurnMemory(reply);
     return reply;
   }
 
@@ -646,14 +769,12 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
     const text = message.trim();
     if (!text) return;
     if (opts.conversationId.startsWith("sms:") && opts.kind !== "proactive") {
-      const number = opts.conversationId.slice(4);
-      await sendImessage(number, text);
+      await opts.sendAcknowledgement?.(text);
     }
     await convex.mutation(api.messages.send, {
       conversationId: opts.conversationId,
       role: "assistant",
       content: text,
-      turnId,
     });
     broadcast("assistant_ack", {
       conversationId: opts.conversationId,
@@ -677,7 +798,12 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
   const lastCodingResult: { current: SpawnCodingAgentResult | null } = { current: null };
 
   const tools = [
-    ...createMemoryTools(opts.conversationId),
+    ...(memoryService
+      ? createMemoryTools({
+          service: memoryService,
+          imageStorageIds: inboundImageStorageIds,
+        })
+      : []),
     ...createAutomationTools(opts.conversationId),
     ...createDraftDecisionTools(opts.conversationId, runtimeConfig),
     ...createSelfTools(),
@@ -802,8 +928,15 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
         opts.kind === "proactive"
           ? []
           : [
-              "mcp__daniel-memory__write_memory",
-              "mcp__daniel-memory__recall",
+              ...(memoryService
+                ? [
+                    "mcp__daniel-memory__remember_memory",
+                    "mcp__daniel-memory__recall",
+                    "mcp__daniel-memory__update_memory",
+                    "mcp__daniel-memory__forget_memory",
+                    "mcp__daniel-memory__remember_image",
+                  ]
+                : []),
               "mcp__daniel-spawn__spawn_agent",
               "mcp__daniel-coding__spawn_coding_agent",
               "mcp__daniel-automations__create_automation",
@@ -875,32 +1008,9 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
 
   broadcast("assistant_message", { conversationId: opts.conversationId, content: reply });
 
-  if (opts.persistAssistantReply) {
-    await convex.mutation(api.messages.send, {
-      conversationId: opts.conversationId,
-      role: "assistant",
-      content: reply,
-      turnId,
-    });
-  }
-
-  // Background extraction — fire-and-forget; don't block the reply.
-  // Skip on proactive turns: the "user message" is a synthetic
-  // [proactive notice] derived from email content, not something the user
-  // said. Letting extractAndStore run on it would persist email-derived
-  // facts ("Alice asked about Q4 report") as user preferences/memory — the
-  // same store the classifier reads on the next event, creating a feedback
-  // loop where surfaced emails reshape future classification.
-  if (opts.kind !== "proactive") {
-    extractAndStore({
-      conversationId: opts.conversationId,
-      userMessage: opts.content,
-      assistantReply: reply,
-      turnId,
-      runtimeConfig,
-      imageStorageIds: inboundImageStorageIds,
-    }).catch((err) => console.error("[interaction] extraction error", err));
-  }
+  // Synthetic proactive notices skip durable capture, so email-derived
+  // content cannot become user memory.
+  await finalizeTurnMemory(reply);
 
   return reply;
 }

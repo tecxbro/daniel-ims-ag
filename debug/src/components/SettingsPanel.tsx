@@ -7,6 +7,8 @@ import {
   type RuntimeProvider,
 } from "../lib/branding.js";
 import { BrowserSection } from "./BrowserSection.js";
+import { SegmentedControl } from "./GlassPrimitives.js";
+import { PrimaryOwnerPairing } from "./PrimaryOwnerPairing.js";
 
 type RuntimeChoice = "claude" | "codex";
 type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -58,7 +60,7 @@ const SETTINGS: Setting[] = [
   },
 ];
 
-const RUNTIME_SETTING_COUNT = SETTINGS.length + 2;
+const RUNTIME_SETTING_COUNT = SETTINGS.length + 4;
 
 const RUNTIME_OPTIONS: Option<RuntimeChoice>[] = [
   { value: "claude", label: "Claude" },
@@ -142,39 +144,14 @@ async function updateRuntimeConfig(
 
 export function SettingsPanel({ isDark }: { isDark: boolean }) {
   return (
-    <div className="mx-auto max-w-[880px] space-y-5 pb-10">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
-        <div className="min-w-0">
-          <div
-            className={`text-[11px] font-medium uppercase tracking-[0.08em] ${
-              isDark ? "text-zinc-500" : "text-zinc-400"
-            }`}
-          >
-            Preferences
-          </div>
-          <h2
-            className={`mt-1 text-[22px] font-semibold tracking-normal ${
-              isDark ? "text-zinc-50" : "text-zinc-950"
-            }`}
-          >
-            Settings
-          </h2>
-          <p className={`mt-1 text-sm ${isDark ? "text-zinc-400" : "text-zinc-500"}`}>
-            Runtime, model, and local agent preferences.
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
+    <section className="mx-auto max-w-[880px] space-y-4 pb-10" aria-label="Dashboard settings">
+      <div className="flex items-center justify-end gap-2">
           <span
-            className={`rounded-2xl border px-2.5 py-1 text-xs mono ${
-              isDark
-                ? "border-white/10 bg-white/5 text-zinc-500"
-                : "border-zinc-200 bg-white text-zinc-500"
-            }`}
+            className="status-badge mono"
           >
             {RUNTIME_SETTING_COUNT} controls
           </span>
           <SettingsRuntimeBadge isDark={isDark} />
-        </div>
       </div>
 
       <div className="space-y-3">
@@ -186,10 +163,17 @@ export function SettingsPanel({ isDark }: { isDark: boolean }) {
             <TimezoneRow key={s.key} setting={s} isDark={isDark} />
           ),
         )}
+        <SettingShell
+          label="Primary memory owner"
+          description="Pair the one conversation allowed to use the local memory dashboard and receive proactive Gmail notices. Other senders can keep chatting without becoming the primary owner."
+          debugLine="memory.primary_owner = protected local state"
+          isDark={isDark}
+          control={<PrimaryOwnerPairing isDark={isDark} />}
+        />
         <BrowserSection isDark={isDark} />
         <DemoModeRow isDark={isDark} />
       </div>
-    </div>
+    </section>
   );
 }
 
@@ -293,7 +277,7 @@ function DemoModeRow({ isDark }: { isDark: boolean }) {
   return (
     <SettingShell
       label="Demo mode"
-      description="Seeds realistic namespaced records across agents, tool traces, memories, memory events, automations, conversations, consolidation, and usage so every dashboard screen has data to inspect."
+      description="Seeds realistic namespaced records across agents, tool traces, Supermemory provider state, synchronization jobs, automations, conversations, and usage so every dashboard screen has data to inspect."
       debugLine={debugLine}
       isDark={isDark}
       control={
@@ -377,9 +361,7 @@ function SettingShell({
   control: ReactNode;
   isDark: boolean;
 }) {
-  const cardBg = isDark
-    ? "bg-[#202024] border-white/10 shadow-black/20"
-    : "bg-white border-zinc-200 shadow-zinc-200/50";
+  const cardBg = "panel-card-motion";
   return (
     <div
       className={`rounded-2xl border p-4 shadow-sm fade-in ${cardBg}`}
@@ -511,13 +493,6 @@ function RuntimeRow({ isDark }: { isDark: boolean }) {
   const inputBg = isDark
     ? "bg-[#17171a] border-white/10 text-zinc-100"
     : "bg-zinc-50 border-zinc-200 text-zinc-900";
-  const segmentBase = isDark
-    ? "border-white/10 bg-[#17171a] text-zinc-400"
-    : "border-zinc-200 bg-zinc-100 text-zinc-500";
-  const segmentActive = isDark
-    ? "bg-zinc-100 text-zinc-950 shadow-sm"
-    : "bg-white text-zinc-950 shadow-sm";
-
   return (
     <SettingShell
       label="AI provider"
@@ -526,32 +501,22 @@ function RuntimeRow({ isDark }: { isDark: boolean }) {
       isDark={isDark}
       control={
         <div className="flex w-full min-w-0 flex-col items-end gap-3 lg:min-w-[360px]">
-          <div
-            className={`segmented-control grid w-full grid-cols-2 rounded-2xl border p-1 ${segmentBase}`}
-            role="group"
-            aria-label="AI provider"
-          >
-            {RUNTIME_OPTIONS.map((option) => {
-              const active = runtime === option.value;
-              return (
-                <button
-                  key={option.value}
-                  onClick={() =>
-                    savePatch(`runtime:${option.value}`, { runtime: option.value })
-                  }
-                  disabled={runtimeLoading || saving !== null || active}
-                  className={`segmented-button inline-flex items-center justify-center gap-1.5 rounded-xl px-3 py-2 text-xs font-medium disabled:opacity-60 ${
-                    active ? segmentActive : isDark ? "hover:bg-white/5" : "hover:bg-white/70"
-                  }`}
-                >
-                  <span aria-hidden="true">
-                    <RuntimeProviderLogo runtime={option.value} size={14} />
-                  </span>
-                  {option.label}
-                </button>
-              );
-            })}
-          </div>
+          <SegmentedControl
+            lensId="settings-runtime"
+            label="AI provider"
+            role="radiogroup"
+            value={runtime}
+            disabled={runtimeLoading || saving !== null}
+            fill
+            className="settings-runtime-segments w-full"
+            onChange={(nextRuntime) =>
+              savePatch(`runtime:${nextRuntime}`, { runtime: nextRuntime })
+            }
+            options={RUNTIME_OPTIONS.map((option) => ({
+              ...option,
+              icon: <RuntimeProviderLogo runtime={option.value} size={14} />,
+            }))}
+          />
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 w-full">
             <label className="flex flex-col gap-1">

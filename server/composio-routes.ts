@@ -16,8 +16,23 @@ import { refreshIntegrations } from "./integrations/registry.js";
 import { getStoredWebhookSecret } from "./composio-webhook.js";
 import { handleEmailEvent } from "./proactive-email.js";
 
-export function createComposioRouter(): express.Router {
+export interface CreateComposioRouterOptions {
+  /** Restricts the interactive integration-management routes without blocking the signed webhook. */
+  requireControlAccess?: express.RequestHandler;
+}
+
+export function createComposioRouter(
+  options: CreateComposioRouterOptions = {},
+): express.Router {
   const router = express.Router();
+
+  router.use((req, res, next) => {
+    if (req.path === "/webhook" || !options.requireControlAccess) {
+      next();
+      return;
+    }
+    options.requireControlAccess(req, res, next);
+  });
 
   router.get("/status", (_req, res) => {
     res.json({ enabled: Boolean(getComposio()) });

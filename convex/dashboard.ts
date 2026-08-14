@@ -1,30 +1,250 @@
-import { query } from "./_generated/server";
+import type { Doc } from "./_generated/dataModel";
+import { query, type QueryCtx } from "./_generated/server";
 
-// Cap per-table scans so a long-lived install doesn't hit Convex's 16,384
-// .collect() ceiling and break the dashboard. Metrics reflect the most
-// recent N rows per table; `truncated` surfaces when we've hit the cap.
-const METRICS_SCAN_LIMIT = 5000;
+// Dashboard reads are deliberately bounded. A `truncated` result means the UI
+// is showing an operational snapshot, not pretending to be an exact all-time
+// analytics warehouse.
+// Keep the worst-case aggregate below Convex's per-transaction document-read
+// ceiling even when every source reaches its cap. These remain snapshots;
+// exact lifetime analytics belong in denormalized counters, not this query.
+const METRICS_SCAN_LIMIT = 1_000;
+const OPERATIONAL_COUNT_LIMIT = 500;
+const RECENT_JOBS_PER_STATUS = 6;
+const RECENT_JOBS_LIMIT = 12;
+const DEMO_SETTING_KEY = "debug_demo_mode";
+const DEPLOYMENT_STATE_KEY = "deployment";
+const DEMO_DEPLOYMENT_STATE_KEY = "demo:deployment";
+
+const syncStatuses = [
+  "pending",
+  "processing",
+  "submitted",
+  "completed",
+  "failed",
+  "dead_letter",
+] as const;
+
+const imageAnchorStatuses = ["pending", "active", "released"] as const;
+
+type SyncStatus = (typeof syncStatuses)[number];
+type ImageAnchorStatus = (typeof imageAnchorStatuses)[number];
+
+type BoundedCount = {
+  count: number;
+  truncated: boolean;
+};
+
+function boundedCount(rows: unknown[]): BoundedCount {
+  return {
+    count: Math.min(rows.length, OPERATIONAL_COUNT_LIMIT),
+    truncated: rows.length > OPERATIONAL_COUNT_LIMIT,
+  };
+}
+
+async function readSyncSnapshot(ctx: QueryCtx) {
+  const entries = await Promise.all(
+    syncStatuses.map(async (status) => {
+      const [countRows, recentRows] = await Promise.all([
+        ctx.db
+          .query("memorySyncJobs")
+          .withIndex("by_status_next_attempt", (q) => q.eq("status", status))
+          .take(OPERATIONAL_COUNT_LIMIT + 1),
+        ctx.db
+          .query("memorySyncJobs")
+          .withIndex("by_status_next_attempt", (q) => q.eq("status", status))
+          .order("desc")
+          .take(RECENT_JOBS_PER_STATUS),
+      ]);
+      return [status, boundedCount(countRows), recentRows] as const;
+    }),
+  );
+
+  const counts = Object.fromEntries(
+    entries.map(([status, count]) => [status, count]),
+  ) as Record<SyncStatus, BoundedCount>;
+  const recentJobs = entries
+    .flatMap(([, , rows]) => rows)
+    .sort((a, b) => b.updatedAt - a.updatedAt)
+    .slice(0, RECENT_JOBS_LIMIT)
+    .map((job) => ({
+      jobId: job.jobId,
+      kind: job.kind,
+      status: job.status,
+      attempts: job.attempts,
+      nextAttemptAt: job.nextAttemptAt,
+      lastError: job.lastError,
+      providerDocumentId: job.providerDocumentId,
+      providerMemoryIds: job.providerMemoryIds ?? [],
+      createdAt: job.createdAt,
+      updatedAt: job.updatedAt,
+    }));
+
+  const pending = counts.pending.count;
+  const processing = counts.processing.count;
+  const submitted = counts.submitted.count;
+  const completed = counts.completed.count;
+  const failed = counts.failed.count;
+  const deadLetter = counts.dead_letter.count;
+  const terminalOrFailed = completed + failed + deadLetter;
+
+  return {
+    value: {
+      pending,
+      processing,
+      submitted,
+      completed,
+      failed,
+      deadLetter,
+      active: pending + processing + submitted + failed,
+      total: pending + processing + submitted + completed + failed + deadLetter,
+      captureCompletionRate:
+        terminalOrFailed === 0 ? null : completed / terminalOrFailed,
+      recentJobs,
+    },
+    truncated: Object.values(counts).some((count) => count.truncated),
+  };
+}
+
+async function readImageAnchorSnapshot(ctx: QueryCtx) {
+  const entries = await Promise.all(
+    imageAnchorStatuses.map(async (status) => {
+      const rows = await ctx.db
+        .query("memoryImageAnchors")
+        .withIndex("by_status", (q) => q.eq("status", status))
+        .take(OPERATIONAL_COUNT_LIMIT + 1);
+      return [status, boundedCount(rows)] as const;
+    }),
+  );
+  const counts = Object.fromEntries(entries) as Record<
+    ImageAnchorStatus,
+    BoundedCount
+  >;
+  const pending = counts.pending.count;
+  const active = counts.active.count;
+  const released = counts.released.count;
+
+  return {
+    value: { pending, active, released, total: pending + active + released },
+    truncated: Object.values(counts).some((count) => count.truncated),
+  };
+}
+
+function providerSnapshot(state: Doc<"memoryProviderState"> | null) {
+  const healthStatus =
+    state?.healthStatus === "healthy" ||
+    state?.healthStatus === "degraded" ||
+    state?.healthStatus === "unavailable" ||
+    state?.healthStatus === "recovery_required"
+      ? state.healthStatus
+      : "unconfigured";
+  return {
+    configured:
+      healthStatus !== "unconfigured" && healthStatus !== "recovery_required",
+    healthStatus,
+    lastSuccessfulSubmissionAt: state?.lastSuccessfulSubmissionAt,
+    lastFailedSubmissionAt: state?.lastFailedSubmissionAt,
+    lastWorkerActivityAt: state?.lastWorkerActivityAt,
+    hasError: Boolean(state?.lastError),
+  };
+}
+
+function hydrationSnapshot(buckets: Doc<"memoryProviderMetrics">[]) {
+  const requests = buckets.reduce(
+    (sum, bucket) => sum + bucket.requestCount,
+    0,
+  );
+  const failures = buckets.reduce(
+    (sum, bucket) => sum + bucket.failureCount,
+    0,
+  );
+  const totalLatencyMs = buckets.reduce(
+    (sum, bucket) => sum + bucket.totalLatencyMs,
+    0,
+  );
+  const histogram = Array<number>(6).fill(0);
+  for (const bucket of buckets) {
+    bucket.latencyBuckets.forEach((count, index) => {
+      histogram[index] = (histogram[index] ?? 0) + count;
+    });
+  }
+  const observedLatencies = histogram.reduce((sum, count) => sum + count, 0);
+  const percentileTarget = Math.ceil(observedLatencies * 0.95);
+  const bounds = [100, 250, 500, 1_000, 2_500, null] as const;
+  let cumulative = 0;
+  let p95UpperBoundMs: number | null = null;
+  for (let index = 0; index < histogram.length; index += 1) {
+    cumulative += histogram[index] ?? 0;
+    if (cumulative >= percentileTarget && percentileTarget > 0) {
+      p95UpperBoundMs = bounds[index] ?? null;
+      break;
+    }
+  }
+  return {
+    requests,
+    failures,
+    averageLatencyMs: requests === 0 ? null : totalLatencyMs / requests,
+    p95UpperBoundMs,
+    observedBuckets: buckets.length,
+  };
+}
 
 export const metrics = query({
   args: {},
   handler: async (ctx) => {
-    const [messages, memories, agents, automationRuns, usageRecords] = await Promise.all([
-      ctx.db.query("messages").order("desc").take(METRICS_SCAN_LIMIT),
-      ctx.db.query("memoryRecords").order("desc").take(METRICS_SCAN_LIMIT),
+    const demoSetting = await ctx.db
+      .query("settings")
+      .withIndex("by_key", (q) => q.eq("key", DEMO_SETTING_KEY))
+      .unique();
+    const providerStateKey =
+      demoSetting?.value === "true"
+        ? DEMO_DEPLOYMENT_STATE_KEY
+        : DEPLOYMENT_STATE_KEY;
+
+    const [
+      messages,
+      agents,
+      automationRuns,
+      usageRecords,
+      providerState,
+      sync,
+      imageAnchors,
+      providerMetricBuckets,
+      providerEvents,
+    ] = await Promise.all([
+      ctx.db
+        .query("messages")
+        .withIndex("by_createdAt")
+        .order("desc")
+        .take(METRICS_SCAN_LIMIT),
       ctx.db.query("executionAgents").order("desc").take(METRICS_SCAN_LIMIT),
       ctx.db.query("automationRuns").order("desc").take(METRICS_SCAN_LIMIT),
       ctx.db.query("usageRecords").order("desc").take(METRICS_SCAN_LIMIT),
+      ctx.db
+        .query("memoryProviderState")
+        .withIndex("by_state_key", (q) => q.eq("stateKey", providerStateKey))
+        .unique(),
+      readSyncSnapshot(ctx),
+      readImageAnchorSnapshot(ctx),
+      ctx.db
+        .query("memoryProviderMetrics")
+        .withIndex("by_bucket_start")
+        .order("desc")
+        .take(168),
+      ctx.db
+        .query("memoryProviderEvents")
+        .withIndex("by_created_at")
+        .order("desc")
+        .take(50),
     ]);
+
     const truncated =
       messages.length === METRICS_SCAN_LIMIT ||
-      memories.length === METRICS_SCAN_LIMIT ||
       agents.length === METRICS_SCAN_LIMIT ||
       automationRuns.length === METRICS_SCAN_LIMIT ||
-      usageRecords.length === METRICS_SCAN_LIMIT;
+      usageRecords.length === METRICS_SCAN_LIMIT ||
+      sync.truncated ||
+      imageAnchors.truncated;
 
-    const activeMem = memories.filter((m) => m.lifecycle === "active");
-
-    // Build daily buckets across all time so the chart has something to draw.
     const buckets = new Map<
       string,
       {
@@ -40,13 +260,14 @@ export const metrics = query({
       }
     >();
 
-    function keyFor(ts: number) {
-      return new Date(ts).toISOString().slice(0, 10);
+    function keyFor(timestamp: number) {
+      return new Date(timestamp).toISOString().slice(0, 10);
     }
+
     function bucketFor(day: string) {
-      let b = buckets.get(day);
-      if (!b) {
-        b = {
+      let bucket = buckets.get(day);
+      if (!bucket) {
+        bucket = {
           day,
           agentCost: 0,
           inputTokens: 0,
@@ -57,63 +278,78 @@ export const metrics = query({
           agentsCancelled: 0,
           automationRuns: 0,
         };
-        buckets.set(day, b);
+        buckets.set(day, bucket);
       }
-      return b;
+      return bucket;
     }
 
     const usageAgentIds = new Set<string>();
-
-    for (const r of usageRecords) {
-      const b = bucketFor(keyFor(r.createdAt));
-      b.agentCost += r.costUsd ?? 0;
-      b.inputTokens += r.inputTokens ?? 0;
-      b.outputTokens += r.outputTokens ?? 0;
-      if (r.agentId) usageAgentIds.add(r.agentId);
+    for (const record of usageRecords) {
+      const bucket = bucketFor(keyFor(record.createdAt));
+      bucket.agentCost += record.costUsd ?? 0;
+      bucket.inputTokens += record.inputTokens ?? 0;
+      bucket.outputTokens += record.outputTokens ?? 0;
+      if (record.agentId) usageAgentIds.add(record.agentId);
     }
 
-    for (const a of agents) {
-      const b = bucketFor(keyFor(a.startedAt));
-      b.agentsSpawned += 1;
-      if (!usageAgentIds.has(a.agentId)) {
-        b.agentCost += a.costUsd ?? 0;
-        b.inputTokens += a.inputTokens ?? 0;
-        b.outputTokens += a.outputTokens ?? 0;
+    for (const agent of agents) {
+      const bucket = bucketFor(keyFor(agent.startedAt));
+      bucket.agentsSpawned += 1;
+      if (!usageAgentIds.has(agent.agentId)) {
+        bucket.agentCost += agent.costUsd ?? 0;
+        bucket.inputTokens += agent.inputTokens ?? 0;
+        bucket.outputTokens += agent.outputTokens ?? 0;
       }
-      if (a.status === "completed") b.agentsCompleted += 1;
-      else if (a.status === "failed") b.agentsFailed += 1;
-      else if (a.status === "cancelled") b.agentsCancelled += 1;
-    }
-    for (const r of automationRuns) {
-      const b = bucketFor(keyFor(r.startedAt));
-      b.automationRuns += 1;
+      if (agent.status === "completed") bucket.agentsCompleted += 1;
+      else if (agent.status === "failed") bucket.agentsFailed += 1;
+      else if (agent.status === "cancelled") bucket.agentsCancelled += 1;
     }
 
-    const dailyBuckets = [...buckets.values()].sort((a, b) => a.day.localeCompare(b.day));
+    for (const run of automationRuns) {
+      bucketFor(keyFor(run.startedAt)).automationRuns += 1;
+    }
+
+    const dailyBuckets = [...buckets.values()].sort((a, b) =>
+      a.day.localeCompare(b.day),
+    );
 
     return {
       messages: messages.length,
-      memories: {
-        total: activeMem.length,
-        shortTerm: activeMem.filter((m) => m.tier === "short").length,
-        longTerm: activeMem.filter((m) => m.tier === "long").length,
-        permanent: activeMem.filter((m) => m.tier === "permanent").length,
-      },
+      memoryProvider: providerSnapshot(providerState),
+      hydration: hydrationSnapshot(providerMetricBuckets),
+      providerEvents: providerEvents.map((event) => ({
+        eventId: event.eventId,
+        operation: event.operation,
+        outcome: event.outcome,
+        latencyMs: event.latencyMs,
+        errorCode: event.errorCode,
+        createdAt: event.createdAt,
+      })),
+      sync: sync.value,
+      imageAnchors: imageAnchors.value,
       agents: {
         total: agents.length,
-        completed: agents.filter((a) => a.status === "completed").length,
-        failed: agents.filter((a) => a.status === "failed").length,
-        cancelled: agents.filter((a) => a.status === "cancelled").length,
+        completed: agents.filter((agent) => agent.status === "completed")
+          .length,
+        failed: agents.filter((agent) => agent.status === "failed").length,
+        cancelled: agents.filter((agent) => agent.status === "cancelled")
+          .length,
         running: agents.filter(
-          (a) => a.status === "running" || a.status === "spawned",
+          (agent) => agent.status === "running" || agent.status === "spawned",
         ).length,
       },
       cost: {
-        total: dailyBuckets.reduce((s, b) => s + b.agentCost, 0),
+        total: dailyBuckets.reduce((sum, bucket) => sum + bucket.agentCost, 0),
       },
       tokens: {
-        input: dailyBuckets.reduce((s, b) => s + b.inputTokens, 0),
-        output: dailyBuckets.reduce((s, b) => s + b.outputTokens, 0),
+        input: dailyBuckets.reduce(
+          (sum, bucket) => sum + bucket.inputTokens,
+          0,
+        ),
+        output: dailyBuckets.reduce(
+          (sum, bucket) => sum + bucket.outputTokens,
+          0,
+        ),
       },
       dailyBuckets,
       truncated,
@@ -122,24 +358,15 @@ export const metrics = query({
   },
 });
 
+/** Compatibility query now reports durable SuperMemory anchors, not message arrays. */
 export const imageStorageStats = query({
   args: {},
   handler: async (ctx) => {
-    // Capped scan like the other dashboard queries — unbounded .collect()
-    // throws TransactionTooLargeError when the bandwidth limit is exceeded.
-    const msgs = await ctx.db
-      .query("messages")
-      .order("desc")
-      .take(METRICS_SCAN_LIMIT);
-    const seen = new Set<string>();
-    let count = 0;
-    for (const m of msgs) {
-      for (const id of m.imageStorageIds ?? []) {
-        if (seen.has(id as unknown as string)) continue;
-        seen.add(id as unknown as string);
-        count++;
-      }
-    }
-    return { count, truncated: msgs.length === METRICS_SCAN_LIMIT };
+    const snapshot = await readImageAnchorSnapshot(ctx);
+    return {
+      count: snapshot.value.pending + snapshot.value.active,
+      ...snapshot.value,
+      truncated: snapshot.truncated,
+    };
   },
 });

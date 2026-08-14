@@ -1,119 +1,215 @@
 import { z } from "zod";
-import { api } from "../../convex/_generated/api.js";
-import { convex } from "../convex-client.js";
-import { embed, embeddingsAvailable } from "../embeddings.js";
-import { createClaudeMcpServer } from "../runtimes/claude.js";
 import { defineRuntimeTool } from "../runtimes/tool.js";
-import { runtimeText, type RuntimeTool } from "../runtimes/types.js";
-import { DEFAULT_DECAY, SEGMENT_PREFERRED_TIER, makeMemoryId } from "./types.js";
+import { runtimeText, type RuntimeTool, type RuntimeToolResult } from "../runtimes/types.js";
+import { SupermemoryService } from "./supermemory/service.js";
 
 const NAMESPACE = "daniel-memory";
-
-const tierEnum = z.enum(["short", "long", "permanent"]);
-const segmentEnum = z.enum([
-  "identity",
-  "preference",
-  "relationship",
-  "project",
-  "knowledge",
-  "context",
+const DEFAULT_TOOL_SEARCH_LIMIT = 8;
+const staticKindEnum = z.enum([
+  "preferred_name",
+  "core_identity",
+  "long_term_role",
+  "home_timezone",
 ]);
 
-export function createMemoryTools(conversationId: string): RuntimeTool[] {
+export interface CreateMemoryToolsOptions {
+  service: SupermemoryService;
+  /** Exact current-turn images the dispatcher may make durable. */
+  imageStorageIds?: readonly string[];
+}
+
+function providerFailure(action: string, error?: unknown): RuntimeToolResult {
+  const errorCode =
+    error && typeof error === "object" && "code" in error
+      ? String((error as { code?: unknown }).code ?? "provider")
+      : "provider";
+  console.warn(`[memory.tools] ${action} failed`, { errorCode });
+  return runtimeText(
+    `The memory provider could not ${action}. Continue the conversation without claiming the memory changed.`,
+    false,
+  );
+}
+
+export function createMemoryTools(options: CreateMemoryToolsOptions): RuntimeTool[] {
+  const eligibleImageStorageIds = new Set(options.imageStorageIds ?? []);
+  const eligibleImageDescription =
+    eligibleImageStorageIds.size > 0
+      ? [...eligibleImageStorageIds].join(", ")
+      : "(no current-turn images)";
+
   return [
     defineRuntimeTool(
       NAMESPACE,
-      "write_memory",
-      "Persist a fact about the user or conversation that you want available in future turns. Prefer aggressive writing — memory is cheap, forgetting is expensive. Only use for durable facts (preferences, identity, projects, relationships), NOT for transient conversational state.",
+      "remember_memory",
+      "Persist one exact durable fact in Supermemory for future turns. Use for durable identity, preferences, projects, relationships, or knowledge, not transient conversation state.",
       {
-        content: z.string().describe("The fact to remember, in one clear sentence."),
-        segment: segmentEnum.describe(
-          "identity: core facts about who they are. preference: how they like things done. relationship: people they know. project: ongoing work. knowledge: facts about their world. context: current situation.",
-        ),
-        importance: z.number().min(0).max(1).describe("0-1; how critical to retain."),
-        tier: tierEnum.optional().describe("Override; defaults by segment."),
-        supersedes: z
-          .array(z.string())
+        content: z
+          .string()
+          .min(1)
+          .max(10_000)
+          .describe("The exact fact to remember, in one clear sentence."),
+        staticKind: staticKindEnum
           .optional()
-          .describe("memoryId(s) this replaces (will be archived)."),
+          .describe(
+            "Only for an explicitly durable preferred name, identity, long-term role, or home timezone.",
+          ),
       },
       async (args) => {
-        const tier = args.tier ?? SEGMENT_PREFERRED_TIER[args.segment];
-        const memoryId = makeMemoryId();
-        const embedding = (await embed(args.content)) ?? undefined;
-        await convex.mutation(api.memoryRecords.upsert, {
-          memoryId,
-          content: args.content,
-          tier,
-          segment: args.segment,
-          importance: args.importance,
-          decayRate: DEFAULT_DECAY[tier],
-          supersedes: args.supersedes,
-          embedding,
-        });
-        await convex.mutation(api.memoryEvents.emit, {
-          eventType: "memory.written",
-          conversationId,
-          memoryId,
-          data: JSON.stringify({ tier, segment: args.segment, importance: args.importance }),
-        });
-        return runtimeText(`Stored ${memoryId} (tier=${tier}, segment=${args.segment}).`);
+        try {
+          const result = await options.service.rememberExact(args);
+          const ids = result.memories.map((memory) => memory.id).join(", ");
+          return runtimeText(`Remembered exact Supermemory ${ids || "memory"}.`);
+        } catch (error) {
+          return providerFailure("remember that fact", error);
+        }
       },
     ),
-
     defineRuntimeTool(
       NAMESPACE,
       "recall",
-      "Search your memories for anything relevant to the current turn. Call this early in any conversation that touches the user's preferences, projects, or past decisions.",
+      "Run an optional narrow Supermemory query. Context is already preloaded; use this only for a specific follow-up search.",
       {
-        query: z.string().describe("Keywords or topic to search for."),
-        limit: z.number().optional().default(10),
+        query: z.string().min(1).describe("A specific topic or fact to search for."),
+        limit: z.number().int().min(1).max(20).optional().default(DEFAULT_TOOL_SEARCH_LIMIT),
       },
       async (args) => {
-        let results: any[] = [];
-        let mode: "vector" | "substring" = "substring";
-
-        if (embeddingsAvailable()) {
-          const queryVec = await embed(args.query);
-          if (queryVec) {
-            const hits = await convex.action(api.memoryRecords.vectorSearch, {
-              embedding: queryVec,
+        const result = await options.service.recall(args.query);
+        if (result.status === "failed") return providerFailure("recall memory", result.error);
+        if (result.results.length === 0) return runtimeText("No memories matched.");
+        return runtimeText(
+          result.results
+            .slice(0, args.limit)
+            .map(
+              (memory) =>
+                `• [relevance=${memory.similarity.toFixed(2)}] ${memory.id}: ${memory.content}`,
+            )
+            .join("\n"),
+        );
+      },
+    ),
+    defineRuntimeTool(
+      NAMESPACE,
+      "update_memory",
+      "Search for candidate Supermemory entries or update one selected exact memory ID as a new version.",
+      {
+        query: z.string().min(1).optional().describe("Search text used only to list candidates."),
+        memoryId: z.string().min(1).optional().describe("The exact memory ID selected for update."),
+        newContent: z.string().min(1).max(10_000).optional().describe("The corrected complete memory content."),
+        limit: z.number().int().min(1).max(8).optional().default(DEFAULT_TOOL_SEARCH_LIMIT),
+      },
+      async (args) => {
+        try {
+          if (!args.memoryId) {
+            if (!args.query || args.newContent) {
+              return runtimeText(
+                "Provide only query to list candidates, then call update_memory with memoryId and newContent.",
+                false,
+              );
+            }
+            const candidates = await options.service.searchUpdateCandidates({
+              query: args.query,
               limit: args.limit,
             });
-            results = hits.map((h) => h.record);
-            mode = "vector";
+            if (candidates.length === 0) return runtimeText("No update candidates matched.");
+            return runtimeText(
+              candidates
+                .map(
+                  (candidate) =>
+                    `• [relevance=${candidate.similarity.toFixed(2)}] ${candidate.id}: ${candidate.content}`,
+                )
+                .join("\n"),
+            );
           }
-        }
-        if (results.length === 0) {
-          results = await convex.query(api.memoryRecords.search, {
-            query: args.query,
-            limit: args.limit,
+          if (!args.newContent || args.query) {
+            return runtimeText(
+              "An exact update requires memoryId and newContent, without a semantic query.",
+              false,
+            );
+          }
+          const result = await options.service.updateExact({
+            memoryId: args.memoryId,
+            newContent: args.newContent,
           });
+          return runtimeText(result.confirmation);
+        } catch (error) {
+          return providerFailure("update memory", error);
         }
-
-        for (const r of results) {
-          await convex.mutation(api.memoryRecords.markAccessed, { memoryId: r.memoryId });
+      },
+    ),
+    defineRuntimeTool(
+      NAMESPACE,
+      "forget_memory",
+      "Preview matching memories, then forget only the exact IDs stored in that preview after user confirmation.",
+      {
+        query: z.string().min(1).optional().describe("Stage 1 semantic forget request."),
+        operationId: z.string().min(1).optional().describe("Stage 2 pending operation ID."),
+        confirm: z.boolean().optional().default(false).describe("True only after explicit confirmation."),
+        reason: z.string().max(1_000).optional(),
+        maxForget: z.number().int().min(1).max(100).optional().default(25),
+      },
+      async (args) => {
+        try {
+          if (args.confirm) {
+            if (!args.operationId || args.query) {
+              return runtimeText(
+                "Confirmation requires only the stored operationId; the semantic query must not be rerun.",
+                false,
+              );
+            }
+            const result = await options.service.confirmForget({
+              operationId: args.operationId,
+              reason: args.reason,
+            });
+            return runtimeText(result.confirmation);
+          }
+          if (!args.query || args.operationId) {
+            return runtimeText(
+              "Start with query to create a forget preview, or confirm a prior operationId.",
+              false,
+            );
+          }
+          const result = await options.service.previewForget({
+            query: args.query,
+            reason: args.reason,
+            maxForget: args.maxForget,
+          });
+          if (!result.operationId) return runtimeText(result.preview);
+          return runtimeText(
+            `${result.preview}\n\nPending operation: ${result.operationId}\nExpires: ${
+              result.expiresAt ? new Date(result.expiresAt).toISOString() : "unavailable"
+            }`,
+          );
+        } catch (error) {
+          return providerFailure("forget memory", error);
         }
-        await convex.mutation(api.memoryEvents.emit, {
-          eventType: "memory.recalled",
-          conversationId,
-          data: JSON.stringify({ query: args.query, hits: results.length, mode }),
-        });
-        if (results.length === 0) {
-          return runtimeText("No memories matched.");
+      },
+    ),
+    defineRuntimeTool(
+      NAMESPACE,
+      "remember_image",
+      "Make one explicitly selected current-turn image durable in Supermemory.",
+      {
+        storageId: z
+          .string()
+          .min(1)
+          .describe(`Exact current-turn image storage ID. Available: ${eligibleImageDescription}`),
+      },
+      async (args) => {
+        if (!eligibleImageStorageIds.has(args.storageId)) {
+          return runtimeText(
+            "That image is not attached to the current user turn, so it cannot be made durable.",
+            false,
+          );
         }
-        const body = results
-          .map(
-            (r) =>
-              `• [${r.tier}/${r.segment} importance=${r.importance.toFixed(2)}] ${r.memoryId}: ${r.content}`,
-          )
-          .join("\n");
-        return runtimeText(body);
+        try {
+          const result = await options.service.rememberImage({ storageId: args.storageId });
+          return runtimeText(
+            `Remembered durable image ${result.anchor.customId} (provider document ${result.providerDocumentId}).`,
+          );
+        } catch (error) {
+          return providerFailure("remember the image", error);
+        }
       },
     ),
   ];
-}
-
-export function createMemoryMcp(conversationId: string) {
-  return createClaudeMcpServer(NAMESPACE, createMemoryTools(conversationId));
 }

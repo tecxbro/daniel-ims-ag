@@ -7,10 +7,53 @@ Daniel is a small personal-agent template. The codebase stays tight because that
 - Bug fixes
 - Security fixes
 - Simplifications (less code doing the same thing)
-- Clear improvements to core behavior — memory decay tuning, consolidation robustness, dispatcher policy, cost tracking, etc.
+- Clear improvements to core behavior — memory hydration, durable capture,
+  synchronization reliability, dispatcher policy, cost tracking, etc.
 - New channels, integrations, or runtime skills if they fit the template spirit (small, opinionated, well-scoped)
 
 Keep the diff focused — one concern per PR. A feature PR and a refactor PR should be two PRs.
+
+## Memory architecture guardrails
+
+Convex stores application state and synchronization state. SuperMemory stores
+and retrieves long-term semantic memory.
+
+Memory changes must preserve these boundaries:
+
+- Keep the raw transcript, recent prompt history, durable outbox, pending
+  operations, image anchors, provider health, metrics, and events in Convex.
+- Use one SuperMemory container per memory owner across conversations. Keep
+  `memoryOwnerId` separate from `conversationId`, and derive provider
+  identifiers with the stable HMAC salt; never send a raw phone number as a
+  container tag or custom ID.
+- Hydrate the profile and query-relevant context before dispatcher execution,
+  but fail open when the provider is unavailable.
+- Capture completed normal turns as `delta_turn_v1` jobs in `memorySyncJobs`.
+  `conversation_turn` is the only accepted outbox kind. Do not replace the
+  stable conversation document with an ever-growing transcript or bypass the
+  durable outbox.
+- Put every SuperMemory SDK or direct HTTP call behind the server-only adapter
+  in `server/memory/supermemory/`. UI, routes, tools, and unrelated server code
+  use the adapter or normalized server APIs; the browser must never receive
+  `SUPERMEMORY_API_KEY`.
+- Keep explicit remember, update, forget, and image operations synchronous.
+  Use exact creation for `remember_memory`, provider versions for corrections,
+  and the two-stage forget flow. Forget confirmation must apply the exact IDs
+  saved during preview and must not rerun the semantic query.
+- Upload images only when the durable-image policy allows it. Pending and
+  active `memoryImageAnchors` retain Convex bytes; release an anchor only after
+  provider deletion is confirmed.
+- Treat missing provider credentials as `unconfigured`: persist and reply
+  normally, make no provider request, and create no memory job. Provider
+  outages must fail open for reads and preserve configured captures for retry.
+- Treat a missing or changed identity salt after identity state exists as
+  `recovery_required`. Never create a replacement identity silently.
+- Keep primary-owner pairing local-only, explicit, and non-replacing. The
+  browser must receive only masked candidate labels and opaque tokens, never
+  raw owner, container, conversation, fingerprint, salt, or authority values.
+- Do not infer the dashboard or proactive-notice owner from the first inbound
+  sender or an environment phone number. Owner-scoped features remain
+  unavailable until code pairing or local candidate confirmation succeeds.
 
 ## Bug-fix PRs
 

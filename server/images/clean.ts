@@ -29,63 +29,93 @@ export function getImageRetentionDays(): number {
 // Hard cap on how many expired rows we scan in one cleanup invocation.
 // If more pages are available, the next interval resumes from a fresh scan.
 const MAX_SCAN_PAGES = 50;
-const MEMORY_REF_PAGE_SIZE = 50;
+const ANCHOR_LOOKUP_BATCH_SIZE = 200;
 
 async function findAnchoredStorageIds(storageIds: string[]): Promise<Set<string>> {
   const wanted = [...new Set(storageIds)];
   const found = new Set<string>();
   if (wanted.length === 0) return found;
-
-  let cursor: string | null = null;
-  for (;;) {
-    // TODO(codegen): drop cast once schema push regenerates Convex API.
-    const result = (await convex.query(api.memoryRecords.findImageRefsPage, {
-      storageIds: wanted as never,
-      cursor,
-      pageSize: MEMORY_REF_PAGE_SIZE,
-    } as never)) as {
-      foundStorageIds: string[];
-      isDone: boolean;
-      continueCursor: string | null;
-    };
-    for (const id of result.foundStorageIds) found.add(id);
-    if (found.size === wanted.length || result.isDone) break;
-    if (result.continueCursor === cursor) {
-      console.warn("[image-cleanup] memory ref cursor did not advance; keeping unresolved refs");
-      break;
-    }
-    cursor = result.continueCursor;
+  for (let offset = 0; offset < wanted.length; offset += ANCHOR_LOOKUP_BATCH_SIZE) {
+    const batch = wanted.slice(offset, offset + ANCHOR_LOOKUP_BATCH_SIZE);
+    const result = (await convex.query(api.memoryImageAnchors.findRetainedStorageIds, {
+      storageIds: batch as never,
+    })) as string[];
+    for (const id of result) found.add(id);
   }
   return found;
 }
 
-export async function runImageCleanup(): Promise<{ deleted: number; kept: number }> {
-  const retention = getImageRetentionDays();
-  if (retention === 0) return { deleted: 0, kept: 0 };
+export interface ImageCleanupDependencies {
+  now: () => number;
+  retentionDays: () => number;
+  listExpired(input: {
+    olderThanMs: number;
+    cursor: string | null;
+    scanLimit: number;
+  }): Promise<{
+    rows: Array<{ _id: string; imageStorageIds?: string[] }>;
+    isDone: boolean;
+    continueCursor: string | null;
+  }>;
+  findRetainedStorageIds(storageIds: string[]): Promise<Set<string>>;
+  clearMessageImage(messageId: string, storageId: string): Promise<void>;
+  deleteStorageIfUnretained(storageId: string): Promise<{ deleted: boolean; reason?: string }>;
+}
 
-  const olderThanMs = Date.now() - retention * 24 * 60 * 60 * 1000;
-  let deleted = 0;
-  let kept = 0;
-  let cursor: string | null = null;
-
-  for (let page = 0; page < MAX_SCAN_PAGES; page++) {
-    // TODO(codegen): drop cast once schema push regenerates Convex API.
-    const result = (await convex.query(api.messages.expiredWithImages, {
-      olderThanMs,
-      cursor,
-      scanLimit: 200,
+const defaultCleanupDependencies: ImageCleanupDependencies = {
+  now: Date.now,
+  retentionDays: getImageRetentionDays,
+  async listExpired(input) {
+    return (await convex.query(api.messages.expiredWithImages, {
+      olderThanMs: input.olderThanMs,
+      cursor: input.cursor,
+      scanLimit: input.scanLimit,
     } as never)) as {
       rows: Array<{ _id: string; imageStorageIds?: string[] }>;
       isDone: boolean;
       continueCursor: string | null;
     };
+  },
+  findRetainedStorageIds: findAnchoredStorageIds,
+  async clearMessageImage(messageId, storageId) {
+    await convex.mutation(api.messages.clearMessageImage, {
+      messageId: messageId as never,
+      storageId: storageId as never,
+    });
+  },
+  async deleteStorageIfUnretained(storageId) {
+    return (await convex.mutation(api.memoryImageAnchors.deleteStorageIfUnretained, {
+      storageId: storageId as never,
+    })) as { deleted: boolean; reason?: string };
+  },
+};
+
+export async function runImageCleanupWithDependencies(
+  dependencies: ImageCleanupDependencies,
+): Promise<{ deleted: number; kept: number }> {
+  const retention = dependencies.retentionDays();
+  if (retention === 0) return { deleted: 0, kept: 0 };
+
+  const olderThanMs = dependencies.now() - retention * 24 * 60 * 60 * 1000;
+  let deleted = 0;
+  let kept = 0;
+  let cursor: string | null = null;
+
+  for (let page = 0; page < MAX_SCAN_PAGES; page++) {
+    const result = await dependencies.listExpired({
+      olderThanMs,
+      cursor,
+      scanLimit: 200,
+    });
 
     const pairs = result.rows.flatMap((msg) =>
       (msg.imageStorageIds ?? []).map((storageId) => ({ messageId: msg._id, storageId })),
     );
     let anchoredStorageIds: Set<string>;
     try {
-      anchoredStorageIds = await findAnchoredStorageIds(pairs.map((p) => p.storageId));
+      anchoredStorageIds = await dependencies.findRetainedStorageIds(
+        pairs.map((p) => p.storageId),
+      );
     } catch (err) {
       console.warn("[image-cleanup] anchor scan failed; keeping page", err);
       kept += pairs.length;
@@ -108,10 +138,7 @@ export async function runImageCleanup(): Promise<{ deleted: number; kept: number
         let failedRefs = 0;
         for (const p of refs) {
           try {
-            await convex.mutation(api.messages.clearMessageImage, {
-              messageId: p.messageId as never,
-              storageId: storageId as never,
-            });
+            await dependencies.clearMessageImage(p.messageId, storageId);
           } catch (err) {
             failedRefs += 1;
             console.warn(`[image-cleanup] failed to clear message ref ${storageId}`, err);
@@ -122,11 +149,11 @@ export async function runImageCleanup(): Promise<{ deleted: number; kept: number
           return;
         }
         try {
-          await convex.mutation(api.messages.deleteImageBytes, {
-            storageId: storageId as never,
-          });
-          deleted += 1;
+          const result = await dependencies.deleteStorageIfUnretained(storageId);
+          if (result.deleted) deleted += 1;
+          else kept += refs.length;
         } catch (err) {
+          kept += refs.length;
           console.warn(`[image-cleanup] failed to delete image bytes ${storageId}`, err);
         }
       }),
@@ -138,6 +165,10 @@ export async function runImageCleanup(): Promise<{ deleted: number; kept: number
   }
 
   return { deleted, kept };
+}
+
+export function runImageCleanup(): Promise<{ deleted: number; kept: number }> {
+  return runImageCleanupWithDependencies(defaultCleanupDependencies);
 }
 
 export function startImageCleanup(): () => void {

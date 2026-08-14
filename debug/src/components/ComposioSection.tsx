@@ -398,9 +398,7 @@ export function ComposioSection({ isDark }: { isDark: boolean }) {
     [expanded, toolsBySlug],
   );
 
-  const cardBg = isDark
-    ? "border-white/10 bg-[#202024] shadow-black/20"
-    : "border-zinc-200 bg-white shadow-zinc-200/50";
+  const cardBg = "panel-card-motion";
   const muted = isDark ? "text-zinc-500" : "text-zinc-400";
 
   const activeCount =
@@ -986,37 +984,16 @@ function SectionHeader({
   isDark: boolean;
 }) {
   return (
-    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-      <div className="min-w-0">
-        <div
-          className={`text-[11px] font-medium uppercase tracking-[0.08em] ${
-            isDark ? "text-zinc-500" : "text-zinc-400"
-          }`}
-        >
-          Integrations
-        </div>
-        <h2
-          className={`mt-1 text-[22px] font-semibold tracking-normal ${
-            isDark ? "text-zinc-50" : "text-zinc-950"
-          }`}
-        >
-          {title}
-        </h2>
-        <p className={`mt-1 text-sm ${isDark ? "text-zinc-400" : "text-zinc-500"}`}>
-          Connect accounts the agent can use for delegated work.
-        </p>
+    <div className="flex items-center justify-end gap-3" aria-label={`${title} status`}>
+      <div className="min-w-0 flex-1">
         {hint && (
-          <p className={`mt-1 text-xs ${isDark ? "text-amber-300" : "text-amber-700"}`}>
+          <p className={`text-xs ${isDark ? "text-amber-300" : "text-amber-700"}`}>
             {hint}
           </p>
         )}
       </div>
       <span
-        className={`inline-flex w-fit items-center rounded-2xl border px-2.5 py-1 text-xs mono ${
-          isDark
-            ? "border-white/10 bg-white/5 text-zinc-400"
-            : "border-zinc-200 bg-white text-zinc-500"
-        }`}
+        className="status-badge inline-flex w-fit items-center mono"
       >
         {count} active
       </span>

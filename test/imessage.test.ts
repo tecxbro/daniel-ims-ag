@@ -1,4 +1,6 @@
 import { Buffer } from "node:buffer";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   chunk,
@@ -10,6 +12,10 @@ import {
   stripMarkdown,
   type SpectrumAttachmentLike,
 } from "../server/imessage.js";
+
+function imessageSource(): string {
+  return readFileSync(resolve(process.cwd(), "server/imessage.ts"), "utf8");
+}
 
 describe("Photon iMessage bridge helpers", () => {
   afterEach(() => {
@@ -80,7 +86,7 @@ describe("Photon iMessage bridge helpers", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
     try {
-      await sendImessage("+15551234567", "hello");
+      await expect(sendImessage("+15551234567", "hello")).resolves.toBe(false);
       expect(warn).toHaveBeenCalledWith("[imessage] missing Photon credentials - not sending");
     } finally {
       if (oldProjectId === undefined) delete process.env.PHOTON_PROJECT_ID;
@@ -88,5 +94,73 @@ describe("Photon iMessage bridge helpers", () => {
       if (oldProjectSecret === undefined) delete process.env.PHOTON_PROJECT_SECRET;
       else process.env.PHOTON_PROJECT_SECRET = oldProjectSecret;
     }
+  });
+
+  it("reports whether every outbound chunk was delivered", async () => {
+    const deliveredSpace = { send: vi.fn(async () => undefined) };
+    await expect(sendImessage("+15551234567", "hello", {
+      space: deliveredSpace as never,
+    })).resolves.toBe(true);
+
+    const failedSpace = {
+      send: vi.fn(async () => {
+        throw new Error("transport unavailable");
+      }),
+    };
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    await expect(sendImessage("+15551234567", "hello", {
+      space: failedSpace as never,
+    })).resolves.toBe(false);
+  });
+
+  it("uses the inbound sender identity and reuses the inbound Space for replies", () => {
+    const source = imessageSource();
+    const handlerStart = source.indexOf("async function handleSpectrumMessage");
+    const normalTurnStart = source.indexOf("const stopTyping = startTypingLoop(space);", handlerStart);
+    const handlerEnd = source.indexOf("export async function startImessageBridge", normalTurnStart);
+    const handler = source.slice(handlerStart, handlerEnd);
+    const normalTurn = source.slice(normalTurnStart, handlerEnd);
+
+    expect(handlerStart).toBeGreaterThanOrEqual(0);
+    expect(normalTurnStart).toBeGreaterThan(handlerStart);
+    expect(handlerEnd).toBeGreaterThan(normalTurnStart);
+    expect(handler).toContain("const fromNumber = normalizeE164(message.sender?.id);");
+    expect(handler).toContain("const conversationId = conversationIdForPhone(fromNumber);");
+    expect(handler).toContain("memoryOwnerId: fromNumber");
+    expect(normalTurn).toContain("sendImessage(fromNumber, text, { space })");
+    expect(normalTurn).toContain("sendImessage(fromNumber, reply, { space })");
+  });
+
+  it("resolves proactive DMs from the Spectrum user without a line override", () => {
+    const source = imessageSource();
+    const retiredLineOverride = ["PHOTON", "IMESSAGE", "PHONE"].join("_");
+    const resolverStart = source.indexOf("async function resolveDmSpace");
+    const resolverEnd = source.indexOf("export async function sendImessage", resolverStart);
+    const resolver = source.slice(resolverStart, resolverEnd);
+
+    expect(resolverStart).toBeGreaterThanOrEqual(0);
+    expect(resolverEnd).toBeGreaterThan(resolverStart);
+    expect(source).toContain("providers: [imessage.config()]");
+    expect(resolver).toContain("const user = await im.user(toNumber);");
+    expect(resolver).toContain("return await im.space(user);");
+    expect(resolver).not.toContain("cached");
+    expect(source).not.toContain(retiredLineOverride);
+  });
+
+  it("persists pairing command turns without semantic capture", () => {
+    const source = imessageSource();
+    const pairingStart = source.indexOf("if (pairingIntent) {");
+    const normalTurnStart = source.indexOf("const stopTyping = startTypingLoop(space);", pairingStart);
+    const pairingBranch = source.slice(pairingStart, normalTurnStart);
+
+    expect(pairingStart).toBeGreaterThanOrEqual(0);
+    expect(normalTurnStart).toBeGreaterThan(pairingStart);
+    expect(pairingBranch).toContain("api.messages.send");
+    expect(pairingBranch).toContain('role: "user"');
+    expect(pairingBranch).toContain("api.messages.persistAssistantTurn");
+    expect(pairingBranch).toContain("sendImessage(fromNumber, reply, { space })");
+    expect(pairingBranch).not.toContain("handleUserMessage");
+    expect(pairingBranch).not.toContain("finalizeAssistantTurnCapture");
+    expect(pairingBranch).not.toContain("job:");
   });
 });

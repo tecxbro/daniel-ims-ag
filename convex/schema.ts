@@ -14,7 +14,13 @@ export default defineSchema({
   })
     .index("by_conversation", ["conversationId"])
     .index("by_conversation_turn", ["conversationId", "turnId"])
-    .index("by_createdAt", ["createdAt"]),
+    .index("by_conversation_id_and_turn_id_and_role", [
+      "conversationId",
+      "turnId",
+      "role",
+    ])
+    .index("by_createdAt", ["createdAt"])
+    .index("by_role_and_created_at", ["role", "createdAt"]),
 
   conversations: defineTable({
     conversationId: v.string(),
@@ -24,44 +30,141 @@ export default defineSchema({
     lastActivityAt: v.number(),
   }).index("by_conversation", ["conversationId"]),
 
-  memoryRecords: defineTable({
-    memoryId: v.string(),
-    content: v.string(),
-    tier: v.union(v.literal("short"), v.literal("long"), v.literal("permanent")),
-    segment: v.union(
-      v.literal("identity"),
-      v.literal("preference"),
-      v.literal("correction"),
-      v.literal("relationship"),
-      v.literal("project"),
-      v.literal("knowledge"),
-      v.literal("context"),
+  memorySyncJobs: defineTable({
+    jobId: v.string(),
+    kind: v.literal("conversation_turn"),
+    ownerKey: v.string(),
+    containerTag: v.string(),
+    customId: v.string(),
+    conversationId: v.string(),
+    turnId: v.string(),
+    payload: v.string(),
+    payloadHash: v.string(),
+    status: v.union(
+      v.literal("pending"),
+      v.literal("processing"),
+      v.literal("submitted"),
+      v.literal("completed"),
+      v.literal("failed"),
+      v.literal("dead_letter"),
     ),
-    importance: v.number(),
-    decayRate: v.number(),
-    accessCount: v.number(),
-    lastAccessedAt: v.number(),
-    sourceTurn: v.optional(v.string()),
-    lifecycle: v.union(v.literal("active"), v.literal("archived"), v.literal("pruned")),
-    supersedes: v.optional(v.array(v.string())),
-    embedding: v.optional(v.array(v.float64())),
-    // Structured sidecar data (JSON blob). Currently used to carry
-    // `corrects` text on correction-segment memories. Intentionally loose
-    // so extraction prompts can stash provider-specific hints without
-    // schema churn.
-    metadata: v.optional(v.string()),
+    providerDocumentId: v.optional(v.string()),
+    providerMemoryIds: v.optional(v.array(v.string())),
+    attempts: v.number(),
+    nextAttemptAt: v.number(),
+    lastError: v.optional(v.string()),
     createdAt: v.number(),
-    imageStorageIds: v.optional(v.array(v.id("_storage"))),
+    updatedAt: v.number(),
   })
-    .index("by_memory_id", ["memoryId"])
-    .index("by_tier", ["tier"])
-    .index("by_segment", ["segment"])
-    .index("by_lifecycle", ["lifecycle"])
-    .vectorIndex("by_embedding", {
-      vectorField: "embedding",
-      dimensions: 1024,
-      filterFields: ["lifecycle"],
-    }),
+    .index("by_job_id", ["jobId"])
+    .index("by_status_next_attempt", ["status", "nextAttemptAt"])
+    .index("by_owner_key_and_status_and_updated_at", [
+      "ownerKey",
+      "status",
+      "updatedAt",
+    ])
+    .index("by_payload_hash", ["payloadHash"])
+    .index("by_turn_id", ["turnId"])
+    .index("by_custom_id", ["customId"]),
+
+  memoryImageAnchors: defineTable({
+    storageId: v.id("_storage"),
+    ownerKey: v.string(),
+    conversationId: v.optional(v.string()),
+    turnId: v.optional(v.string()),
+    customId: v.string(),
+    providerDocumentId: v.optional(v.string()),
+    status: v.union(
+      v.literal("pending"),
+      v.literal("active"),
+      v.literal("released"),
+    ),
+    reason: v.string(),
+    createdAt: v.number(),
+    releasedAt: v.optional(v.number()),
+  })
+    .index("by_storage_id", ["storageId"])
+    .index("by_custom_id", ["customId"])
+    .index("by_status", ["status"])
+    .index("by_owner_key_and_status", ["ownerKey", "status"]),
+
+  memoryPendingOperations: defineTable({
+    operationId: v.string(),
+    ownerKey: v.string(),
+    conversationId: v.string(),
+    type: v.union(v.literal("forget"), v.literal("update")),
+    providerMemoryIds: v.array(v.string()),
+    preview: v.string(),
+    status: v.union(
+      v.literal("pending"),
+      v.literal("confirmed"),
+      v.literal("completed"),
+      v.literal("cancelled"),
+      v.literal("expired"),
+    ),
+    createdAt: v.number(),
+    expiresAt: v.number(),
+    completedAt: v.optional(v.number()),
+  })
+    .index("by_operation_id", ["operationId"])
+    .index("by_conversation_status", ["conversationId", "status"]),
+
+  memoryProviderState: defineTable({
+    // "deployment" for global provider state, or a deterministic key for a
+    // per-container initialization record. Mutations enforce uniqueness.
+    stateKey: v.string(),
+    scope: v.union(v.literal("deployment"), v.literal("container")),
+    containerTag: v.optional(v.string()),
+    saltFingerprint: v.optional(v.string()),
+    initializedAt: v.optional(v.number()),
+    healthStatus: v.optional(
+      v.union(
+        v.literal("unconfigured"),
+        v.literal("recovery_required"),
+        v.literal("healthy"),
+        v.literal("degraded"),
+        v.literal("unavailable"),
+      ),
+    ),
+    lastSuccessfulSubmissionAt: v.optional(v.number()),
+    lastFailedSubmissionAt: v.optional(v.number()),
+    lastError: v.optional(v.string()),
+    pairingAuthorityProof: v.optional(v.string()),
+    primaryOwnerKey: v.optional(v.string()),
+    primaryContainerTag: v.optional(v.string()),
+    primaryConversationId: v.optional(v.string()),
+    primaryRegisteredAt: v.optional(v.number()),
+    lastWorkerActivityAt: v.optional(v.number()),
+    updatedAt: v.number(),
+  })
+    .index("by_state_key", ["stateKey"])
+    .index("by_container_tag", ["containerTag"]),
+
+  memoryProviderMetrics: defineTable({
+    bucketStart: v.number(),
+    requestCount: v.number(),
+    failureCount: v.number(),
+    totalLatencyMs: v.number(),
+    latencyBuckets: v.array(v.number()),
+    updatedAt: v.number(),
+  }).index("by_bucket_start", ["bucketStart"]),
+
+  memoryProviderEvents: defineTable({
+    eventId: v.string(),
+    operation: v.union(
+      v.literal("hydration"),
+      v.literal("profile"),
+      v.literal("search"),
+      v.literal("documents"),
+      v.literal("entries"),
+    ),
+    outcome: v.union(v.literal("success"), v.literal("failure")),
+    latencyMs: v.optional(v.number()),
+    errorCode: v.optional(v.string()),
+    createdAt: v.number(),
+  })
+    .index("by_event_id", ["eventId"])
+    .index("by_created_at", ["createdAt"]),
 
   executionAgents: defineTable({
     agentId: v.string(),
@@ -250,17 +353,6 @@ export default defineSchema({
     createdAt: v.number(),
   }).index("by_agent", ["agentId"]),
 
-  memoryEvents: defineTable({
-    eventType: v.string(),
-    conversationId: v.optional(v.string()),
-    memoryId: v.optional(v.string()),
-    agentId: v.optional(v.string()),
-    data: v.string(),
-    createdAt: v.number(),
-  })
-    .index("by_conversation", ["conversationId"])
-    .index("by_type", ["eventType"]),
-
   automations: defineTable({
     automationId: v.string(),
     name: v.string(),
@@ -304,27 +396,6 @@ export default defineSchema({
   })
     .index("by_draft_id", ["draftId"])
     .index("by_conversation_status", ["conversationId", "status"]),
-
-  consolidationRuns: defineTable({
-    runId: v.string(),
-    trigger: v.string(),
-    status: v.union(
-      v.literal("running"),
-      v.literal("completed"),
-      v.literal("failed"),
-    ),
-    proposalsCount: v.number(),
-    mergedCount: v.number(),
-    prunedCount: v.number(),
-    notes: v.optional(v.string()),
-    // JSON blob: { proposals: [...], decisions: [...], applied: [...] }
-    // Captured so you can inspect the reasoning for any historical run.
-    details: v.optional(v.string()),
-    startedAt: v.number(),
-    completedAt: v.optional(v.number()),
-  })
-    .index("by_run_id", ["runId"])
-    .index("by_status", ["status"]),
 
   // Runtime overrides for things normally pinned by env vars (e.g. the Claude
   // model). Lets the user say "use opus" via iMessage and have the next agent

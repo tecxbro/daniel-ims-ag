@@ -2,19 +2,18 @@ import "./env-setup.js";
 import express from "express";
 import cors from "cors";
 import { createServer } from "node:http";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { WebSocketServer } from "ws";
 import { addClient } from "./broadcast.js";
-import { startImessageBridge } from "./imessage.js";
+import { normalizeE164, startImessageBridge } from "./imessage.js";
 import { handleUserMessage } from "./interaction-agent.js";
 import { loadIntegrations } from "./integrations/registry.js";
-import { startCleanupLoop } from "./memory/clean.js";
 import { startAutomationLoop } from "./automations.js";
 import { startHeartbeatLoop } from "./heartbeat.js";
-import { startConsolidationLoop } from "./consolidation.js";
 import { cancelAgent, retryAgent } from "./execution-agent.js";
 import { createComposioRouter } from "./composio-routes.js";
 import { ensureProactiveWatcher } from "./proactive-email.js";
-import { preloadLocalModel } from "./embeddings.js";
 import { createMemoryRouter } from "./memory-routes.js";
 import { createBrowserRouter } from "./browser-routes.js";
 import { closeLocalBrowser } from "./browser/launcher.js";
@@ -29,18 +28,101 @@ import {
   setRuntimeProvider,
 } from "./runtime-config.js";
 import { startImageCleanup } from "./images/clean.js";
+import { convex } from "./convex-client.js";
+import {
+  startConfiguredMemorySyncWorker,
+  type MemorySyncWorker,
+} from "./memory/supermemory/sync-worker.js";
+import { startCaptureRecoveryReplay } from "./memory/supermemory/capture-recovery.js";
+import { normalizeMemoryOwnerId } from "./memory/supermemory/identity.js";
+import { isLocalMemoryRouteRequest } from "./memory/supermemory/routes.js";
+import type { NextFunction, Request, Response } from "express";
+
+interface ChatMemoryOwnerEnvironment {
+  NODE_ENV?: string;
+}
+
+/**
+ * Resolves the private memory owner at the local HTTP boundary. Direct-message
+ * conversation IDs can safely derive the same canonical phone used by the
+ * iMessage bridge. Other production callers must supply an explicit owner;
+ * the shared local development identity is never accepted in production.
+ */
+export function resolveChatMemoryOwnerId(
+  input: { conversationId: unknown; memoryOwnerId: unknown },
+  env: ChatMemoryOwnerEnvironment = process.env,
+): string | null {
+  const isProduction = env.NODE_ENV?.trim().toLowerCase() === "production";
+  if (typeof input.memoryOwnerId === "string" && input.memoryOwnerId.trim()) {
+    try {
+      const rawOwnerId = input.memoryOwnerId.trim();
+      const normalizedPhone = /^[+()\d\s.-]+$/.test(rawOwnerId)
+        ? normalizeE164(rawOwnerId)
+        : undefined;
+      const ownerId = normalizeMemoryOwnerId(normalizedPhone ?? rawOwnerId);
+      return isProduction && ownerId === "local-default" ? null : ownerId;
+    } catch {
+      return null;
+    }
+  }
+
+  if (typeof input.conversationId === "string" && input.conversationId.startsWith("sms:")) {
+    const phone = normalizeE164(input.conversationId.slice("sms:".length));
+    if (phone && /^\+[1-9]\d{7,14}$/.test(phone)) return phone;
+  }
+
+  return isProduction ? null : "local-default";
+}
+
+/** Browser origins allowed to call the local control API. */
+export function isAllowedControlOrigin(origin: string | undefined): boolean {
+  if (!origin) return true;
+  try {
+    const hostname = new URL(origin).hostname.toLowerCase();
+    return (
+      hostname === "localhost" ||
+      hostname === "::1" ||
+      hostname === "0:0:0:0:0:0:0:1" ||
+      /^127\./.test(hostname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+function requireLocalControl(req: Request, res: Response, next: NextFunction): void {
+  if (isLocalMemoryRouteRequest(req.headers, req.socket.remoteAddress ?? "")) {
+    next();
+    return;
+  }
+  res.status(403).json({
+    ok: false,
+    error: {
+      code: "forbidden",
+      message: "Daniel control routes are only available locally.",
+    },
+  });
+}
 
 async function main() {
   await loadIntegrations();
-  startCleanupLoop();
   startAutomationLoop();
   startHeartbeatLoop();
-  startConsolidationLoop();
   startImageCleanup();
-  // No-op when a paid embedding key is set; otherwise downloads/loads the
-  // local BGE-large model in the background so the first user-facing
-  // recall() doesn't pay the model-load cost.
-  preloadLocalModel();
+  const captureRecovery = startCaptureRecoveryReplay();
+  let memorySyncWorker: MemorySyncWorker | null = null;
+  try {
+    const memorySync = await startConfiguredMemorySyncWorker({
+      client: convex,
+      onError: (err) => console.error("[supermemory-sync] startup/worker error", err),
+    });
+    memorySyncWorker = memorySync.worker;
+    if (memorySync.reason === "started") {
+      console.log(`[supermemory-sync] worker started (${memorySync.backlog.total} queued)`);
+    }
+  } catch (err) {
+    console.error("[supermemory-sync] startup failed", err);
+  }
   let stopImessageBridge: (() => Promise<void>) | undefined;
   startImessageBridge()
     .then((stop) => {
@@ -60,7 +142,13 @@ async function main() {
   }
 
   const app = express();
-  app.use(cors());
+  app.use(
+    cors({
+      origin(origin, callback) {
+        callback(null, isAllowedControlOrigin(origin));
+      },
+    }),
+  );
   // Composio webhook receiver must read raw bytes for HMAC verification, so
   // its body parser is mounted BEFORE the global express.json. Without this
   // ordering the JSON parser consumes the stream first and the raw buffer
@@ -72,7 +160,7 @@ async function main() {
     res.json({ ok: true, service: "daniel" });
   });
 
-  app.get("/runtime-config", async (_req, res) => {
+  app.get("/runtime-config", requireLocalControl, async (_req, res) => {
     try {
       res.json(await getRuntimeConfig());
     } catch (err) {
@@ -80,7 +168,7 @@ async function main() {
     }
   });
 
-  app.post("/runtime-config", async (req, res) => {
+  app.post("/runtime-config", requireLocalControl, async (req, res) => {
     try {
       const body = req.body as {
         runtime?: unknown;
@@ -130,31 +218,28 @@ async function main() {
     }
   });
 
-  app.use("/composio", createComposioRouter());
+  app.use("/composio", createComposioRouter({ requireControlAccess: requireLocalControl }));
   app.use("/memory", createMemoryRouter());
-  app.use("/browser", createBrowserRouter());
-  app.use("/changelog", createChangelogRouter());
+  app.use("/browser", requireLocalControl, createBrowserRouter());
+  app.use("/changelog", requireLocalControl, createChangelogRouter());
 
-  app.post("/agents/:id/cancel", (req, res) => {
-    const ok = cancelAgent(req.params.id);
+  app.post("/agents/:id/cancel", requireLocalControl, (req, res) => {
+    const agentId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    if (!agentId) {
+      res.status(400).json({ error: "agent id required" });
+      return;
+    }
+    const ok = cancelAgent(agentId);
     res.json({ ok });
   });
 
-  app.post("/consolidate", async (_req, res) => {
-    try {
-      const { runConsolidation } = await import("./consolidation.js");
-      // Fire-and-forget so the HTTP request returns immediately.
-      runConsolidation("manual").catch((err) =>
-        console.error("[consolidation] manual run failed", err),
-      );
-      res.json({ ok: true, triggered: "manual" });
-    } catch (err) {
-      res.status(500).json({ error: String(err) });
+  app.post("/agents/:id/retry", requireLocalControl, async (req, res) => {
+    const agentId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+    if (!agentId) {
+      res.status(400).json({ error: "agent id required" });
+      return;
     }
-  });
-
-  app.post("/agents/:id/retry", async (req, res) => {
-    const result = await retryAgent(req.params.id);
+    const result = await retryAgent(agentId);
     if (!result) {
       res.status(404).json({ error: "agent not found" });
       return;
@@ -163,15 +248,32 @@ async function main() {
   });
 
   // Chat endpoint for local testing and the debug dashboard
-  app.post("/chat", async (req, res) => {
-    const { conversationId, content } = req.body ?? {};
-    if (!conversationId || !content) {
+  app.post("/chat", requireLocalControl, async (req, res) => {
+    const { conversationId, memoryOwnerId, content } = req.body ?? {};
+    if (
+      typeof conversationId !== "string" ||
+      !conversationId.trim() ||
+      typeof content !== "string" ||
+      !content.trim()
+    ) {
       res.status(400).json({ error: "conversationId and content required" });
+      return;
+    }
+    const resolvedMemoryOwnerId = resolveChatMemoryOwnerId({
+      conversationId,
+      memoryOwnerId,
+    });
+    if (!resolvedMemoryOwnerId) {
+      res.status(400).json({
+        error:
+          "memoryOwnerId is required unless it can be derived from a direct sms conversationId",
+      });
       return;
     }
     try {
       const reply = await handleUserMessage({
         conversationId,
+        memoryOwnerId: resolvedMemoryOwnerId,
         content,
         persistAssistantReply: true,
       });
@@ -184,7 +286,11 @@ async function main() {
 
   const server = createServer(app);
   const wss = new WebSocketServer({ server, path: "/ws" });
-  wss.on("connection", (ws) => {
+  wss.on("connection", (ws, request) => {
+    if (!isLocalMemoryRouteRequest(request.headers, request.socket.remoteAddress ?? "")) {
+      ws.close(1008, "Daniel control WebSocket is only available locally.");
+      return;
+    }
     addClient(ws);
     ws.send(JSON.stringify({ event: "hello", data: { ok: true }, at: Date.now() }));
   });
@@ -206,6 +312,9 @@ async function main() {
       shuttingDown = true;
       Promise.resolve(stopImessageBridge?.())
         .catch(() => undefined)
+        .then(() => memorySyncWorker?.stop())
+        .catch(() => undefined)
+        .then(() => captureRecovery.stop())
         .then(() => closeLocalBrowser())
         .catch(() => undefined)
         .finally(() => process.exit(signalExitCodes[sig]));
@@ -213,7 +322,10 @@ async function main() {
   }
 }
 
-main().catch((err) => {
-  console.error("fatal", err);
-  process.exit(1);
-});
+const entryPath = process.argv[1] ? pathToFileURL(resolve(process.argv[1])).href : undefined;
+if (entryPath === import.meta.url) {
+  main().catch((err) => {
+    console.error("fatal", err);
+    process.exit(1);
+  });
+}

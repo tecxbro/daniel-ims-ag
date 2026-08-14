@@ -122,7 +122,7 @@ export function prettyToolName(raw?: string | null): string {
 
 const DANIEL_ICONS: Record<string, any> = {
   recall: AiBrain02Icon,
-  write_memory: AiBrain02Icon,
+  remember_memory: AiBrain02Icon,
   WebSearch: GlobalSearchIcon,
   WebFetch: FileSearchIcon,
   save_draft: NoteEditIcon,

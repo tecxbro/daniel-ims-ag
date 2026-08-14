@@ -1,11 +1,14 @@
 import { z } from "zod";
+import { api } from "../convex/_generated/api.js";
 import {
   CURATED_TOOLKITS,
   listConnectedToolkits,
   listToolkitMeta,
   listToolsForToolkit,
 } from "./composio.js";
-import { activeProvider as activeEmbeddingProvider } from "./embeddings.js";
+import { readMemoryProviderConfiguration } from "./memory/supermemory/client.js";
+import { ensureMemoryIdentityRuntime } from "./memory/supermemory/primary-owner.js";
+import type { MemoryProviderConfiguration } from "./memory/supermemory/types.js";
 import { listEnabledIntegrations } from "./integrations/registry.js";
 import { createClaudeMcpServer } from "./runtimes/claude.js";
 import { defineRuntimeTool } from "./runtimes/tool.js";
@@ -34,6 +37,182 @@ const NAMESPACE = "daniel-self";
 
 const reasoningEffortSchema = z.enum(["minimal", "low", "medium", "high", "xhigh"]);
 
+type MemoryProviderHealth =
+  | "unconfigured"
+  | "recovery_required"
+  | "healthy"
+  | "degraded"
+  | "unavailable"
+  | "unknown";
+
+interface MemoryProviderDeploymentState {
+  healthStatus: Exclude<MemoryProviderHealth, "unknown"> | null;
+  lastSuccessfulSubmissionAt: number | null;
+  lastFailedSubmissionAt: number | null;
+  hasError: boolean;
+  lastWorkerActivityAt: number | null;
+  updatedAt: number | null;
+}
+
+export interface MemorySyncBacklogStatus {
+  pending: number;
+  processing: number;
+  submitted: number;
+  completed: number;
+  failed: number;
+  deadLetter: number;
+  active: number;
+  total: number;
+  truncated: boolean;
+}
+
+export interface MemoryProviderOperationalStatus {
+  providerState: MemoryProviderDeploymentState | null;
+  syncBacklog: MemorySyncBacklogStatus | null;
+  providerStateAvailable: boolean;
+  syncBacklogAvailable: boolean;
+}
+
+interface MemoryStatusClient {
+  query(reference: unknown, args: Record<string, never>): Promise<unknown>;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function numberOrNull(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function nonNegativeCount(record: Record<string, unknown>, key: string): number {
+  const value = record[key];
+  const nested = asRecord(value);
+  const count = typeof value === "number" ? value : nested?.count;
+  return typeof count === "number" && Number.isFinite(count)
+    ? Math.max(0, Math.floor(count))
+    : 0;
+}
+
+function normalizeProviderState(value: unknown): MemoryProviderDeploymentState | null {
+  const state = asRecord(value);
+  if (!state) return null;
+  const rawHealth = state.healthStatus;
+  const healthStatus =
+    rawHealth === "unconfigured" ||
+    rawHealth === "recovery_required" ||
+    rawHealth === "healthy" ||
+    rawHealth === "degraded" ||
+    rawHealth === "unavailable"
+      ? rawHealth
+      : null;
+  return {
+    healthStatus,
+    lastSuccessfulSubmissionAt: numberOrNull(state.lastSuccessfulSubmissionAt),
+    lastFailedSubmissionAt: numberOrNull(state.lastFailedSubmissionAt),
+    hasError: state.hasError === true,
+    lastWorkerActivityAt: numberOrNull(state.lastWorkerActivityAt),
+    updatedAt: numberOrNull(state.updatedAt),
+  };
+}
+
+function normalizeSyncBacklog(value: unknown): MemorySyncBacklogStatus | null {
+  const backlog = asRecord(value);
+  if (!backlog) return null;
+  const counts = asRecord(backlog.counts) ?? backlog;
+  const pending = nonNegativeCount(counts, "pending");
+  const processing = nonNegativeCount(counts, "processing");
+  const submitted = nonNegativeCount(counts, "submitted");
+  const completed = nonNegativeCount(counts, "completed");
+  const failed = nonNegativeCount(counts, "failed");
+  const deadLetter = Math.max(
+    nonNegativeCount(counts, "deadLetter"),
+    nonNegativeCount(counts, "dead_letter"),
+  );
+  return {
+    pending,
+    processing,
+    submitted,
+    completed,
+    failed,
+    deadLetter,
+    active:
+      numberOrNull(backlog.active) ?? pending + processing + submitted + failed,
+    total:
+      numberOrNull(backlog.total) ??
+      pending + processing + submitted + completed + failed + deadLetter,
+    truncated: backlog.truncated === true,
+  };
+}
+
+/** Reads the durable provider-state and outbox modules without calling Supermemory. */
+export async function readMemoryProviderOperationalStatus(
+  client?: MemoryStatusClient,
+): Promise<MemoryProviderOperationalStatus> {
+  const queries = client
+    ? [
+        client.query(api.memoryProviderState.getDeploymentState, {}),
+        client.query(api.memorySyncJobs.backlog, {}),
+      ]
+    : await import("./convex-client.js").then(({ convex }) => [
+        convex.query(api.memoryProviderState.getDeploymentState, {}),
+        convex.query(api.memorySyncJobs.backlog, {}),
+      ]);
+  const [providerStateResult, syncBacklogResult] = await Promise.allSettled(queries);
+  return {
+    providerState:
+      providerStateResult.status === "fulfilled"
+        ? normalizeProviderState(providerStateResult.value)
+        : null,
+    syncBacklog:
+      syncBacklogResult.status === "fulfilled"
+        ? normalizeSyncBacklog(syncBacklogResult.value)
+        : null,
+    providerStateAvailable: providerStateResult.status === "fulfilled",
+    syncBacklogAvailable: syncBacklogResult.status === "fulfilled",
+  };
+}
+
+export function buildMemoryRuntimeStatus(
+  memory: MemoryProviderConfiguration,
+  operational: MemoryProviderOperationalStatus,
+  identityStatus?: "ready" | "unconfigured" | "recovery_required" | "unknown",
+) {
+  const memoryProviderHealth: MemoryProviderHealth =
+    !memory.apiKeyConfigured
+      ? "unconfigured"
+      : identityStatus === "recovery_required" || identityStatus === "unconfigured"
+        ? identityStatus
+        : (operational.providerState?.healthStatus ?? "unknown");
+  const identityReady =
+    identityStatus === undefined || identityStatus === "ready";
+  const captureConfigured =
+    memory.apiKeyConfigured &&
+    identityReady &&
+    memoryProviderHealth !== "recovery_required" &&
+    memoryProviderHealth !== "unconfigured";
+
+  return {
+    memoryProvider: "supermemory" as const,
+    memoryProviderHealth,
+    memoryCaptureKind: captureConfigured ? "conversation_turn" : null,
+    memorySyncBacklog: operational.syncBacklog,
+    memoryLastProviderSuccessAt:
+      operational.providerState?.lastSuccessfulSubmissionAt ?? null,
+    memoryLastProviderFailureAt:
+      operational.providerState?.lastFailedSubmissionAt ?? null,
+    memoryProviderHasError: operational.providerState?.hasError ?? false,
+    memoryLastWorkerActivityAt:
+      operational.providerState?.lastWorkerActivityAt ?? null,
+    memoryProviderStateUpdatedAt: operational.providerState?.updatedAt ?? null,
+    memoryProviderStateAvailable: operational.providerStateAvailable,
+    memorySyncBacklogAvailable: operational.syncBacklogAvailable,
+    supermemoryConfigured: memory.apiKeyConfigured,
+  };
+}
+
 export function createSelfTools(): RuntimeTool[] {
   return [
     defineRuntimeTool(
@@ -46,6 +225,17 @@ export function createSelfTools(): RuntimeTool[] {
         const tzInfo = await describeUserNow();
         const runtime = await getRuntimeConfig();
         const browser = await getBrowserSettings();
+        const memory = readMemoryProviderConfiguration();
+        const identityStatus = memory.apiKeyConfigured
+          ? await ensureMemoryIdentityRuntime()
+              .then((result) => result.status)
+              .catch(() => "unknown" as const)
+          : ("unconfigured" as const);
+        const memoryStatus = buildMemoryRuntimeStatus(
+          memory,
+          await readMemoryProviderOperationalStatus(),
+          identityStatus,
+        );
         const config = {
           runtime: runtime.runtime,
           model: runtime.model,
@@ -71,8 +261,7 @@ export function createSelfTools(): RuntimeTool[] {
             extraArgs: browser.extraArgs,
           },
           composioEnabled: Boolean(process.env.COMPOSIO_API_KEY),
-          embeddingsEnabled: true,
-          embeddingsProvider: activeEmbeddingProvider(),
+          ...memoryStatus,
           photonEnabled: Boolean(process.env.PHOTON_PROJECT_ID && process.env.PHOTON_PROJECT_SECRET),
         };
         return runtimeText(JSON.stringify(config, null, 2));

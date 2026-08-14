@@ -10,10 +10,19 @@ import { getRuntimeConfig, type RuntimeConfig } from "./runtime-config.js";
 import { runAgentRuntime } from "./runtimes/index.js";
 import { EMPTY_USAGE, type UsageTotals } from "./usage.js";
 import { handleUserMessage } from "./interaction-agent.js";
-import { sendImessage } from "./imessage.js";
+import { normalizeE164, sendImessage } from "./imessage.js";
 import { ensureTrigger, getComposio, listConnectedToolkits } from "./composio.js";
 import { ensureWebhookSubscription } from "./composio-webhook.js";
 import { describeUserNow } from "./timezone-config.js";
+import {
+  getSupermemoryProvider,
+  readMemoryProviderConfiguration,
+} from "./memory/supermemory/client.js";
+import { getPrimaryOwnerScope } from "./memory/supermemory/primary-owner.js";
+import type {
+  DanielMemoryProvider,
+  MemoryHydrationResult,
+} from "./memory/supermemory/types.js";
 
 const TRIGGER_SLUG = "GMAIL_NEW_GMAIL_MESSAGE";
 const CLASSIFIER_MODEL = process.env.DANIEL_CLASSIFIER_MODEL ?? "claude-haiku-4-5-20251001";
@@ -53,6 +62,29 @@ export interface NormalizedEmail {
   snippet: string;
   body: string;
   timestamp?: string;
+}
+
+export interface ProactiveMemoryTarget {
+  phone: string;
+  conversationId: string;
+  memoryOwnerId: string;
+  ownerKey: string;
+  containerTag: string;
+}
+
+/** Uses only the paired inbound SMS conversation as the proactive destination. */
+export async function resolveProactiveMemoryTarget(): Promise<ProactiveMemoryTarget | null> {
+  const owner = await getPrimaryOwnerScope();
+  if (!owner) return null;
+  const phone = normalizeE164(owner.conversationId.slice("sms:".length));
+  if (!phone || !/^\+[1-9]\d{7,14}$/.test(phone)) return null;
+  return {
+    phone,
+    conversationId: owner.conversationId,
+    memoryOwnerId: phone,
+    ownerKey: owner.ownerKey,
+    containerTag: owner.containerTag,
+  };
 }
 
 // Pull the bare address out of a "Name <addr@example.com>" header. Falls
@@ -260,68 +292,115 @@ export async function classifyEmailImportance(
   return { important, summary, usage };
 }
 
-async function recallPreferenceLines(): Promise<string[]> {
+type Environment = Record<string, string | undefined>;
+
+export interface ProactivePreferenceDependencies {
+  env?: Environment;
+  provider?: Pick<DanielMemoryProvider, "profile" | "search"> | null;
+}
+
+export interface ProactiveDispatchDependencies {
+  handleMessage?: typeof handleUserMessage;
+  send?: (phone: string, message: string) => Promise<boolean>;
+  persistAssistantMessage?: (input: {
+    conversationId: string;
+    role: "assistant";
+    content: string;
+  }) => Promise<unknown>;
+}
+
+const PROACTIVE_PREFERENCE_QUERY =
+  "Which emails should Daniel proactively surface or ignore, including important senders, topics, deadlines, and notification preferences?";
+
+function preferenceLinesFromHydration(hydration: MemoryHydrationResult): string[] {
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  for (const value of [
+    ...hydration.profile.static,
+    ...hydration.profile.dynamic,
+    ...hydration.results.map((result) => result.content),
+  ]) {
+    const line = value.trim();
+    const key = line.toLocaleLowerCase("en-US");
+    if (!line || seen.has(key)) continue;
+    seen.add(key);
+    lines.push(line);
+    if (lines.length === 20) break;
+  }
+  return lines;
+}
+
+export async function recallPreferenceLines(
+  target: Pick<ProactiveMemoryTarget, "containerTag">,
+  dependencies: ProactivePreferenceDependencies = {},
+): Promise<string[]> {
+  const env = dependencies.env ?? process.env;
+  let config;
   try {
-    const rows = await convex.query(api.memoryRecords.list, {
-      segment: "preference",
-      lifecycle: "active",
-      limit: 20,
+    config = readMemoryProviderConfiguration(env);
+  } catch (error) {
+    console.warn(
+      "[proactive] Supermemory preference configuration is invalid",
+      error instanceof Error ? error.name : "unknown error",
+    );
+    return [];
+  }
+  if (!config.apiKeyConfigured) return [];
+  try {
+    const provider =
+      dependencies.provider === undefined ? getSupermemoryProvider() : dependencies.provider;
+    if (!provider) return [];
+    const result = await provider.profile({
+      containerTag: target.containerTag,
+      q: PROACTIVE_PREFERENCE_QUERY,
+      threshold: config.threshold,
     });
-    return rows.map((r: { content: string }) => r.content);
-  } catch (err) {
-    console.warn("[proactive] preference recall failed", err);
+    return preferenceLinesFromHydration(result);
+  } catch (error) {
+    console.warn(
+      "[proactive] Supermemory preference recall failed open",
+      error instanceof Error ? error.name : "unknown error",
+    );
     return [];
   }
 }
 
-// Bring whatever the user put in DANIEL_USER_PHONE to E.164 (+1XXXXXXXXXX).
-// Without this, a bare 10-digit number in env produces an `sms:NNNNNNNNNN`
-// conversation that doesn't match the `sms:+1NNNNNNNNNN` ID the iMessage
-// bridge uses for inbound messages from the same person — proactive notices end up in
-// a parallel Convex conversation invisible to the user-driven thread.
-function normalizeProactivePhone(raw: string): string | null {
-  const trimmed = raw.trim();
-  if (!trimmed) return null;
-  if (trimmed.startsWith("+")) return trimmed;
-  if (/^\d{10}$/.test(trimmed)) return `+1${trimmed}`;
-  if (/^\d{11,15}$/.test(trimmed)) return `+${trimmed}`;
-  return null;
-}
-
-async function dispatchProactiveNotice(summary: string): Promise<void> {
-  const raw = process.env.DANIEL_USER_PHONE;
-  if (!raw) {
-    console.warn("[proactive] DANIEL_USER_PHONE not set; skipping dispatch");
+export async function dispatchProactiveNotice(
+  summary: string,
+  target?: ProactiveMemoryTarget | null,
+  dependencies: ProactiveDispatchDependencies = {},
+): Promise<void> {
+  const resolvedTarget = target === undefined ? await resolveProactiveMemoryTarget() : target;
+  if (!resolvedTarget) {
+    console.log("[proactive] no paired primary SMS conversation; skipping dispatch");
     return;
   }
-  const phone = normalizeProactivePhone(raw);
-  if (!phone) {
-    console.warn(
-      `[proactive] user phone=${JSON.stringify(raw)} doesn't look like a valid phone number; skipping dispatch`,
-    );
-    return;
-  }
-  const conversationId = `sms:${phone}`;
-  const reply = await handleUserMessage({
-    conversationId,
+  const handleMessage = dependencies.handleMessage ?? handleUserMessage;
+  const send = dependencies.send ?? sendImessage;
+  const persistAssistantMessage =
+    dependencies.persistAssistantMessage ??
+    ((input) => convex.mutation(api.messages.send, input));
+  const reply = await handleMessage({
+    conversationId: resolvedTarget.conversationId,
+    memoryOwnerId: resolvedTarget.memoryOwnerId,
     content: `[proactive notice] ${summary}`,
     kind: "proactive",
   });
   // handleUserMessage only sends iMessage from inside send_ack; the final
   // reply is the caller's responsibility.
   if (reply && reply !== "(no reply)") {
-    await sendImessage(phone, reply);
-    await convex.mutation(api.messages.send, {
-      conversationId,
+    await send(resolvedTarget.phone, reply);
+    await persistAssistantMessage({
+      conversationId: resolvedTarget.conversationId,
       role: "assistant",
       content: reply,
     });
   } else {
     // IA stayed silent — fall back to the raw classifier summary so the
     // user still gets the notice; otherwise classification was a no-op.
-    await sendImessage(phone, summary);
-    await convex.mutation(api.messages.send, {
-      conversationId,
+    await send(resolvedTarget.phone, summary);
+    await persistAssistantMessage({
+      conversationId: resolvedTarget.conversationId,
       role: "assistant",
       content: summary,
     });
@@ -347,11 +426,6 @@ export async function ensureProactiveWatcher(publicUrl: string): Promise<void> {
   if (!getComposio()) {
     console.warn("[proactive] COMPOSIO_API_KEY not set; skipping watcher setup");
     return;
-  }
-  if (!process.env.DANIEL_USER_PHONE) {
-    console.warn(
-      "[proactive] DANIEL_USER_PHONE not set; webhook will register but notices won't dispatch",
-    );
   }
   try {
     await ensureWebhookSubscription(publicUrl);
@@ -421,12 +495,17 @@ export async function handleEmailEvent(event: NormalizedTriggerEvent): Promise<v
     }
   }
 
-  const preferences = await recallPreferenceLines();
+  const target = await resolveProactiveMemoryTarget();
+  if (!target) {
+    console.log("[proactive] no paired primary SMS conversation; skipping notice");
+    return;
+  }
+  const preferences = await recallPreferenceLines(target);
   const { important, summary } = await classifyEmailImportance(email, preferences);
   if (!important || !summary) {
     console.log(`[proactive] dropped (not important): ${email.subject}`);
     return;
   }
   console.log(`[proactive] surfacing: ${summary}`);
-  await dispatchProactiveNotice(summary);
+  await dispatchProactiveNotice(summary, target);
 }

@@ -78,11 +78,14 @@ When a user turn has `imageStorageIds`:
 - The dispatcher filters image refs against images attached to the current inbound turn.
 - Execution agents receive image content blocks when the task depends on those images.
 
-### 5.4 Memory Extraction (`server/memory/extract.ts`)
+### 5.4 Durable Image Memory
 
-- Image turns are available to the post-turn extraction pass.
-- If the image is worth remembering, extraction can write a description-style memory with `imageStorageIds`.
-- That makes requests like "remember that photo I sent" searchable through memory recall.
+- Ordinary image turns remain part of the Convex transcript but are not
+  uploaded to semantic memory automatically.
+- `remember_image` and other explicit image-memory operations upload through
+  the server-only SuperMemory adapter.
+- `memoryImageAnchors` retain the referenced Convex bytes while the provider
+  document is pending or active.
 
 ### 5.5 Schema (`convex/schema.ts`)
 
@@ -92,20 +95,21 @@ When a user turn has `imageStorageIds`:
 - `mediaError?: v.string()`
 - `by_createdAt` index for cleanup scans
 
-`memoryRecords` includes:
-
-- `imageStorageIds?: v.array(v.id("_storage"))`
+`memoryImageAnchors` records the storage ID, opaque owner/container scope,
+provider document ID, lifecycle status, and timestamps needed for safe
+retention.
 
 ## 6. Retention And Cleanup
 
-Raw image bytes are deleted after `DANIEL_IMAGE_RETENTION_DAYS` unless a memory record still references the storage id.
+Raw image bytes are deleted after `DANIEL_IMAGE_RETENTION_DAYS` unless an
+active image anchor still retains the storage ID.
 
 `server/images/clean.ts` runs a bounded, idempotent sweep:
 
 ```
 for each page of old messages with imageStorageIds:
   for each storageId:
-    if no memoryRecords row references storageId:
+    if no pending or active image anchor retains storageId:
       delete bytes from Convex storage
       remove storageId from messages.imageStorageIds
 ```
@@ -115,7 +119,7 @@ for each page of old messages with imageStorageIds:
 ## 7. Dashboard
 
 - Dashboard metrics include image storage count.
-- Memory records can show image-linked markers.
+- Memory documents can show image-linked markers.
 - No manual image purge control exists in this design.
 
 ## 8. Error Handling

@@ -1,8 +1,10 @@
 #!/usr/bin/env tsx
 import prompts from "prompts";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
+import { createHmac, randomBytes } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { isValidMemoryIdSalt } from "../server/memory/supermemory/identity.js";
 
 const ROOT = resolve(new URL(".", import.meta.url).pathname, "..");
 const ENV_PATH = resolve(ROOT, ".env.local");
@@ -13,6 +15,8 @@ type RuntimeChoice = "claude" | "codex";
 const DEFAULT_CLAUDE_MODEL = "claude-sonnet-4-6";
 const DEFAULT_CODEX_MODEL = "gpt-5.5";
 const DEFAULT_CODEX_REASONING_EFFORT = "medium";
+const MEMORY_FINGERPRINT_CONTEXT = "daniel-memory-id-salt-fingerprint-v1";
+const PAIRING_AUTHORITY_CONTEXT = "daniel-primary-owner-pairing-authority-v1";
 
 const CLAUDE_MODEL_CHOICES = [
   { title: "claude-sonnet-4-6 (recommended)", value: "claude-sonnet-4-6" },
@@ -95,6 +99,65 @@ function writeEnv(path: string, env: Record<string, string>): void {
     out += s + "\n";
   }
   writeFileSync(path, out.trim() + "\n");
+}
+
+function memoryIdentityMaterial(salt: string): {
+  saltFingerprint: string;
+  pairingAuthorityProof: string;
+} {
+  const saltFingerprint = createHmac("sha256", salt)
+    .update(MEMORY_FINGERPRINT_CONTEXT, "utf8")
+    .digest("hex")
+    .slice(0, 32);
+  const pairingAuthorityProof = createHmac("sha256", salt)
+    .update(PAIRING_AUTHORITY_CONTEXT, "utf8")
+    .digest("hex");
+  return { saltFingerprint, pairingAuthorityProof };
+}
+
+function runMemoryIdentityCommand(
+  functionName: string,
+  salt: string,
+): { status?: string } {
+  const output = execFileSync(
+    "npx",
+    [
+      "convex",
+      "run",
+      functionName,
+      JSON.stringify(memoryIdentityMaterial(salt)),
+      "--typecheck",
+      "disable",
+      "--codegen",
+      "disable",
+    ],
+    { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+  );
+  return JSON.parse(output.trim()) as { status?: string };
+}
+
+function initializePersistedMemoryIdentity(salt: string): void {
+  const result = runMemoryIdentityCommand(
+    "memoryProviderState:initializeIdentityConfiguration",
+    salt,
+  );
+  if (result.status !== "ready") {
+    throw new Error(
+      "Memory identity recovery is required. Setup did not replace the existing identity.",
+    );
+  }
+}
+
+function verifyPersistedMemoryIdentity(salt: string): void {
+  const result = runMemoryIdentityCommand(
+    "memoryProviderState:verifyIdentityConfiguration",
+    salt,
+  );
+  if (result.status !== "ready") {
+    throw new Error(
+      "Memory identity recovery is required. Setup did not replace the existing identity.",
+    );
+  }
 }
 
 function cleanConvexUrlEnv(path: string): void {
@@ -190,16 +253,6 @@ function runCapture(cmd: string, args: string[]): Promise<string> {
   });
 }
 
-function normalizeOptionalE164(raw: string | undefined): string {
-  const trimmed = raw?.trim() ?? "";
-  if (!trimmed) return "";
-  if (trimmed.startsWith("+")) return trimmed;
-  const digits = trimmed.replace(/\D/g, "");
-  if (/^\d{10}$/.test(digits)) return `+1${digits}`;
-  if (/^\d{11,15}$/.test(digits)) return `+${digits}`;
-  return trimmed;
-}
-
 async function main() {
   banner("daniel setup");
 
@@ -207,9 +260,10 @@ async function main() {
 What this does:
   1. Captures your Photon Spectrum project credentials for iMessage
   2. Asks whether Daniel should use your Claude Code or Codex subscription
-  3. Optionally enables local browser use
-  4. Runs \`npx convex dev\` to create a Convex project
-  5. Writes .env.local
+  3. Configures SuperMemory as Daniel's semantic memory provider
+  4. Optionally enables local browser use
+  5. Runs \`npx convex dev\` to create a Convex project
+  6. Writes .env.local
 
 Before you start:
   • Claude Code subscription if choosing Claude: https://claude.com/code
@@ -223,9 +277,8 @@ Before you start:
   banner("Photon Spectrum — iMessage bridge");
   console.log(`
 Daniel uses Photon Spectrum's cloud iMessage provider. Find PROJECT_ID and
-SECRET_KEY in your Photon project settings. PHOTON_IMESSAGE_PHONE is optional;
-set it only when you have a dedicated line and want all outbound DMs pinned
-to that line.
+SECRET_KEY in your Photon project settings. Spectrum selects the correct
+shared or dedicated line for each conversation.
 `);
 
   const answers = await prompts(
@@ -241,12 +294,6 @@ to that line.
         name: "PHOTON_PROJECT_SECRET",
         message: "Photon project secret",
         initial: existing.PHOTON_PROJECT_SECRET ?? "",
-      },
-      {
-        type: "text",
-        name: "PHOTON_IMESSAGE_PHONE",
-        message: "Photon dedicated iMessage line (optional, e.g. +1XXXXXXXXXX)",
-        initial: existing.PHOTON_IMESSAGE_PHONE ?? "",
       },
       {
         type: "select",
@@ -328,9 +375,6 @@ to that line.
     PHOTON_PROJECT_ID: answers.PHOTON_PROJECT_ID ?? existing.PHOTON_PROJECT_ID ?? "",
     PHOTON_PROJECT_SECRET:
       answers.PHOTON_PROJECT_SECRET ?? existing.PHOTON_PROJECT_SECRET ?? "",
-    PHOTON_IMESSAGE_PHONE: normalizeOptionalE164(
-      answers.PHOTON_IMESSAGE_PHONE ?? existing.PHOTON_IMESSAGE_PHONE,
-    ),
   });
 
   // ---- Composio API key ---------------------------------------------------
@@ -392,41 +436,104 @@ to that line.
     );
   }
 
-  // ---- Embedding provider --------------------------------------------------
-  banner("Memory search — embedding provider");
-  const existingVoyage = existing.VOYAGE_API_KEY ?? "";
-  const existingOpenai = existing.OPENAI_API_KEY ?? "";
-  const inferredCurrent = existingVoyage
-    ? "voyage"
-    : existingOpenai
-      ? "openai"
-      : "local";
+  // ---- SuperMemory ---------------------------------------------------------
+  banner("SuperMemory — semantic memory");
   console.log(`
-Daniel's recall() searches your stored memories by semantic similarity. Pick
-how you want to generate embeddings:
+SuperMemory is Daniel's semantic memory provider. Convex remains the application
+database and stores the durable conversation-capture outbox.
 
-  • Local  — free, runs in-process via @huggingface/transformers
-            (Xenova/bge-large-en-v1.5, 1024-dim). First run downloads
-            ~440MB and caches forever. No API key.
-  • Voyage — paid, ~$0.06/M tokens. Slightly stronger English retrieval.
-  • OpenAI — paid, ~$0.13/M tokens. Comparable to Voyage.
-
-All three produce 1024-dim vectors (compatible with the same Convex index)
-so you can switch later by adding/removing the API key.
+Setup manages Daniel's private memory identity automatically. If existing
+identity state cannot be verified, setup stops instead of replacing it.
 `);
-  const { embeddingProvider } = await prompts(
-    {
-      type: "select",
-      name: "embeddingProvider",
-      message: "Which embedding provider should daniel use?",
-      choices: [
-        { title: "Local (free, recommended)", value: "local" },
-        { title: "Voyage (paid — I have a key)", value: "voyage" },
-        { title: "OpenAI (paid — I have a key)", value: "openai" },
-      ],
-      initial:
-        inferredCurrent === "voyage" ? 1 : inferredCurrent === "openai" ? 2 : 0,
-    },
+  let persistedIdentity:
+    | {
+        hasSaltFingerprint: boolean;
+        hasPairingAuthority: boolean;
+        hasPrimaryOwner: boolean;
+      }
+    | undefined;
+  if (existing.CONVEX_DEPLOYMENT) {
+    try {
+      const output = execFileSync(
+        "npx",
+        [
+          "convex",
+          "run",
+          "memoryProviderState:getIdentityPresence",
+          "{}",
+          "--typecheck",
+          "disable",
+          "--codegen",
+          "disable",
+        ],
+        { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+      );
+      persistedIdentity = JSON.parse(output.trim()) as typeof persistedIdentity;
+    } catch {
+      throw new Error(
+        "Memory identity state could not be verified. Restore the existing DANIEL_MEMORY_ID_SALT and Convex access before rerunning setup; a replacement will not be generated.",
+      );
+    }
+  }
+  const hasPersistedIdentity = Boolean(
+    persistedIdentity?.hasSaltFingerprint ||
+      persistedIdentity?.hasPairingAuthority ||
+      persistedIdentity?.hasPrimaryOwner,
+  );
+  const hasValidExistingMemoryIdSalt = isValidMemoryIdSalt(
+    existing.DANIEL_MEMORY_ID_SALT,
+  );
+  if (hasPersistedIdentity && !hasValidExistingMemoryIdSalt) {
+    throw new Error(
+      "Memory identity recovery is required: persisted identity state exists but DANIEL_MEMORY_ID_SALT is missing or invalid.",
+    );
+  }
+  if (hasPersistedIdentity && hasValidExistingMemoryIdSalt) {
+    if (persistedIdentity?.hasPairingAuthority) {
+      verifyPersistedMemoryIdentity(existing.DANIEL_MEMORY_ID_SALT);
+    } else if (persistedIdentity?.hasPrimaryOwner || !answers.runConvex) {
+      throw new Error(
+        "Memory identity recovery is required. Run Convex setup to initialize the server-only pairing authority.",
+      );
+    }
+  }
+  const memoryIdSalt =
+    (hasValidExistingMemoryIdSalt ? existing.DANIEL_MEMORY_ID_SALT : undefined) ||
+    (!hasPersistedIdentity ? randomBytes(32).toString("hex") : "");
+  const memoryAnswers = await prompts(
+    [
+      {
+        type: "password",
+        name: "SUPERMEMORY_API_KEY",
+        message: "SuperMemory API key",
+        initial: existing.SUPERMEMORY_API_KEY ?? "",
+      },
+      {
+        type: "number",
+        name: "DANIEL_SUPERMEMORY_TIMEOUT_MS",
+        message: "SuperMemory profile/search timeout (milliseconds)",
+        initial: Number(existing.DANIEL_SUPERMEMORY_TIMEOUT_MS ?? "1200"),
+        validate: (value: number) =>
+          (Number.isInteger(value) && value > 0) || "Enter a positive whole number",
+      },
+      {
+        type: "number",
+        name: "DANIEL_SUPERMEMORY_THRESHOLD",
+        message: "SuperMemory search threshold (0 to 1)",
+        initial: Number(existing.DANIEL_SUPERMEMORY_THRESHOLD ?? "0.60"),
+        validate: (value: number) =>
+          (value >= 0 && value <= 1) || "Enter a number between 0 and 1",
+      },
+      {
+        type: "number",
+        name: "DANIEL_SUPERMEMORY_SEARCH_LIMIT",
+        message: "Maximum SuperMemory search results (1 to 100)",
+        initial: Number(existing.DANIEL_SUPERMEMORY_SEARCH_LIMIT ?? "8"),
+        validate: (value: number) =>
+          (Number.isInteger(value) && value >= 1 && value <= 100) ||
+          "Enter a whole number between 1 and 100",
+      },
+    ],
     {
       onCancel: () => {
         console.log("Setup cancelled.");
@@ -434,51 +541,10 @@ so you can switch later by adding/removing the API key.
       },
     },
   );
-
-  if (embeddingProvider === "voyage") {
-    const { VOYAGE_API_KEY } = await prompts({
-      type: "password",
-      name: "VOYAGE_API_KEY",
-      message: "Paste your Voyage API key (https://dash.voyageai.com):",
-      initial: existingVoyage,
-    });
-    (answers as any).VOYAGE_API_KEY = VOYAGE_API_KEY || "";
-    (answers as any).OPENAI_API_KEY = "";
-  } else if (embeddingProvider === "openai") {
-    const { OPENAI_API_KEY } = await prompts({
-      type: "password",
-      name: "OPENAI_API_KEY",
-      message: "Paste your OpenAI API key:",
-      initial: existingOpenai,
-    });
-    (answers as any).OPENAI_API_KEY = OPENAI_API_KEY || "";
-    (answers as any).VOYAGE_API_KEY = "";
-  } else {
-    // Local — clear any stale paid keys so embeddings.ts falls through to
-    // the local provider on next start.
-    (answers as any).VOYAGE_API_KEY = "";
-    (answers as any).OPENAI_API_KEY = "";
-
-    const { preload } = await prompts({
-      type: "confirm",
-      name: "preload",
-      message:
-        "Pre-download the local model now? (~440MB, ~30s on broadband — saves the wait on first recall)",
-      initial: true,
-    });
-    if (preload) {
-      console.log("\nDownloading Xenova/bge-large-en-v1.5… (Ctrl+C to skip)\n");
-      try {
-        await runInherit("npx", ["tsx", "scripts/preload-embeddings.ts"]);
-        console.log("✓ Local model cached.");
-      } catch (err) {
-        console.warn(
-          "Preload failed — model will download on first recall instead.",
-          err instanceof Error ? err.message : err,
-        );
-      }
-    }
-  }
+  Object.assign(answers, memoryAnswers, {
+    DANIEL_MEMORY_ID_SALT: memoryIdSalt,
+    DANIEL_SUPERMEMORY_DREAMING: existing.DANIEL_SUPERMEMORY_DREAMING ?? "dynamic",
+  });
 
   // ---- Local browser use ---------------------------------------------------
   banner("Local browser use — optional");
@@ -638,6 +704,7 @@ ${claudeInstalled ? "✓ Claude Code found on PATH." : "⚠ Claude Code was not 
 
   if (answers.runConvex) {
     await runConvexDev();
+    initializePersistedMemoryIdentity(env.DANIEL_MEMORY_ID_SALT);
     const after = readEnv(ENV_PATH);
 
     // VITE_CONVEX_URL is written to .env.local as part of `convex dev`. The
@@ -687,7 +754,6 @@ the tunnel is live, you'll see a banner with your public URL.
 
 Photon iMessage:
   • Make sure PHOTON_PROJECT_ID and PHOTON_PROJECT_SECRET are set.
-  • PHOTON_IMESSAGE_PHONE is optional; set it only for a dedicated line.
   • No inbound webhook needs to be pasted anywhere.
 
 Test it:

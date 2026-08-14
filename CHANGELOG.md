@@ -8,6 +8,24 @@ updates.
 
 - Dispatcher now answers stable questions itself and only spawns a web/tool
   worker when the request needs a live lookup or a real-world action.
+- Made SuperMemory Daniel's only semantic-memory provider while keeping Convex
+  as the application database and durable synchronization control plane.
+- Reduced durable memory jobs to one idempotent `conversation_turn` contract;
+  explicit remember, update, confirmed forget, and image operations are direct
+  and synchronous.
+- Added fail-open unconfigured and identity-recovery states so messages and
+  assistant replies persist normally when credentials, identity material, or
+  the provider are unavailable.
+- Added one-time primary-owner pairing through a local temporary code or a
+  masked recent inbound conversation. Dashboard memory and proactive Gmail
+  notices remain unavailable until pairing succeeds.
+- Updated shared-line iMessage routing to reuse inbound Spectrum Spaces and to
+  resolve proactive direct messages without a configured phone-line override.
+- Preserved the operational SuperMemory dashboard, durable capture recovery,
+  retry/fencing/dead-letter controls, rendered UI coverage, and Liquid Glass
+  accessibility behavior while removing inactive cutover controls.
+- Recorded the verified legacy-memory deletion proof:
+  `12/44/1/0 → 0/0/0/0` before runtime and schema decommission.
 
 ## 0.1.0 — 2026-07-25
 
@@ -19,8 +37,8 @@ updates.
   workspaces.
 - Added persistent Convex conversations, settings, usage, coding state,
   scheduled automations, and draft state.
-- Added tiered memory, vector recall, consolidation, image retention, and
-  cleanup workflows.
+- Added the original, now-legacy tiered memory, vector recall, consolidation,
+  image retention, and cleanup workflows.
 - Added scheduled automations, timezone-aware execution, and proactive email
   notifications.
 - Added Composio integrations with per-worker scoping and connection
