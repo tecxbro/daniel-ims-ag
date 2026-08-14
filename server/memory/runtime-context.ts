@@ -45,6 +45,11 @@ export interface RuntimeMemoryContextDependencies {
   providerError?: unknown;
   memoryIdSalt?: string;
   instrumentation?: MemoryContextInstrumentationHook;
+  recordHydration?: (input: {
+    startedAt: number;
+    finishedAt: number;
+    error?: unknown;
+  }) => Promise<void>;
 }
 
 export interface PrepareRuntimeMemoryContextInput {
@@ -227,6 +232,7 @@ export async function prepareRuntimeMemoryContext(
   const provider = dependencies.provider ?? providerFailure(
     dependencies.providerError ?? new Error("Supermemory provider is unavailable"),
   );
+  const hydrationStartedAt = Date.now();
   const providerResultPromise = hydrateMemoryContext({
     provider,
     owner,
@@ -244,6 +250,11 @@ export async function prepareRuntimeMemoryContext(
     legacyPromise,
     providerResultPromise,
   ]);
+  await dependencies.recordHydration?.({
+    startedAt: hydrationStartedAt,
+    finishedAt: Date.now(),
+    error: providerResult.error,
+  });
 
   if (config.readMode === "shadow") {
     return {

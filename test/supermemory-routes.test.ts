@@ -199,9 +199,44 @@ describe("Implementation 8 Supermemory routes", () => {
       totalItems: 1,
       totalPages: 1,
     }));
+    const listMemories = vi.fn<NonNullable<DanielMemoryProvider["listMemories"]>>(async () => ({
+      entries: [
+        {
+          id: "memory-1",
+          content: "Likes window seats",
+          version: 2,
+          isLatest: true,
+          isForgotten: false,
+          isStatic: false,
+          isInference: false,
+          sourceCount: 1,
+          parentMemoryId: "memory-0",
+          rootMemoryId: "memory-0",
+          forgetAfter: null,
+          forgetReason: null,
+          metadata: { source: "conversation" },
+          history: [
+            {
+              id: "memory-0",
+              content: "Likes aisle seats",
+              version: 1,
+              parentMemoryId: null,
+              rootMemoryId: null,
+              isLatest: false,
+              isForgotten: false,
+            },
+          ],
+          documentIds: ["document-1"],
+        },
+      ],
+      page: 1,
+      limit: 5,
+      totalItems: 1,
+      totalPages: 1,
+    }));
     const router = createMemoryRouter({
       localOnly: false,
-      provider: { profile, search, listDocuments },
+      provider: { profile, search, listDocuments, listMemories },
       controlPlane: controlPlane(),
       resolveOwner: async () => authorized,
     });
@@ -211,6 +246,7 @@ describe("Implementation 8 Supermemory routes", () => {
       expect(profileResponse.status).toBe(200);
       expect(await json(profileResponse)).toMatchObject({
         ok: true,
+        profileState: "ready",
         provider: "supermemory",
         profile: { static: ["Prefers concise answers"], dynamic: ["Planning a trip"] },
       });
@@ -237,6 +273,27 @@ describe("Implementation 8 Supermemory routes", () => {
         page: 1,
         totalItems: 1,
       });
+
+      const rejectedDocumentQuery = await fetch(
+        `${baseUrl}/memory/documents?q=seat`,
+      );
+      expect(rejectedDocumentQuery.status).toBe(400);
+
+      const entriesResponse = await fetch(
+        `${baseUrl}/memory/entries?page=1&limit=5&order=desc&sort=updatedAt&containerTag=${encodeURIComponent(foreign.containerTag)}`,
+      );
+      expect(entriesResponse.status).toBe(200);
+      expect(await json(entriesResponse)).toMatchObject({
+        ok: true,
+        entries: [
+          {
+            id: "memory-1",
+            isLatest: true,
+            isForgotten: false,
+            history: [{ id: "memory-0", isLatest: false }],
+          },
+        ],
+      });
     });
 
     expect(profile).toHaveBeenCalledWith(
@@ -256,11 +313,21 @@ describe("Implementation 8 Supermemory routes", () => {
         limit: 5,
       }),
     );
+    expect(listMemories).toHaveBeenCalledWith(
+      expect.objectContaining({
+        containerTag: authorized.containerTag,
+        page: 1,
+        limit: 5,
+        order: "desc",
+        sort: "updatedAt",
+      }),
+    );
     expect(
       JSON.stringify([
         ...profile.mock.calls,
         ...search.mock.calls,
         ...listDocuments.mock.calls,
+        ...listMemories.mock.calls,
       ]),
     ).not.toContain(foreign.containerTag);
   });

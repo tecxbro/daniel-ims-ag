@@ -3,7 +3,7 @@ import { api } from "../convex/_generated/api.js";
 import { convex } from "./convex-client.js";
 import { createMemoryTools, recallLegacyMemory } from "./memory/tools.js";
 import { prepareRuntimeMemoryContext } from "./memory/runtime-context.js";
-import { enqueueRawTurnCapture } from "./memory/supermemory/capture.js";
+import { finalizeAssistantTurnCapture } from "./memory/supermemory/capture-recovery.js";
 import {
   getSupermemoryProvider,
   readMemoryProviderConfiguration,
@@ -15,6 +15,7 @@ import type {
   MemoryReadMode,
   MemoryWriteMode,
 } from "./memory/supermemory/types.js";
+import { recordProviderRead } from "./memory/supermemory/provider-observability.js";
 import { spawnExecutionAgent } from "./execution-agent.js";
 import {
   continueCodingAgentWithAnswer,
@@ -645,6 +646,8 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
                 { saltFingerprint },
               ),
             instrumentation: memoryInstrumentation,
+            recordHydration: (observation) =>
+              recordProviderRead({ operation: "hydration", ...observation }),
           },
         );
   if (runtimeMemory?.shadowComparison) {
@@ -677,11 +680,10 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
   const finalizeTurnMemory = async (assistantReply: string): Promise<void> => {
     if (opts.kind === "proactive") return;
 
-    // Local callers persist the assistant row inside this function, so the
-    // durable handoff can happen here. iMessage defers capture until its
-    // caller confirms delivery and persists this same turnId.
+    // Local callers atomically persist the assistant row and outbox job here.
+    // iMessage defers this same operation until its caller confirms delivery.
     if (opts.persistAssistantReply) {
-      await enqueueRawTurnCapture({
+      await finalizeAssistantTurnCapture({
         conversationId: opts.conversationId,
         memoryOwnerId: opts.memoryOwnerId,
         turnId,
@@ -690,8 +692,6 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
         imageStorageIds: inboundImageStorageIds,
         kind: opts.kind,
         channel: "local",
-      }).catch((err) => {
-        console.error("[supermemory-capture] durable enqueue failed", err);
       });
     }
   };
@@ -725,14 +725,6 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
         conversationId: opts.conversationId,
         content: codingReply,
       });
-      if (opts.persistAssistantReply) {
-        await convex.mutation(api.messages.send, {
-          conversationId: opts.conversationId,
-          role: "assistant",
-          content: codingReply,
-          turnId,
-        });
-      }
       await finalizeTurnMemory(codingReply);
       return codingReply;
     }
@@ -750,14 +742,6 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
         : `Switched to ${label}. Next turn will use ${nextConfig.model}.`;
     log(`runtime switch: ${runtimeConfig.runtime} -> ${directRuntimeSwitch}`);
     broadcast("assistant_message", { conversationId: opts.conversationId, content: reply });
-    if (opts.persistAssistantReply) {
-      await convex.mutation(api.messages.send, {
-        conversationId: opts.conversationId,
-        role: "assistant",
-        content: reply,
-        turnId,
-      });
-    }
     await finalizeTurnMemory(reply);
     return reply;
   }
@@ -771,14 +755,6 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
       "Local browser use is off right now. Turn it on in Settings → Local browser use, then resend this and I can use Chrome on your machine.";
     log("browser requested but disabled");
     broadcast("assistant_message", { conversationId: opts.conversationId, content: reply });
-    if (opts.persistAssistantReply) {
-      await convex.mutation(api.messages.send, {
-        conversationId: opts.conversationId,
-        role: "assistant",
-        content: reply,
-        turnId,
-      });
-    }
     await finalizeTurnMemory(reply);
     return reply;
   }
@@ -1027,15 +1003,6 @@ export async function handleUserMessage(opts: HandleOpts): Promise<string> {
   });
 
   broadcast("assistant_message", { conversationId: opts.conversationId, content: reply });
-
-  if (opts.persistAssistantReply) {
-    await convex.mutation(api.messages.send, {
-      conversationId: opts.conversationId,
-      role: "assistant",
-      content: reply,
-      turnId,
-    });
-  }
 
   // Synthetic proactive notices skip durable capture, so email-derived
   // content cannot become user memory.

@@ -26,6 +26,7 @@ import { SettingsPanel } from "./components/SettingsPanel.js";
 import { ChangelogDrawer } from "./components/ChangelogDrawer.js";
 import { RuntimeProviderLogo, type RuntimeProvider } from "./lib/branding.js";
 import metadata from "../../project-metadata.json";
+import { useMemoryProfileState } from "./lib/memoryProfile.js";
 
 type View =
   | "dashboard"
@@ -47,7 +48,6 @@ interface RuntimeConfigSnapshot {
 interface MemoryOperationalSummary {
   memoryProvider: {
     healthStatus: string;
-    profileState: "ready" | "empty" | "unavailable";
     readMode: string;
     writeMode: string;
   };
@@ -94,6 +94,7 @@ export function App() {
   const [runtimeConfig, setRuntimeConfig] = useState<RuntimeConfigSnapshot | null>(null);
   const [changelogOpen, setChangelogOpen] = useState(false);
   const { connected } = useSocket();
+  const memoryProfileState = useMemoryProfileState();
 
   const memorySummary = useQuery(api.dashboard.metrics, {}) as
     | MemoryOperationalSummary
@@ -244,7 +245,7 @@ export function App() {
                 <div className="flex items-center justify-between gap-2 text-xs">
                   <span className={isDark ? "text-zinc-500" : "text-zinc-500"}>Profile</span>
                   <span className={`truncate capitalize ${isDark ? "text-zinc-300" : "text-zinc-700"}`}>
-                    {memorySummary.memoryProvider.profileState}
+                    {memoryProfileState}
                   </span>
                 </div>
                 <div className="grid grid-cols-2 gap-2">

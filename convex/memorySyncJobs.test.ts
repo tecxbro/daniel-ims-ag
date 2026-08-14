@@ -17,7 +17,16 @@ function enqueueArgs(overrides: Record<string, unknown> = {}) {
     customId: "daniel-conv-conversation001",
     conversationId: "sms:test-user",
     turnId: "turn_001",
-    payload: '{"ingestionStrategy":"delta_turn_v1"}',
+    payload: JSON.stringify({
+      schemaVersion: 1,
+      kind: "conversation_turn",
+      ingestionStrategy: "delta_turn_v1",
+      providerInput: {
+        content: "USER: hello\nDANIEL: hi",
+        containerTag: "daniel-user-owner001",
+        customId: "daniel-conv-conversation001",
+      },
+    }),
     payloadHash: "a".repeat(64),
     now: 1_000,
     ...overrides,

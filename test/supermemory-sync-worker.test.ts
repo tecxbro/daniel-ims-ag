@@ -145,6 +145,8 @@ function provider(captureTurn = vi.fn(async () => ({ id: "doc_001", status: "que
     createExact: vi.fn(async () => []),
     update: vi.fn(async () => ({ id: "memory_001", content: "updated" })),
     forget: vi.fn(async () => undefined),
+    uploadImageJob: vi.fn(async () => ({ id: "image_doc_001", status: "queued" })),
+    forgetMany: vi.fn(async () => undefined),
   };
 }
 
@@ -472,8 +474,9 @@ describe("durable Supermemory synchronization worker", () => {
         jobId: "job_image",
         kind: "image",
         payload: JSON.stringify({
-          content: "Durable image description",
+          storageId: "storage_001",
           customId: "daniel-conv-conversation001",
+          reason: "migration",
         }),
       }),
       conversationJob({
@@ -500,10 +503,11 @@ describe("durable Supermemory synchronization worker", () => {
     for (let index = 0; index < 5; index += 1) await worker.runOnce();
 
     expect(jobs.jobs.every((job) => job.status === "completed")).toBe(true);
-    expect(currentProvider.captureTurn).toHaveBeenCalledTimes(2);
+    expect(currentProvider.captureTurn).toHaveBeenCalledOnce();
     expect(currentProvider.createExact).toHaveBeenCalledOnce();
+    expect(currentProvider.uploadImageJob).toHaveBeenCalledOnce();
     expect(currentProvider.update).toHaveBeenCalledOnce();
-    expect(currentProvider.forget).toHaveBeenCalledOnce();
+    expect(currentProvider.forgetMany).toHaveBeenCalledOnce();
   });
 
   it("does not start when capture is disabled and the durable backlog is empty", async () => {

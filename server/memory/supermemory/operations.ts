@@ -1,5 +1,29 @@
 import { createHash, randomUUID } from "node:crypto";
 import { validateProviderIdentifier } from "./identity.js";
+import {
+  buildExplicitMemoryOutboxPayload,
+  buildImageOutboxPayload,
+  buildMemoryForgetOutboxPayload,
+  buildMemoryUpdateOutboxPayload,
+  type DurableImageReason,
+  type ExplicitMemoryOutboxPayload,
+  type ImageOutboxPayload,
+  type MemoryForgetOutboxPayload,
+  type MemoryUpdateOutboxPayload,
+} from "./job-contract.js";
+export {
+  buildExplicitMemoryOutboxPayload,
+  buildImageOutboxPayload,
+  buildMemoryForgetOutboxPayload,
+  buildMemoryUpdateOutboxPayload,
+} from "./job-contract.js";
+export type {
+  DurableImageReason,
+  ExplicitMemoryOutboxPayload,
+  ImageOutboxPayload,
+  MemoryForgetOutboxPayload,
+  MemoryUpdateOutboxPayload,
+} from "./job-contract.js";
 import type {
   CreateExactMemoryInput,
   ForgetMemoryInput,
@@ -26,12 +50,6 @@ export type DurableStaticMemoryKind =
   | "core_identity"
   | "long_term_role"
   | "home_timezone";
-
-export type DurableImageReason =
-  | "explicit_request"
-  | "durable_object"
-  | "remember_image_tool"
-  | "migration";
 
 export interface CreatedMemoriesResult {
   documentId: string | null;
@@ -910,83 +928,6 @@ function conciseForgetPreview(candidates: ForgetCandidate[]): string {
   });
   if (candidates.length > lines.length) lines.push(`...and ${candidates.length - lines.length} more.`);
   return `Confirm forgetting these ${candidates.length} memories:\n${lines.join("\n")}`;
-}
-
-export interface ExplicitMemoryOutboxPayload {
-  schemaVersion: 1;
-  kind: "explicit_memory";
-  providerInput: CreateExactMemoryInput;
-}
-
-export interface MemoryUpdateOutboxPayload {
-  schemaVersion: 1;
-  kind: "memory_update";
-  providerInput: { containerTag: string; id: string; newContent: string; metadata?: ProviderMetadata };
-}
-
-export interface MemoryForgetOutboxPayload {
-  schemaVersion: 1;
-  kind: "memory_forget";
-  providerInput: { containerTag: string; ids: string[]; reason?: string };
-}
-
-export interface ImageOutboxPayload {
-  schemaVersion: 1;
-  kind: "image";
-  providerInput: {
-    containerTag: string;
-    storageId: string;
-    customId: string;
-    reason: DurableImageReason;
-    conversationId?: string;
-    turnId?: string;
-  };
-}
-
-export function buildExplicitMemoryOutboxPayload(
-  providerInput: CreateExactMemoryInput,
-): ExplicitMemoryOutboxPayload {
-  return { schemaVersion: 1, kind: "explicit_memory", providerInput };
-}
-
-export function buildMemoryUpdateOutboxPayload(input: {
-  containerTag: string;
-  memoryId: string;
-  newContent: string;
-  metadata?: ProviderMetadata;
-}): MemoryUpdateOutboxPayload {
-  return {
-    schemaVersion: 1,
-    kind: "memory_update",
-    providerInput: {
-      containerTag: input.containerTag,
-      id: input.memoryId,
-      newContent: input.newContent,
-      metadata: input.metadata,
-    },
-  };
-}
-
-export function buildMemoryForgetOutboxPayload(input: {
-  containerTag: string;
-  providerMemoryIds: string[];
-  reason?: string;
-}): MemoryForgetOutboxPayload {
-  return {
-    schemaVersion: 1,
-    kind: "memory_forget",
-    providerInput: {
-      containerTag: input.containerTag,
-      ids: uniqueIds(input.providerMemoryIds),
-      reason: input.reason,
-    },
-  };
-}
-
-export function buildImageOutboxPayload(
-  input: ImageOutboxPayload["providerInput"],
-): ImageOutboxPayload {
-  return { schemaVersion: 1, kind: "image", providerInput: input };
 }
 
 export function createMemoryOperationProvider(input: {

@@ -95,8 +95,18 @@ describe("Implementation 8 owner-scoped control plane", () => {
       kind: "conversation_turn",
       ownerKey: "owner-a",
       containerTag: "daniel-user-owner-a",
+      customId: "daniel-conv-owner-a",
       turnId: "turn-a",
-      payload: "{}",
+      payload: JSON.stringify({
+        schemaVersion: 1,
+        kind: "conversation_turn",
+        ingestionStrategy: "delta_turn_v1",
+        providerInput: {
+          content: "USER: hello\nDANIEL: hi",
+          containerTag: "daniel-user-owner-a",
+          customId: "daniel-conv-owner-a",
+        },
+      }),
       payloadHash: "d".repeat(64),
       now: 100,
     });

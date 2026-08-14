@@ -33,6 +33,7 @@ import {
   startConfiguredMemorySyncWorker,
   type MemorySyncWorker,
 } from "./memory/supermemory/sync-worker.js";
+import { startCaptureRecoveryReplay } from "./memory/supermemory/capture-recovery.js";
 import { normalizeMemoryOwnerId } from "./memory/supermemory/identity.js";
 import { isLocalMemoryRouteRequest } from "./memory/supermemory/routes.js";
 import type { NextFunction, Request, Response } from "express";
@@ -108,6 +109,7 @@ async function main() {
   startAutomationLoop();
   startHeartbeatLoop();
   startImageCleanup();
+  const captureRecovery = startCaptureRecoveryReplay();
   let memorySyncWorker: MemorySyncWorker | null = null;
   try {
     const memorySync = await startConfiguredMemorySyncWorker({
@@ -321,6 +323,7 @@ async function main() {
         .catch(() => undefined)
         .then(() => memorySyncWorker?.stop())
         .catch(() => undefined)
+        .then(() => captureRecovery.stop())
         .then(() => closeLocalBrowser())
         .catch(() => undefined)
         .finally(() => process.exit(signalExitCodes[sig]));

@@ -11,14 +11,20 @@ import {
   SupermemoryProviderError,
   type SupermemoryContainerSettingsClient,
 } from "./client.js";
+import {
+  MemorySyncPayloadError,
+  parseMemorySyncJobPayload,
+  type ImageJobInput,
+  type MemoryForgetJobInput,
+  type MemorySyncJobKind,
+  type MemorySyncPayloadByKind,
+} from "./job-contract.js";
+export { MemorySyncPayloadError } from "./job-contract.js";
+export type { MemorySyncJobKind, MemorySyncPayloadByKind } from "./job-contract.js";
 import type {
-  CaptureTurnInput,
-  CreateExactMemoryInput,
   DanielMemoryProvider,
-  ForgetMemoryInput,
   ProviderDocumentResult,
   ProviderMemoryResult,
-  UpdateMemoryInput,
 } from "./types.js";
 
 export const MEMORY_SYNC_RETRY_DELAYS_MS = [
@@ -38,13 +44,6 @@ export const MEMORY_SYNC_MAX_PROVIDER_ATTEMPTS = 5;
 export const DEFAULT_MEMORY_SYNC_POLL_INTERVAL_MS = 1_000;
 export const DEFAULT_MEMORY_SYNC_LEASE_MS = 2 * 60_000;
 export const DEFAULT_MEMORY_SYNC_HEARTBEAT_INTERVAL_MS = 15_000;
-
-export type MemorySyncJobKind =
-  | "conversation_turn"
-  | "explicit_memory"
-  | "image"
-  | "memory_update"
-  | "memory_forget";
 
 export type MemorySyncJobStatus =
   | "pending"
@@ -172,14 +171,6 @@ export interface MemoryProviderStateWriter {
   heartbeat(input: RecordWorkerHeartbeatInput): Promise<void>;
 }
 
-export interface MemorySyncPayloadByKind {
-  conversation_turn: CaptureTurnInput;
-  explicit_memory: CreateExactMemoryInput;
-  image: CaptureTurnInput;
-  memory_update: UpdateMemoryInput;
-  memory_forget: ForgetMemoryInput;
-}
-
 export type MemorySyncDispatchHandler<K extends MemorySyncJobKind> = (
   payload: MemorySyncPayloadByKind[K],
   job: MemorySyncJob,
@@ -188,15 +179,6 @@ export type MemorySyncDispatchHandler<K extends MemorySyncJobKind> = (
 export type MemorySyncDispatchHandlers = {
   [K in MemorySyncJobKind]: MemorySyncDispatchHandler<K>;
 };
-
-export class MemorySyncPayloadError extends Error {
-  readonly retryable = false;
-
-  constructor(message: string) {
-    super(message);
-    this.name = "MemorySyncPayloadError";
-  }
-}
 
 function asObject(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -213,111 +195,16 @@ function parsePayload<K extends MemorySyncJobKind>(
       `memory sync job ${job.jobId} changed kind while dispatching`,
     );
   }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(job.payload);
-  } catch {
-    throw new MemorySyncPayloadError(`memory sync job ${job.jobId} contains invalid JSON`);
-  }
-  const envelope = asObject(parsed);
-  if (!envelope) {
-    throw new MemorySyncPayloadError(`memory sync job ${job.jobId} payload must be an object`);
-  }
-  if (
-    job.kind === "conversation_turn" &&
-    (envelope.ingestionStrategy !== "delta_turn_v1" || envelope.schemaVersion !== 1)
-  ) {
-    throw new MemorySyncPayloadError(
-      `memory sync conversation job ${job.jobId} must use delta_turn_v1`,
-    );
-  }
-  const providerInput = asObject(envelope.providerInput) ?? envelope;
-  validatePayloadForKind(job, providerInput);
-  return providerInput as unknown as MemorySyncPayloadByKind[K];
-}
-
-function requireStringField(
-  payload: Record<string, unknown>,
-  field: string,
-  job: MemorySyncJob,
-): void {
-  if (typeof payload[field] !== "string" || !(payload[field] as string).trim()) {
-    throw new MemorySyncPayloadError(
-      `memory sync ${job.kind} job ${job.jobId} requires ${field}`,
-    );
-  }
-}
-
-function validatePayloadForKind(
-  job: MemorySyncJob,
-  payload: Record<string, unknown>,
-): void {
-  switch (job.kind) {
-    case "conversation_turn":
-    case "image":
-      requireStringField(payload, "content", job);
-      if (
-        payload.taskType !== undefined &&
-        payload.taskType !== "memory" &&
-        payload.taskType !== "superrag"
-      ) {
-        throw new MemorySyncPayloadError(
-          `memory sync ${job.kind} job ${job.jobId} has an invalid taskType`,
-        );
-      }
-      if (payload.customId !== undefined && payload.customId !== job.customId) {
-        throw new MemorySyncPayloadError(
-          `memory sync ${job.kind} job ${job.jobId} customId does not match its durable identity`,
-        );
-      }
-      if (
-        payload.containerTag !== undefined &&
-        payload.containerTag !== job.containerTag
-      ) {
-        throw new MemorySyncPayloadError(
-          `memory sync ${job.kind} job ${job.jobId} containerTag does not match its durable identity`,
-        );
-      }
-      return;
-    case "explicit_memory":
-      if (!Array.isArray(payload.memories) || payload.memories.length < 1) {
-        throw new MemorySyncPayloadError(
-          `memory sync explicit_memory job ${job.jobId} requires memories`,
-        );
-      }
-      for (const memory of payload.memories) {
-        const value = asObject(memory);
-        if (!value || typeof value.content !== "string" || !value.content.trim()) {
-          throw new MemorySyncPayloadError(
-            `memory sync explicit_memory job ${job.jobId} contains an invalid memory`,
-          );
-        }
-      }
-      return;
-    case "memory_update":
-      requireStringField(payload, "newContent", job);
-      if (
-        (typeof payload.id !== "string" || !payload.id) &&
-        (typeof payload.content !== "string" || !payload.content)
-      ) {
-        throw new MemorySyncPayloadError(
-          `memory sync memory_update job ${job.jobId} requires id or content`,
-        );
-      }
-      return;
-    case "memory_forget":
-      if (
-        (typeof payload.id !== "string" || !payload.id) &&
-        (typeof payload.content !== "string" || !payload.content)
-      ) {
-        throw new MemorySyncPayloadError(
-          `memory sync memory_forget job ${job.jobId} requires id or content`,
-        );
-      }
-      return;
-    default:
-      assertNever(job.kind);
-  }
+  const envelope = parseMemorySyncJobPayload(
+    job.payload,
+    {
+      kind: expectedKind,
+      containerTag: job.containerTag,
+      customId: job.customId,
+    },
+    { allowLegacy: true },
+  );
+  return envelope.providerInput as MemorySyncPayloadByKind[K];
 }
 
 function requireCustomId(job: MemorySyncJob): string {
@@ -342,10 +229,7 @@ function memorySubmission(results: ProviderMemoryResult[]): ProviderSubmission {
  * modules. Implementation 6 can replace individual handlers at construction.
  */
 export function createMemorySyncDispatchHandlers(
-  provider: Pick<
-    DanielMemoryProvider,
-    "captureTurn" | "createExact" | "update" | "forget"
-  >,
+  provider: MemorySyncProvider,
   overrides: Partial<MemorySyncDispatchHandlers> = {},
 ): MemorySyncDispatchHandlers {
   const defaults: MemorySyncDispatchHandlers = {
@@ -364,14 +248,20 @@ export function createMemorySyncDispatchHandlers(
           containerTag: job.containerTag,
         }),
       ),
-    image: async (payload, job) =>
-      documentSubmission(
-        await provider.captureTurn({
+    image: async (payload, job) => {
+      if (!provider.uploadImageJob) {
+        throw new MemorySyncPayloadError(
+          `memory sync image job ${job.jobId} has no image upload handler`,
+        );
+      }
+      return documentSubmission(
+        await provider.uploadImageJob({
           ...payload,
           containerTag: job.containerTag,
           customId: requireCustomId(job),
         }),
-      ),
+      );
+    },
     memory_update: async (payload, job) =>
       memorySubmission([
         await provider.update({
@@ -380,10 +270,12 @@ export function createMemorySyncDispatchHandlers(
         }),
       ]),
     memory_forget: async (payload, job) => {
-      await provider.forget({
-        ...payload,
-        containerTag: job.containerTag,
-      });
+      if (!provider.forgetMany) {
+        throw new MemorySyncPayloadError(
+          `memory sync memory_forget job ${job.jobId} has no bulk forget handler`,
+        );
+      }
+      await provider.forgetMany({ ...payload, containerTag: job.containerTag });
       return {};
     },
   };
@@ -507,10 +399,7 @@ function randomWorkerId(): string {
 export interface MemorySyncWorkerDependencies {
   jobs: MemorySyncJobsStore;
   providerState: MemoryProviderStateWriter;
-  provider: Pick<
-    DanielMemoryProvider,
-    "captureTurn" | "createExact" | "update" | "forget"
-  >;
+  provider: MemorySyncProvider;
   handlers?: Partial<MemorySyncDispatchHandlers>;
   ensureContainerSettings?: (containerTag: string) => Promise<unknown>;
   now?: () => number;
@@ -770,7 +659,10 @@ export function startMemorySyncWorker(
 type MemorySyncProvider = Pick<
   DanielMemoryProvider,
   "captureTurn" | "createExact" | "update" | "forget"
->;
+> & {
+  uploadImageJob?: (input: ImageJobInput) => Promise<ProviderDocumentResult>;
+  forgetMany?: (input: MemoryForgetJobInput) => Promise<void>;
+};
 
 type Environment = Record<string, string | undefined>;
 
@@ -893,19 +785,25 @@ export interface MemorySyncBacklogSummary {
   pending: number;
   processing: number;
   submitted: number;
+  completed: number;
   failed: number;
   deadLetter: number;
   total: number;
 }
 
-function numberField(record: Record<string, unknown>, ...keys: string[]): number {
+function optionalNumberField(
+  record: Record<string, unknown>,
+  ...keys: string[]
+): number | undefined {
   for (const key of keys) {
-    if (typeof record[key] === "number") return record[key] as number;
+    if (typeof record[key] === "number" && Number.isFinite(record[key])) {
+      return Math.max(0, record[key] as number);
+    }
   }
-  return 0;
+  return undefined;
 }
 
-function normalizeBacklog(value: unknown): MemorySyncBacklogSummary {
+export function normalizeBacklog(value: unknown): MemorySyncBacklogSummary {
   const record = asObject(value) ?? {};
   const counts = asObject(record.counts) ?? record;
   const count = (...keys: string[]): number => {
@@ -920,17 +818,23 @@ function normalizeBacklog(value: unknown): MemorySyncBacklogSummary {
   const pending = count("pending");
   const processing = count("processing");
   const submitted = count("submitted");
+  const completed = count("completed");
   const failed = count("failed");
   const deadLetter = count("deadLetter", "dead_letter");
+  const suppliedTotal = optionalNumberField(record, "total");
+  const suppliedActive = optionalNumberField(record, "active");
   return {
     pending,
     processing,
     submitted,
+    completed,
     failed,
     deadLetter,
     total:
-      numberField(record, "total", "active") + deadLetter ||
-      pending + processing + submitted + failed + deadLetter,
+      suppliedTotal ??
+      (suppliedActive !== undefined
+        ? suppliedActive + deadLetter
+        : pending + processing + submitted + completed + failed + deadLetter),
   };
 }
 

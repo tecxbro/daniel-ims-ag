@@ -85,7 +85,7 @@ describe("Implementation 8 runtime cutover", () => {
 
   it("uses durable capture and has no active legacy extraction path", () => {
     const interactionSource = source("server/interaction-agent.ts");
-    expect(interactionSource).toContain("enqueueRawTurnCapture({");
+    expect(interactionSource).toContain("finalizeAssistantTurnCapture({");
     expect(interactionSource).toContain('opts.kind === "proactive"');
     expect(interactionSource).not.toContain('from "./memory/extract.js"');
     expect(interactionSource).not.toContain("extractAndStore(");

@@ -25,6 +25,8 @@ import type * as memoryImageAnchors from "../memoryImageAnchors.js";
 import type * as memoryMigration from "../memoryMigration.js";
 import type * as memoryPendingOperations from "../memoryPendingOperations.js";
 import type * as memoryProviderState from "../memoryProviderState.js";
+import type * as memoryProviderMetrics from "../memoryProviderMetrics.js";
+import type * as memoryProviderEvents from "../memoryProviderEvents.js";
 import type * as memoryRecords from "../memoryRecords.js";
 import type * as memorySyncJobs from "../memorySyncJobs.js";
 import type * as messageDedup from "../messageDedup.js";
@@ -56,6 +58,8 @@ declare const fullApi: ApiFromModules<{
   memoryMigration: typeof memoryMigration;
   memoryPendingOperations: typeof memoryPendingOperations;
   memoryProviderState: typeof memoryProviderState;
+  memoryProviderMetrics: typeof memoryProviderMetrics;
+  memoryProviderEvents: typeof memoryProviderEvents;
   memoryRecords: typeof memoryRecords;
   memorySyncJobs: typeof memorySyncJobs;
   messageDedup: typeof messageDedup;

@@ -8,6 +8,10 @@ import {
   SupermemoryProviderError,
 } from "./client.js";
 import {
+  inspectCaptureRecoveryJournal,
+  type CaptureRecoveryStatus,
+} from "./capture-recovery.js";
+import {
   deriveMemoryIdentity,
   MemoryIdentityConfigurationError,
   validateProviderIdentifier,
@@ -18,12 +22,19 @@ import type {
   MemoryOwnerContext,
   MemorySearchResult,
 } from "./types.js";
+import {
+  recordProviderRead,
+  type ProviderReadOperation,
+} from "./provider-observability.js";
 
 type Environment = Record<string, string | undefined>;
 type RetryableJobStatus = "failed" | "dead_letter";
 
 interface MemoryRouteProvider
-  extends Pick<DanielMemoryProvider, "profile" | "search" | "listDocuments"> {}
+  extends Pick<
+    DanielMemoryProvider,
+    "profile" | "search" | "listDocuments" | "listMemories"
+  > {}
 
 export interface MemoryRouteControlPlane {
   getProviderState(): Promise<unknown>;
@@ -50,6 +61,8 @@ export interface CreateSupermemoryRouterOptions {
   /** Tests and a future authenticated parent router may provide an equivalent boundary. */
   localOnly?: boolean;
   now?: () => number;
+  getRecoveryStatus?: () => Promise<CaptureRecoveryStatus>;
+  recordProviderRead?: typeof recordProviderRead;
 }
 
 interface MemoryRoutesApi {
@@ -327,26 +340,40 @@ function nonNegativeCount(value: unknown): number {
     : 0;
 }
 
-function normalizeBacklog(value: unknown): Record<string, number | boolean> | null {
+export function normalizeBacklog(value: unknown): Record<string, number | boolean> | null {
   const backlog = asRecord(value);
   if (!backlog) return null;
   const counts = asRecord(backlog.counts) ?? backlog;
   const pending = nonNegativeCount(counts.pending);
   const processing = nonNegativeCount(counts.processing);
   const submitted = nonNegativeCount(counts.submitted);
+  const completed = nonNegativeCount(counts.completed);
   const failed = nonNegativeCount(counts.failed);
   const deadLetter = Math.max(
     nonNegativeCount(counts.deadLetter),
     nonNegativeCount(counts.dead_letter),
   );
+  const suppliedTotal =
+    typeof backlog.total === "number" && Number.isFinite(backlog.total)
+      ? Math.max(0, Math.floor(backlog.total))
+      : undefined;
+  const suppliedActive =
+    typeof backlog.active === "number" && Number.isFinite(backlog.active)
+      ? Math.max(0, Math.floor(backlog.active))
+      : undefined;
   return {
     pending,
     processing,
     submitted,
+    completed,
     failed,
     deadLetter,
-    active: nonNegativeCount(backlog.active) || pending + processing + submitted + failed,
-    total: nonNegativeCount(backlog.total) || pending + processing + submitted + failed + deadLetter,
+    active: suppliedActive ?? pending + processing + submitted + failed,
+    total:
+      suppliedTotal ??
+      (suppliedActive !== undefined
+        ? suppliedActive + deadLetter
+        : pending + processing + submitted + completed + failed + deadLetter),
     truncated: backlog.truncated === true,
   };
 }
@@ -404,11 +431,17 @@ export function createSupermemoryRouter(
   const env = options.env ?? process.env;
   const controlPlane = options.controlPlane ?? createDefaultControlPlane();
   const now = options.now ?? Date.now;
+  const getRecoveryStatus = options.getRecoveryStatus ?? inspectCaptureRecoveryJournal;
   const resolveOwner =
     options.resolveOwner ?? (() => resolveConfiguredOwner(env, controlPlane));
   const getProvider =
     options.getProvider ??
     (() => (options.provider === undefined ? getSupermemoryProvider() : options.provider));
+  const recordRead =
+    options.recordProviderRead ??
+    (options.provider === undefined && options.getProvider === undefined
+      ? recordProviderRead
+      : async () => undefined);
 
   if (options.localOnly !== false) router.use(requireLocalRequest);
 
@@ -426,13 +459,29 @@ export function createSupermemoryRouter(
     return provider;
   };
 
+  const observedProviderRead = async <T>(
+    operation: ProviderReadOperation,
+    run: () => Promise<T>,
+  ): Promise<T> => {
+    const startedAt = now();
+    try {
+      const result = await run();
+      await recordRead({ operation, startedAt, finishedAt: now() });
+      return result;
+    } catch (error) {
+      await recordRead({ operation, startedAt, finishedAt: now(), error });
+      throw error;
+    }
+  };
+
   router.get(
     "/provider-status",
     route(async (_request, response) => {
       const config = readMemoryProviderConfiguration(env);
-      const [providerStateResult, backlogResult] = await Promise.allSettled([
+      const [providerStateResult, backlogResult, recoveryResult] = await Promise.allSettled([
         controlPlane.getProviderState(),
         controlPlane.getBacklog(),
+        getRecoveryStatus(),
       ]);
       const state =
         providerStateResult.status === "fulfilled"
@@ -461,9 +510,14 @@ export function createSupermemoryRouter(
           hasError: typeof state?.lastError === "string" && state.lastError.length > 0,
         },
         backlog,
+        recoveryJournal:
+          recoveryResult.status === "fulfilled"
+            ? recoveryResult.value
+            : { unresolvedCount: null, oldestCreatedAt: null, oldestAgeMs: null },
         availability: {
           providerState: providerStateResult.status === "fulfilled",
           backlog: backlogResult.status === "fulfilled",
+          recoveryJournal: recoveryResult.status === "fulfilled",
         },
         checkedAt: now(),
       });
@@ -477,13 +531,18 @@ export function createSupermemoryRouter(
       const q = optionalString(request.query.q, "q", MAX_QUERY_LENGTH);
       const threshold = optionalNumber(request.query.threshold, "threshold", 0, 1);
       const profile = normalizeProfile(
-        await providerForRequest().profile({
+        await observedProviderRead("profile", () => providerForRequest().profile({
           containerTag: owner.containerTag,
           ...(q ? { q } : {}),
           ...(threshold === undefined ? {} : { threshold }),
-        }),
+        })),
       );
-      response.json({ ok: true, ...profile });
+      const factCount = profile.profile.static.length + profile.profile.dynamic.length;
+      response.json({
+        ok: true,
+        profileState: factCount > 0 ? "ready" : "empty",
+        ...profile,
+      });
     }),
   );
 
@@ -504,13 +563,13 @@ export function createSupermemoryRouter(
         throw new MemoryRouteError(400, "invalid_request", "searchMode is invalid.");
       }
       const results = normalizeResults(
-        await providerForRequest().search({
+        await observedProviderRead("search", () => providerForRequest().search({
           containerTag: owner.containerTag,
           q,
           searchMode,
           ...(threshold === undefined ? {} : { threshold }),
           ...(limit === undefined ? {} : { limit }),
-        }),
+        })),
       );
       response.json({ ok: true, provider: "supermemory", searchMode, results });
     }),
@@ -519,19 +578,61 @@ export function createSupermemoryRouter(
   router.get(
     "/documents",
     route(async (request, response) => {
+      if (request.query.q !== undefined) {
+        throw new MemoryRouteError(
+          400,
+          "invalid_request",
+          "Document browse does not accept q; use memory search with searchMode documents.",
+        );
+      }
       const owner = await ownerFor(request);
       const page = optionalNumber(request.query.page, "page", 1, 100_000, true);
       const limit = optionalNumber(request.query.limit, "limit", 1, 100, true);
-      const result = await providerForRequest().listDocuments({
+      const result = await observedProviderRead("documents", () =>
+        providerForRequest().listDocuments({
         containerTag: owner.containerTag,
         ...(page === undefined ? {} : { page }),
         ...(limit === undefined ? {} : { limit }),
-      });
+        }),
+      );
       response.json({
         ok: true,
         provider: "supermemory",
         ...result,
       });
+    }),
+  );
+
+  router.get(
+    "/entries",
+    route(async (request, response) => {
+      const owner = await ownerFor(request);
+      const page = optionalNumber(request.query.page, "page", 1, 100_000, true);
+      const limit = optionalNumber(request.query.limit, "limit", 1, 100, true);
+      const order = request.query.order ?? "desc";
+      const sort = request.query.sort ?? "updatedAt";
+      if (order !== "asc" && order !== "desc") {
+        throw new MemoryRouteError(400, "invalid_request", "order is invalid.");
+      }
+      if (sort !== "createdAt" && sort !== "updatedAt") {
+        throw new MemoryRouteError(400, "invalid_request", "sort is invalid.");
+      }
+      const provider = providerForRequest();
+      if (!provider.listMemories) {
+        throw new MemoryRouteError(
+          503,
+          "provider_unavailable",
+          "Memory history is unavailable from the configured provider.",
+        );
+      }
+      const result = await observedProviderRead("entries", () => provider.listMemories!({
+        containerTag: owner.containerTag,
+        ...(page === undefined ? {} : { page }),
+        ...(limit === undefined ? {} : { limit }),
+        order,
+        sort,
+      }));
+      response.json({ ok: true, provider: "supermemory", ...result });
     }),
   );
 

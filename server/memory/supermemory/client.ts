@@ -6,10 +6,12 @@ import Supermemory, {
 } from "supermemory";
 import { validateProviderIdentifier } from "./identity.js";
 import {
+  fetchConvexImageBytes,
   SupermemoryOperationTransport,
   SupermemoryProviderError,
 } from "./operations.js";
 export { SupermemoryProviderError } from "./operations.js";
+import type { ImageJobInput, MemoryForgetJobInput } from "./job-contract.js";
 import type {
   CaptureTurnInput,
   CreateExactMemoryInput,
@@ -19,11 +21,15 @@ import type {
   MemoryProviderConfiguration,
   MemoryReadMode,
   MemorySearchResult,
+  MemoryVersionHistoryItem,
   MemoryWriteMode,
   ListDocumentsInput,
+  ListMemoryEntriesInput,
   ProfileInput,
   ProviderDocumentPage,
   ProviderDocumentResult,
+  ProviderMemoryEntry,
+  ProviderMemoryEntryPage,
   ProviderMemoryResult,
   SearchInput,
   UpdateMemoryInput,
@@ -293,6 +299,61 @@ function mapSearchResult(value: unknown): MemorySearchResult | null {
   };
 }
 
+function nullableString(value: unknown): string | null {
+  return typeof value === "string" ? value : null;
+}
+
+function mapMemoryHistoryItem(value: unknown): MemoryVersionHistoryItem | null {
+  const item = asRecord(value);
+  if (
+    !item ||
+    typeof item.id !== "string" ||
+    typeof item.memory !== "string" ||
+    typeof item.version !== "number" ||
+    typeof item.isLatest !== "boolean" ||
+    typeof item.isForgotten !== "boolean"
+  ) {
+    return null;
+  }
+  return {
+    id: item.id,
+    content: item.memory,
+    version: item.version,
+    createdAt: typeof item.createdAt === "string" ? item.createdAt : undefined,
+    updatedAt: typeof item.updatedAt === "string" ? item.updatedAt : undefined,
+    parentMemoryId: nullableString(item.parentMemoryId),
+    rootMemoryId: nullableString(item.rootMemoryId),
+    isLatest: item.isLatest,
+    isForgotten: item.isForgotten,
+  };
+}
+
+function mapMemoryEntry(value: unknown): ProviderMemoryEntry | null {
+  const entry = asRecord(value);
+  const base = mapMemoryHistoryItem(value);
+  if (!entry || !base) return null;
+  return {
+    ...base,
+    isStatic: entry.isStatic === true,
+    isInference: entry.isInference === true,
+    sourceCount:
+      typeof entry.sourceCount === "number" && Number.isFinite(entry.sourceCount)
+        ? Math.max(0, Math.floor(entry.sourceCount))
+        : 0,
+    forgetAfter: nullableString(entry.forgetAfter),
+    forgetReason: nullableString(entry.forgetReason),
+    metadata: asRecord(entry.metadata),
+    history: Array.isArray(entry.history)
+      ? entry.history
+          .map(mapMemoryHistoryItem)
+          .filter((item): item is MemoryVersionHistoryItem => item !== null)
+      : [],
+    documentIds: Array.isArray(entry.documentIds)
+      ? entry.documentIds.filter((id): id is string => typeof id === "string")
+      : [],
+  };
+}
+
 function requiredString(record: Record<string, unknown>, key: string, operation: string): string {
   const value = record[key];
   if (typeof value !== "string" || !value) {
@@ -505,6 +566,53 @@ export class SupermemoryAdapter
     }
   }
 
+  async listMemories(input: ListMemoryEntriesInput): Promise<ProviderMemoryEntryPage> {
+    validateProviderIdentifier(input.containerTag, "containerTag");
+    const page = input.page ?? 1;
+    const limit = input.limit ?? 20;
+    const order = input.order ?? "desc";
+    const sort = input.sort ?? "updatedAt";
+    if (!Number.isInteger(page) || page < 1) {
+      throw new SupermemoryProviderError("memory entry page must be a positive integer", {
+        operation: "listMemories",
+        code: "configuration",
+      });
+    }
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+      throw new SupermemoryProviderError("memory entry limit must be between 1 and 100", {
+        operation: "listMemories",
+        code: "configuration",
+      });
+    }
+    const response = asRecord(
+      await this.requestJson(
+        "POST",
+        "/v4/memories/list",
+        { containerTags: [input.containerTag], page, limit, order, sort },
+        "listMemories",
+      ),
+    );
+    const pagination = asRecord(response?.pagination);
+    if (!response || !Array.isArray(response.memoryEntries) || !pagination) {
+      throw new SupermemoryProviderError(
+        "Supermemory listMemories returned an invalid response",
+        { operation: "listMemories" },
+      );
+    }
+    return {
+      entries: response.memoryEntries
+        .map(mapMemoryEntry)
+        .filter((entry): entry is ProviderMemoryEntry => entry !== null),
+      page:
+        typeof pagination.currentPage === "number" ? pagination.currentPage : page,
+      limit: typeof pagination.limit === "number" ? pagination.limit : limit,
+      totalItems:
+        typeof pagination.totalItems === "number" ? pagination.totalItems : 0,
+      totalPages:
+        typeof pagination.totalPages === "number" ? pagination.totalPages : 0,
+    };
+  }
+
   async createExact(input: CreateExactMemoryInput): Promise<ProviderMemoryResult[]> {
     return (await this.operationTransport.createExact(input)).memories;
   }
@@ -515,6 +623,35 @@ export class SupermemoryAdapter
 
   async forget(input: ForgetMemoryInput): Promise<void> {
     await this.operationTransport.forgetExact(input);
+  }
+
+  async forgetMany(input: MemoryForgetJobInput): Promise<void> {
+    const result = await this.operationTransport.applyExactForget(input);
+    const forgottenIds = new Set(result.forgotten.map((memory) => memory.id));
+    if (input.ids.some((id) => !forgottenIds.has(id))) {
+      throw new SupermemoryProviderError(
+        "Supermemory bulk forget did not confirm every exact memory ID",
+        { operation: "forgetMany" },
+      );
+    }
+  }
+
+  async uploadImageJob(input: ImageJobInput): Promise<ProviderDocumentResult> {
+    const image = await fetchConvexImageBytes(input.storageId);
+    const extension = image.mediaType.split("/")[1]?.replace("jpeg", "jpg") || "img";
+    return await this.operationTransport.uploadImage({
+      containerTag: input.containerTag,
+      customId: input.customId,
+      bytes: image.bytes,
+      mediaType: image.mediaType,
+      filename: `${input.customId}.${extension}`,
+      metadata: input.metadata ?? {
+        source: "daniel_durable_image",
+        reason: input.reason,
+        ...(input.turnId ? { turnId: input.turnId } : {}),
+        schemaVersion: 1,
+      },
+    });
   }
 
   async getContainerSettings(containerTag: string): Promise<ContainerTagSettings | null> {

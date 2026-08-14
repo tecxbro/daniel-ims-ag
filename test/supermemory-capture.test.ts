@@ -109,6 +109,7 @@ describe("durable Supermemory turn capture", () => {
     const payload = JSON.parse(row.payload);
     expect(payload).toEqual({
       schemaVersion: 1,
+      kind: "conversation_turn",
       ingestionStrategy: CONVERSATION_INGESTION_STRATEGY,
       providerInput: {
         content:

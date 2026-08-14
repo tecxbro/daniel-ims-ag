@@ -2,6 +2,7 @@ import { useQuery } from "convex/react";
 import { api } from "../../../convex/_generated/api.js";
 import { SupermemoryStatusBanner } from "./EmbeddingBanner.js";
 import { PanelPage, panelCardClass } from "./PanelPrimitives.js";
+import { useMemoryProfileState } from "../lib/memoryProfile.js";
 
 interface DashboardMetrics {
   messages: number;
@@ -14,7 +15,13 @@ interface DashboardMetrics {
     lastFailedSubmissionAt?: number;
     lastWorkerActivityAt?: number;
     lastError?: string;
-    profileState: "ready" | "empty" | "unavailable";
+  };
+  hydration: {
+    requests: number;
+    failures: number;
+    averageLatencyMs: number | null;
+    p95UpperBoundMs: number | null;
+    observedBuckets: number;
   };
   sync: {
     pending: number;
@@ -55,6 +62,7 @@ function time(value: number | undefined): string {
 
 export function DashboardPanel({ isDark }: { isDark: boolean }) {
   const data = useQuery(api.dashboard.metrics, {}) as DashboardMetrics | undefined;
+  const profileState = useMemoryProfileState();
 
   if (!data) {
     return <div className={`flex h-full items-center justify-center text-sm ${isDark ? "text-zinc-500" : "text-zinc-500"}`}>Loading dashboard…</div>;
@@ -86,7 +94,7 @@ export function DashboardPanel({ isDark }: { isDark: boolean }) {
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
           <Metric label="Provider health" value={data.memoryProvider.healthStatus} detail={data.memoryProvider.configured ? "Provider state initialized" : "No active provider state"} isDark={isDark} tone={data.memoryProvider.healthStatus === "healthy" ? "success" : "warning"} />
           <Metric label="Read / write mode" value={`${data.memoryProvider.readMode} / ${data.memoryProvider.writeMode}`} detail="Current semantic routing" isDark={isDark} />
-          <Metric label="Profile state" value={data.memoryProvider.profileState} detail="Open Memory for the live profile" isDark={isDark} />
+          <Metric label="Profile state" value={profileState} detail="Live provider profile response" isDark={isDark} />
           <Metric label="Last provider success" value={time(data.memoryProvider.lastSuccessfulSubmissionAt)} detail={data.memoryProvider.lastError || "No stored provider error"} isDark={isDark} />
         </div>
       </section>
@@ -110,10 +118,13 @@ export function DashboardPanel({ isDark }: { isDark: boolean }) {
           <p className={`mt-1 text-xs ${isDark ? "text-zinc-500" : "text-zinc-500"}`}>Unavailable values are shown explicitly; the dashboard does not infer provider analytics.</p>
         </div>
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
-          <Metric label="Hydration latency" value="Not reported" detail="No aggregate latency contract" isDark={isDark} />
-          <Metric label="Hydration error rate" value="Not reported" detail="No aggregate error contract" isDark={isDark} />
-          <Metric label="Document processing" value="Search available" detail="Inspect source documents in Memory" isDark={isDark} />
-          <Metric label="Memory versions" value="Provider-side" detail="Current and history render when returned" isDark={isDark} />
+          <Metric label="Hydration requests" value={compact(data.hydration.requests)} detail={`${data.hydration.observedBuckets} bounded hourly buckets`} isDark={isDark} />
+          {data.hydration.averageLatencyMs !== null && (
+            <Metric label="Average hydration latency" value={`${Math.round(data.hydration.averageLatencyMs)} ms`} detail={data.hydration.p95UpperBoundMs === null ? "P95 exceeds the highest bounded bucket" : `P95 ≤ ${data.hydration.p95UpperBoundMs} ms`} isDark={isDark} />
+          )}
+          {data.hydration.requests > 0 && (
+            <Metric label="Hydration error rate" value={`${((data.hydration.failures / data.hydration.requests) * 100).toFixed(1)}%`} detail={`${data.hydration.failures} failed requests`} isDark={isDark} tone={data.hydration.failures > 0 ? "warning" : "success"} />
+          )}
         </div>
       </section>
 

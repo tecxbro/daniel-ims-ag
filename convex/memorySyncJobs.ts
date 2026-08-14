@@ -3,7 +3,7 @@ import type { MutationCtx } from "./_generated/server";
 import type { Doc } from "./_generated/dataModel";
 import { v } from "convex/values";
 
-const jobKindValidator = v.union(
+export const jobKindValidator = v.union(
   v.literal("conversation_turn"),
   v.literal("explicit_memory"),
   v.literal("image"),
@@ -22,6 +22,19 @@ const jobStatusValidator = v.union(
 
 type MemorySyncJob = Doc<"memorySyncJobs">;
 type JobStatus = MemorySyncJob["status"];
+
+export interface EnqueueMemorySyncJobArgs {
+  jobId: string;
+  kind: MemorySyncJob["kind"];
+  ownerKey: string;
+  containerTag: string;
+  customId?: string;
+  conversationId?: string;
+  turnId?: string;
+  payload: string;
+  payloadHash: string;
+  now?: number;
+}
 
 const CLAIMABLE_STATUSES: readonly JobStatus[] = [
   "pending",
@@ -73,26 +86,36 @@ async function getByJobId(
  * Any existing row with the same hash is returned instead of creating a
  * second source job, including dead-letter rows (which must use retry()).
  */
-export const enqueue = mutation({
-  args: {
-    jobId: v.string(),
-    kind: jobKindValidator,
-    ownerKey: v.string(),
-    containerTag: v.string(),
-    customId: v.optional(v.string()),
-    conversationId: v.optional(v.string()),
-    turnId: v.optional(v.string()),
-    payload: v.string(),
-    payloadHash: v.string(),
-    now: v.optional(v.number()),
-  },
-  handler: async (ctx, args) => {
+export async function enqueueMemorySyncJob(
+  ctx: MutationCtx,
+  args: EnqueueMemorySyncJobArgs,
+) {
     const payloadHash = args.payloadHash.toLowerCase();
     if (!/^[a-f0-9]{64}$/.test(payloadHash)) {
       throw new Error("payloadHash must be a 64-character SHA-256 hex digest");
     }
     if (args.kind === "conversation_turn" && !args.turnId) {
       throw new Error("conversation_turn jobs require turnId");
+    }
+    let envelope: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(args.payload) as unknown;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("payload must be an object");
+      }
+      envelope = parsed as Record<string, unknown>;
+    } catch {
+      throw new Error("memory sync payload must be valid JSON");
+    }
+    if (envelope.schemaVersion !== 1 || envelope.kind !== args.kind) {
+      throw new Error("memory sync payload must use the canonical v1 job contract");
+    }
+    const providerInput = envelope.providerInput;
+    if (!providerInput || typeof providerInput !== "object" || Array.isArray(providerInput)) {
+      throw new Error("memory sync payload requires providerInput");
+    }
+    if ((providerInput as Record<string, unknown>).containerTag !== args.containerTag) {
+      throw new Error("memory sync payload containerTag does not match the durable job");
     }
 
     if (args.kind === "conversation_turn") {
@@ -149,7 +172,22 @@ export const enqueue = mutation({
     const job = await ctx.db.get(jobId);
     if (!job) throw new Error("memory sync job disappeared after enqueue");
     return { created: true, duplicate: false, job };
+}
+
+export const enqueue = mutation({
+  args: {
+    jobId: v.string(),
+    kind: jobKindValidator,
+    ownerKey: v.string(),
+    containerTag: v.string(),
+    customId: v.optional(v.string()),
+    conversationId: v.optional(v.string()),
+    turnId: v.optional(v.string()),
+    payload: v.string(),
+    payloadHash: v.string(),
+    now: v.optional(v.number()),
   },
+  handler: async (ctx, args) => await enqueueMemorySyncJob(ctx, args),
 });
 
 /**

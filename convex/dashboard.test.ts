@@ -29,17 +29,13 @@ describe("Implementation 9 dashboard operational truth", () => {
     const metrics = await t.query(api.dashboard.metrics, {});
 
     expect(metrics).not.toHaveProperty("memories");
-    expect(metrics.memoryProvider).toEqual({
+    expect(metrics.memoryProvider).toMatchObject({
       configured: false,
       healthStatus: "unconfigured",
       readMode: "convex",
       writeMode: "convex",
-      lastSuccessfulSubmissionAt: undefined,
-      lastFailedSubmissionAt: undefined,
-      lastWorkerActivityAt: undefined,
-      lastError: undefined,
-      profileState: "unavailable",
     });
+    expect(metrics.memoryProvider).not.toHaveProperty("profileState");
     expect(metrics.sync).toMatchObject({
       pending: 0,
       processing: 0,
@@ -144,8 +140,8 @@ describe("Implementation 9 dashboard operational truth", () => {
       lastFailedSubmissionAt: 1_000,
       lastWorkerActivityAt: 1_050,
       lastError: "provider timeout",
-      profileState: "unavailable",
     });
+    expect(metrics.memoryProvider).not.toHaveProperty("profileState");
     expect(metrics.sync).toMatchObject({
       pending: 1,
       processing: 1,

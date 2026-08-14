@@ -169,9 +169,42 @@ function providerSnapshot(state: Doc<"memoryProviderState"> | null) {
     lastFailedSubmissionAt: state?.lastFailedSubmissionAt,
     lastWorkerActivityAt: state?.lastWorkerActivityAt,
     lastError: state?.lastError,
-    // Convex stores provider/synchronization state, not a copy of the
-    // SuperMemory profile. The server-only profile route owns this truth.
-    profileState: "unavailable" as const,
+  };
+}
+
+function hydrationSnapshot(
+  buckets: Doc<"memoryProviderMetrics">[],
+) {
+  const requests = buckets.reduce((sum, bucket) => sum + bucket.requestCount, 0);
+  const failures = buckets.reduce((sum, bucket) => sum + bucket.failureCount, 0);
+  const totalLatencyMs = buckets.reduce(
+    (sum, bucket) => sum + bucket.totalLatencyMs,
+    0,
+  );
+  const histogram = Array<number>(6).fill(0);
+  for (const bucket of buckets) {
+    bucket.latencyBuckets.forEach((count, index) => {
+      histogram[index] = (histogram[index] ?? 0) + count;
+    });
+  }
+  const observedLatencies = histogram.reduce((sum, count) => sum + count, 0);
+  const percentileTarget = Math.ceil(observedLatencies * 0.95);
+  const bounds = [100, 250, 500, 1_000, 2_500, null] as const;
+  let cumulative = 0;
+  let p95UpperBoundMs: number | null = null;
+  for (let index = 0; index < histogram.length; index += 1) {
+    cumulative += histogram[index] ?? 0;
+    if (cumulative >= percentileTarget && percentileTarget > 0) {
+      p95UpperBoundMs = bounds[index] ?? null;
+      break;
+    }
+  }
+  return {
+    requests,
+    failures,
+    averageLatencyMs: requests === 0 ? null : totalLatencyMs / requests,
+    p95UpperBoundMs,
+    observedBuckets: buckets.length,
   };
 }
 
@@ -194,6 +227,8 @@ export const metrics = query({
       sync,
       migration,
       imageAnchors,
+      providerMetricBuckets,
+      providerEvents,
     ] = await Promise.all([
       ctx.db
         .query("messages")
@@ -219,6 +254,16 @@ export const metrics = query({
       readSyncSnapshot(ctx),
       readMigrationSnapshot(ctx),
       readImageAnchorSnapshot(ctx),
+      ctx.db
+        .query("memoryProviderMetrics")
+        .withIndex("by_bucket_start")
+        .order("desc")
+        .take(168),
+      ctx.db
+        .query("memoryProviderEvents")
+        .withIndex("by_created_at")
+        .order("desc")
+        .take(50),
     ]);
 
     const truncated =
@@ -301,6 +346,15 @@ export const metrics = query({
     return {
       messages: messages.length,
       memoryProvider: providerSnapshot(providerState),
+      hydration: hydrationSnapshot(providerMetricBuckets),
+      providerEvents: providerEvents.map((event) => ({
+        eventId: event.eventId,
+        operation: event.operation,
+        outcome: event.outcome,
+        latencyMs: event.latencyMs,
+        errorCode: event.errorCode,
+        createdAt: event.createdAt,
+      })),
       sync: sync.value,
       migration: migration.value,
       imageAnchors: imageAnchors.value,

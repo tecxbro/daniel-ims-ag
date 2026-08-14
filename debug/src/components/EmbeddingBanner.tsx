@@ -166,8 +166,14 @@ export function normalizeProviderStatus(value: unknown): ProviderStatus {
   const completed = count(backlog.completed ?? counts.completed);
   const failed = count(backlog.failed ?? counts.failed);
   const deadLetter = count(backlog.deadLetter ?? backlog.dead_letter ?? counts.dead_letter);
-  const active = count(backlog.active) || pending + processing + submitted + failed;
-  const total = count(backlog.total) || active + completed + deadLetter;
+  const active =
+    numberValue(backlog.active) === undefined
+      ? pending + processing + submitted + failed
+      : count(backlog.active);
+  const total =
+    numberValue(backlog.total) === undefined
+      ? active + completed + deadLetter
+      : count(backlog.total);
   const profileStateValue = text(raw.profileState ?? provider.profileState);
 
   return {

@@ -153,6 +153,45 @@ export interface ListDocumentsInput {
   limit?: number;
 }
 
+export interface MemoryVersionHistoryItem {
+  id: string;
+  content: string;
+  version: number;
+  createdAt?: string;
+  updatedAt?: string;
+  parentMemoryId: string | null;
+  rootMemoryId: string | null;
+  isLatest: boolean;
+  isForgotten: boolean;
+}
+
+export interface ProviderMemoryEntry extends MemoryVersionHistoryItem {
+  isStatic: boolean;
+  isInference: boolean;
+  sourceCount: number;
+  forgetAfter: string | null;
+  forgetReason: string | null;
+  metadata: Record<string, unknown> | null;
+  history: MemoryVersionHistoryItem[];
+  documentIds: string[];
+}
+
+export interface ProviderMemoryEntryPage {
+  entries: ProviderMemoryEntry[];
+  page: number;
+  limit: number;
+  totalItems: number;
+  totalPages: number;
+}
+
+export interface ListMemoryEntriesInput {
+  containerTag: string;
+  page?: number;
+  limit?: number;
+  order?: "asc" | "desc";
+  sort?: "createdAt" | "updatedAt";
+}
+
 export interface ProviderMemoryResult {
   id: string;
   content: string;
@@ -170,6 +209,7 @@ export interface DanielMemoryProvider {
   profile(input: ProfileInput): Promise<MemoryHydrationResult>;
   search(input: SearchInput): Promise<MemorySearchResult[]>;
   listDocuments(input: ListDocumentsInput): Promise<ProviderDocumentPage>;
+  listMemories?(input: ListMemoryEntriesInput): Promise<ProviderMemoryEntryPage>;
   captureTurn(input: CaptureTurnInput): Promise<ProviderDocumentResult>;
   createExact(input: CreateExactMemoryInput): Promise<ProviderMemoryResult[]>;
   update(input: UpdateMemoryInput): Promise<ProviderMemoryResult>;

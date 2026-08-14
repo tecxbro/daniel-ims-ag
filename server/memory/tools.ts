@@ -151,12 +151,15 @@ function asLegacyMemoryResult(value: unknown): LegacyMemoryResult | null {
 /**
  * The one legacy recall boundary used by both automatic shadow hydration and
  * the optional recall tool. It intentionally retains the old vector-first,
- * substring-fallback behavior and its access/event bookkeeping.
+ * substring-fallback behavior. Cutover callers are read-only by default;
+ * pre-cutover compatibility callers may request best-effort bookkeeping,
+ * which is isolated so telemetry can never erase a successful read.
  */
 export async function recallLegacyMemory(input: {
   conversationId: string;
   query: string;
   limit?: number;
+  bookkeeping?: "disabled" | "best_effort";
 }): Promise<LegacyMemoryRecall> {
   const limit = Math.max(1, Math.min(100, Math.floor(input.limit ?? DEFAULT_TOOL_SEARCH_LIMIT)));
   let results: LegacyMemoryResult[] = [];
@@ -186,17 +189,40 @@ export async function recallLegacyMemory(input: {
     mode = "substring";
   }
 
-  await Promise.all(
-    results.map((result) =>
-      convex.mutation(api.memoryRecords.markAccessed, { memoryId: result.memoryId }),
-    ),
-  );
-  await convex.mutation(api.memoryEvents.emit, {
-    eventType: "memory.recalled",
-    conversationId: input.conversationId,
-    data: JSON.stringify({ query: input.query, hits: results.length, mode }),
-  });
+  if (input.bookkeeping === "best_effort") {
+    await bestEffortLegacyRecallBookkeeping({
+      conversationId: input.conversationId,
+      query: input.query,
+      results,
+      mode,
+    });
+  }
   return { results, mode };
+}
+
+async function bestEffortLegacyRecallBookkeeping(input: {
+  conversationId: string;
+  query: string;
+  results: LegacyMemoryResult[];
+  mode: LegacyMemoryRecall["mode"];
+}): Promise<void> {
+  try {
+    await Promise.all(
+      input.results.map((result) =>
+        convex.mutation(api.memoryRecords.markAccessed, { memoryId: result.memoryId }),
+      ),
+    );
+    await convex.mutation(api.memoryEvents.emit, {
+      eventType: "memory.recalled",
+      conversationId: input.conversationId,
+      data: JSON.stringify({ query: input.query, hits: input.results.length, mode: input.mode }),
+    });
+  } catch (error) {
+    console.warn("[memory] legacy recall bookkeeping unavailable", {
+      errorName: error instanceof Error ? error.name : "UnknownError",
+      resultCount: input.results.length,
+    });
+  }
 }
 
 /** Legacy write path retained only for convex/dual rollback coverage. */

@@ -14,6 +14,11 @@ export default defineSchema({
   })
     .index("by_conversation", ["conversationId"])
     .index("by_conversation_turn", ["conversationId", "turnId"])
+    .index("by_conversation_id_and_turn_id_and_role", [
+      "conversationId",
+      "turnId",
+      "role",
+    ])
     .index("by_createdAt", ["createdAt"]),
 
   conversations: defineTable({
@@ -204,6 +209,32 @@ export default defineSchema({
   })
     .index("by_state_key", ["stateKey"])
     .index("by_container_tag", ["containerTag"]),
+
+  memoryProviderMetrics: defineTable({
+    bucketStart: v.number(),
+    requestCount: v.number(),
+    failureCount: v.number(),
+    totalLatencyMs: v.number(),
+    latencyBuckets: v.array(v.number()),
+    updatedAt: v.number(),
+  }).index("by_bucket_start", ["bucketStart"]),
+
+  memoryProviderEvents: defineTable({
+    eventId: v.string(),
+    operation: v.union(
+      v.literal("hydration"),
+      v.literal("profile"),
+      v.literal("search"),
+      v.literal("documents"),
+      v.literal("entries"),
+    ),
+    outcome: v.union(v.literal("success"), v.literal("failure")),
+    latencyMs: v.optional(v.number()),
+    errorCode: v.optional(v.string()),
+    createdAt: v.number(),
+  })
+    .index("by_event_id", ["eventId"])
+    .index("by_created_at", ["createdAt"]),
 
   executionAgents: defineTable({
     agentId: v.string(),

@@ -57,8 +57,8 @@ describe("Implementation 9 dashboard demo state", () => {
       healthStatus: "healthy",
       readMode: "supermemory",
       writeMode: "supermemory",
-      profileState: "unavailable",
     });
+    expect(metrics.memoryProvider).not.toHaveProperty("profileState");
     expect(metrics.sync).toMatchObject({
       pending: 2,
       processing: 1,

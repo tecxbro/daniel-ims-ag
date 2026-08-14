@@ -17,6 +17,14 @@ interface DashboardEventData {
     lastWorkerActivityAt?: number;
   };
   sync: { recentJobs: MemorySyncJobSummary[] };
+  providerEvents: Array<{
+    eventId: string;
+    operation: string;
+    outcome: "success" | "failure";
+    latencyMs?: number;
+    errorCode?: string;
+    createdAt: number;
+  }>;
   migration: {
     pending: number;
     migrated: number;
@@ -89,6 +97,21 @@ export function EventsPanel({ isDark }: { isDark: boolean }) {
   const events = useMemo(() => {
     if (!data) return [];
     const next = data.sync.recentJobs.flatMap(eventsForJob);
+    next.push(
+      ...data.providerEvents.map((event) => ({
+        id: event.eventId,
+        type: `memory.provider_${event.operation}`,
+        summary: `${event.operation} · ${event.outcome}`,
+        detail: [
+          event.latencyMs === undefined ? undefined : `${Math.round(event.latencyMs)} ms`,
+          event.errorCode ? `Error ${event.errorCode}` : undefined,
+        ]
+          .filter(Boolean)
+          .join(" · ") || undefined,
+        at: event.createdAt,
+        tone: event.outcome === "success" ? "success" as const : "warning" as const,
+      })),
+    );
     if (data.migration.total > 0) {
       next.push({
         id: "migration:verification",
@@ -126,16 +149,6 @@ export function EventsPanel({ isDark }: { isDark: boolean }) {
       stat={<HeaderPill isDark={isDark}>{events.length} recent</HeaderPill>}
       maxWidth="max-w-[1040px]"
     >
-      <aside
-        className={`rounded-2xl border px-4 py-3 text-xs leading-relaxed ${
-          isDark
-            ? "border-sky-400/20 bg-sky-400/10 text-sky-200"
-            : "border-sky-200 bg-sky-50 text-sky-800"
-        }`}
-      >
-        Provider reads are not stored as a per-request audit stream by the current status contract. This view shows persisted synchronization and verification evidence only.
-      </aside>
-
       {!data ? (
         <div className="space-y-2" aria-label="Loading memory events">
           {[1, 2, 3, 4].map((item) => (

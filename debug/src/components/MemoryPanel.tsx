@@ -16,6 +16,7 @@ type MemoryView = "profile" | "search" | "documents";
 type UnknownRecord = Record<string, unknown>;
 
 interface ProfileSnapshot {
+  state: "ready" | "empty";
   stable: string[];
   recent: string[];
   relevant: MemoryExplorerItem[];
@@ -62,7 +63,7 @@ function history(value: unknown): MemoryVersionSummary[] | undefined {
     return {
       id: text(raw.id ?? raw.memoryId),
       version: numberValue(raw.version) ?? text(raw.version),
-      content: text(raw.content ?? raw.text),
+      content: text(raw.content ?? raw.memory ?? raw.text),
       status: text(raw.status),
       createdAt: timestamp(raw.createdAt),
       updatedAt: timestamp(raw.updatedAt),
@@ -79,6 +80,7 @@ function explorerItem(value: unknown, index: number, kind: "memory" | "document"
     `${kind}:${index}`;
   const forgotten =
     raw.forgotten === true ||
+    raw.isForgotten === true ||
     metadata.forgotten === true ||
     text(raw.status)?.toLowerCase() === "forgotten" ||
     text(metadata.status)?.toLowerCase() === "forgotten" ||
@@ -88,7 +90,7 @@ function explorerItem(value: unknown, index: number, kind: "memory" | "document"
   return {
     id,
     title: text(raw.title ?? raw.name ?? raw.filename),
-    content: text(raw.content ?? raw.text ?? raw.summary ?? raw.excerpt),
+    content: text(raw.content ?? raw.memory ?? raw.text ?? raw.summary ?? raw.excerpt),
     status: text(raw.status ?? raw.processingStatus),
     current: typeof currentValue === "boolean" ? currentValue : forgotten ? false : undefined,
     forgotten,
@@ -112,6 +114,7 @@ function normalizeProfile(value: unknown): ProfileSnapshot {
   const profile = record(raw.profile);
   const relevantValues = raw.results ?? raw.memories ?? profile.memories;
   return {
+    state: raw.profileState === "ready" ? "ready" : "empty",
     stable: lines(profile.static ?? raw.staticProfile ?? raw.static),
     recent: lines(profile.dynamic ?? raw.dynamicProfile ?? raw.recentContext ?? raw.dynamic),
     relevant: Array.isArray(relevantValues)
@@ -148,6 +151,7 @@ export function MemoryPanel({ isDark }: { isDark: boolean }) {
   const [view, setView] = useState<MemoryView>("profile");
   const [profile, setProfile] = useState<ProfileSnapshot | null>(null);
   const [documents, setDocuments] = useState<MemoryExplorerItem[]>([]);
+  const [entries, setEntries] = useState<MemoryExplorerItem[]>([]);
   const [searchResults, setSearchResults] = useState<MemoryExplorerItem[]>([]);
   const [query, setQuery] = useState("");
   const [documentQuery, setDocumentQuery] = useState("");
@@ -156,6 +160,7 @@ export function MemoryPanel({ isDark }: { isDark: boolean }) {
   const [searching, setSearching] = useState(false);
   const [profileError, setProfileError] = useState<string | null>(null);
   const [documentsError, setDocumentsError] = useState<string | null>(null);
+  const [entriesError, setEntriesError] = useState<string | null>(null);
   const [documentsMessage, setDocumentsMessage] = useState("Enter a query to find source documents.");
   const [searchMessage, setSearchMessage] = useState("Enter a question to search provider memory.");
   const searchId = useId();
@@ -172,22 +177,30 @@ export function MemoryPanel({ isDark }: { isDark: boolean }) {
     }
   }, []);
 
-  const loadDocuments = useCallback(async (requestedQuery?: string, signal?: AbortSignal) => {
-    const normalizedQuery = (requestedQuery ?? documentQuery).trim();
-    if (!normalizedQuery) {
-      setDocumentsMessage("Enter a query before searching documents.");
-      return;
-    }
+  const loadDocuments = useCallback(async (requestedQuery = "", signal?: AbortSignal) => {
+    const normalizedQuery = requestedQuery.trim();
     setLoadingDocuments(true);
     try {
-      const params = new URLSearchParams({ q: normalizedQuery, limit: "50" });
+      const response = normalizedQuery
+        ? await fetch("/api/memory/search", {
+            method: "POST",
+            headers: { Accept: "application/json", "Content-Type": "application/json" },
+            body: JSON.stringify({ q: normalizedQuery, limit: 50, searchMode: "documents" }),
+            signal,
+          }).then(async (result) => {
+            if (!result.ok) throw new Error(`Document search failed (${result.status})`);
+            return await result.json();
+          })
+        : await getJson("/api/memory/documents?page=1&limit=50", signal);
       const results = normalizeList(
-        await getJson(`/api/memory/documents?${params.toString()}`, signal),
+        response,
         "document",
       );
       setDocuments(results);
       setDocumentsError(null);
-      setDocumentsMessage(`${results.length} ${results.length === 1 ? "document" : "documents"} found.`);
+      setDocumentsMessage(
+        `${results.length} ${results.length === 1 ? "document" : "documents"} ${normalizedQuery ? "found" : "browsed"}.`,
+      );
     } catch (cause) {
       if (!signal?.aborted) {
         const message = cause instanceof Error ? cause.message : String(cause);
@@ -197,13 +210,30 @@ export function MemoryPanel({ isDark }: { isDark: boolean }) {
     } finally {
       if (!signal?.aborted) setLoadingDocuments(false);
     }
-  }, [documentQuery]);
+  }, []);
+
+  const loadEntries = useCallback(async (signal?: AbortSignal) => {
+    try {
+      const value = await getJson(
+        "/api/memory/entries?page=1&limit=50&order=desc&sort=updatedAt",
+        signal,
+      );
+      setEntries(normalizeList(record(value).entries ?? value, "memory"));
+      setEntriesError(null);
+    } catch (cause) {
+      if (!signal?.aborted) {
+        setEntriesError(cause instanceof Error ? cause.message : String(cause));
+      }
+    }
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
     void loadProfile(controller.signal);
+    void loadEntries(controller.signal);
+    void loadDocuments("", controller.signal);
     return () => controller.abort();
-  }, [loadProfile]);
+  }, [loadDocuments, loadEntries, loadProfile]);
 
   async function submitSearch(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -318,6 +348,22 @@ export function MemoryPanel({ isDark }: { isDark: boolean }) {
               <MemorySourceExplorer items={profile.relevant} isDark={isDark} emptyMessage="No linked results." />
             </section>
           )}
+
+          <section className={panelCardClass(isDark, "overflow-hidden")}>
+            <div className={`border-b px-5 py-3 ${isDark ? "border-white/10" : "border-zinc-200"}`}>
+              <h2 className={`text-sm font-semibold ${isDark ? "text-zinc-100" : "text-zinc-950"}`}>
+                Current and historical memory entries
+              </h2>
+              <p className={`mt-0.5 text-xs ${isDark ? "text-zinc-500" : "text-zinc-500"}`}>
+                Current, forgotten, and version-history state comes from the provider history endpoint.
+              </p>
+            </div>
+            {entriesError ? (
+              <ErrorState message={`Memory history unavailable: ${entriesError}`} onRetry={() => void loadEntries()} isDark={isDark} />
+            ) : (
+              <MemorySourceExplorer items={entries} isDark={isDark} emptyMessage="No memory entries yet." />
+            )}
+          </section>
         </div>
       )}
 
@@ -395,7 +441,7 @@ export function MemoryPanel({ isDark }: { isDark: boolean }) {
                     isDark ? "bg-zinc-100 text-zinc-950 hover:bg-white" : "bg-zinc-950 text-white hover:bg-zinc-800"
                   }`}
                 >
-                  {loadingDocuments ? "Searching…" : "Search documents"}
+                  {loadingDocuments ? "Loading…" : documentQuery.trim() ? "Search documents" : "Browse documents"}
                 </button>
               </form>
               <p role="status" aria-live="polite" className={`mt-2 text-xs ${isDark ? "text-zinc-500" : "text-zinc-500"}`}>

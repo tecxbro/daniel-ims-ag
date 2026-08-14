@@ -6,27 +6,22 @@ import {
   deriveMemoryIdentity,
   memoryIdSaltFingerprint,
 } from "./identity.js";
+import {
+  buildConversationTurnJobPayload,
+  CONVERSATION_INGESTION_STRATEGY,
+  parseMemorySyncJobPayload,
+  stableJson,
+  type ConversationTurnJobPayload,
+  type MemorySyncJobKind,
+} from "./job-contract.js";
 import type {
-  CaptureTurnInput,
   MemoryOwnerContext,
   MemoryWriteMode,
   ProviderMetadata,
 } from "./types.js";
 
-export const CONVERSATION_INGESTION_STRATEGY = "delta_turn_v1" as const;
-
-export type MemorySyncJobKind =
-  | "conversation_turn"
-  | "explicit_memory"
-  | "image"
-  | "memory_update"
-  | "memory_forget";
-
-export interface ConversationTurnJobPayload {
-  schemaVersion: 1;
-  ingestionStrategy: typeof CONVERSATION_INGESTION_STRATEGY;
-  providerInput: CaptureTurnInput;
-}
+export { CONVERSATION_INGESTION_STRATEGY };
+export type { ConversationTurnJobPayload, MemorySyncJobKind };
 
 export interface EnqueueMemorySyncJobInput {
   jobId: string;
@@ -101,15 +96,20 @@ export interface RawTurnCaptureDependencies {
   createJobId?: () => string;
 }
 
-function stableJson(value: unknown): string {
-  if (value === null || typeof value !== "object") return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
-  const record = value as Record<string, unknown>;
-  return `{${Object.keys(record)
-    .sort()
-    .map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`)
-    .join(",")}}`;
-}
+export type PrepareRawTurnCaptureDependencies = Omit<
+  RawTurnCaptureDependencies,
+  "jobStore"
+>;
+
+export type PreparedRawTurnCapture =
+  | {
+      capture: { enqueued: false; reason: "write_mode_disabled" | "synthetic_proactive" };
+      job: null;
+    }
+  | {
+      capture: Omit<Extract<RawTurnCaptureResult, { jobId: string }>, "enqueued" | "duplicate">;
+      job: EnqueueMemorySyncJobInput;
+    };
 
 export function buildRawTurnContent(input: {
   turnId: string;
@@ -145,20 +145,24 @@ export function buildConversationTurnPayload(input: {
     hasImages: imageCount > 0,
     imageCount,
   };
-  return {
-    schemaVersion: 1,
-    ingestionStrategy: CONVERSATION_INGESTION_STRATEGY,
-    providerInput: {
+  return buildConversationTurnJobPayload({
       content: buildRawTurnContent(input),
       containerTag: input.identity.containerTag,
       customId: input.identity.customId,
       taskType: "memory",
       metadata,
-    },
-  };
+    });
 }
 
 export function normalizeMemorySyncPayload(payload: unknown): string {
+  if (payload && typeof payload === "object" && "kind" in payload) {
+    const envelope = payload as ConversationTurnJobPayload;
+    parseMemorySyncJobPayload(envelope, {
+      kind: envelope.kind,
+      containerTag: envelope.providerInput.containerTag,
+      customId: envelope.providerInput.customId,
+    });
+  }
   return stableJson(payload);
 }
 
@@ -181,12 +185,34 @@ export async function captureRawTurn(
   input: RawTurnCaptureInput,
   dependencies: RawTurnCaptureDependencies,
 ): Promise<RawTurnCaptureResult> {
+  const prepared = await prepareRawTurnCapture(input, dependencies);
+  if (!prepared.job) return prepared.capture;
+  const result = await dependencies.jobStore.enqueue(prepared.job);
+
+  return {
+    ...prepared.capture,
+    enqueued: result.enqueued,
+    duplicate: result.duplicate,
+    jobId: result.jobId,
+  };
+}
+
+export async function prepareRawTurnCapture(
+  input: RawTurnCaptureInput,
+  dependencies: PrepareRawTurnCaptureDependencies,
+): Promise<PreparedRawTurnCapture> {
   if (input.kind === "proactive") {
-    return { enqueued: false, reason: "synthetic_proactive" };
+    return {
+      capture: { enqueued: false, reason: "synthetic_proactive" },
+      job: null,
+    };
   }
   const writeMode = dependencies.writeMode ?? readMemoryProviderConfiguration().writeMode;
   if (writeMode === "convex") {
-    return { enqueued: false, reason: "write_mode_disabled" };
+    return {
+      capture: { enqueued: false, reason: "write_mode_disabled" },
+      job: null,
+    };
   }
 
   const currentSaltFingerprint = memoryIdSaltFingerprint(dependencies.memoryIdSalt);
@@ -222,7 +248,7 @@ export async function captureRawTurn(
     normalizedPayload,
   });
   const jobId = dependencies.createJobId?.() ?? `memory-sync-${randomUUID()}`;
-  const result = await dependencies.jobStore.enqueue({
+  const job: EnqueueMemorySyncJobInput = {
     jobId,
     kind: "conversation_turn",
     ownerKey: identity.ownerKey,
@@ -233,14 +259,11 @@ export async function captureRawTurn(
     payload: normalizedPayload,
     payloadHash,
     now: (dependencies.now ?? Date.now)(),
-  });
+  };
 
   return {
-    enqueued: result.enqueued,
-    duplicate: result.duplicate,
-    jobId: result.jobId,
-    payloadHash,
-    identity,
+    capture: { jobId, payloadHash, identity },
+    job,
   };
 }
 

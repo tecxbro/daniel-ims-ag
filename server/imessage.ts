@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { api } from "../convex/_generated/api.js";
 import { convex } from "./convex-client.js";
 import { handleUserMessage } from "./interaction-agent.js";
-import { enqueueRawTurnCapture } from "./memory/supermemory/capture.js";
+import { finalizeAssistantTurnCapture } from "./memory/supermemory/capture-recovery.js";
 import { broadcast } from "./broadcast.js";
 import { validateImageHeader, MAX_IMAGE_BYTES, type ImageMediaType } from "./images/mime.js";
 import { Spectrum, type Message, type Space } from "spectrum-ts";
@@ -310,6 +310,7 @@ async function handleSpectrumMessage(space: Space, message: Message): Promise<vo
   });
 
   const stopTyping = startTypingLoop(space);
+  let deliveredTurn = false;
   try {
     const reply = await handleUserMessage({
       conversationId,
@@ -332,13 +333,8 @@ async function handleSpectrumMessage(space: Space, message: Message): Promise<vo
         console.error(`[turn ${turnTag}] reply was not fully delivered; skipping memory capture`);
         return;
       }
-      await convex.mutation(api.messages.send, {
-        conversationId,
-        role: "assistant",
-        content: reply,
-        turnId,
-      });
-      await enqueueRawTurnCapture({
+      deliveredTurn = true;
+      await finalizeAssistantTurnCapture({
         conversationId,
         memoryOwnerId: fromNumber,
         turnId,
@@ -347,14 +343,13 @@ async function handleSpectrumMessage(space: Space, message: Message): Promise<vo
         imageStorageIds: ingested.map((image) => image.storageId),
         kind: "user",
         channel: "imessage",
-      }).catch((err) => {
-        console.error("[supermemory-capture] durable enqueue failed", err);
       });
     } else {
       console.log(`[turn ${turnTag}] -> (no reply)`);
     }
   } catch (err) {
     console.error(`[turn ${turnTag}] handler error`, err);
+    if (deliveredTurn) throw err;
   } finally {
     stopTyping();
   }
