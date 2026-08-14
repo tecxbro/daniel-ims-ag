@@ -2,6 +2,7 @@ import { useState, type ReactNode } from "react";
 import { useQuery } from "convex/react";
 import { api } from "../../../convex/_generated/api.js";
 import { IntegrationLogo, BrailleIndicator, prettyToolName } from "../lib/branding.js";
+import { SegmentedControl } from "./GlassPrimitives.js";
 import {
   EmptyState,
   HeaderPill,
@@ -482,33 +483,20 @@ export function AgentsPanel({ isDark }: { isDark: boolean }) {
       description="Top-level and delegated agent runs, with live status and tool traces."
       stat={<HeaderPill isDark={isDark}>{activeCount} active</HeaderPill>}
       action={
-        <div
-          className={`segmented-control flex items-center rounded-2xl border p-1 ${
-            isDark ? "border-white/10 bg-[#17171a]" : "border-zinc-200 bg-zinc-100"
-          }`}
-        >
-          {["all", "running", "completed", "failed"].map((s) => (
-            <button
-              key={s}
-              onClick={() => setStatusFilter(s)}
-              className={`segmented-button rounded-xl px-2.5 py-1 text-xs capitalize ${
-                statusFilter === s
-                  ? isDark
-                    ? "bg-zinc-100 text-zinc-950 shadow-sm"
-                    : "bg-white text-zinc-950 shadow-sm"
-                  : isDark
-                    ? "text-zinc-400 hover:bg-white/5 hover:text-zinc-200"
-                    : "text-zinc-500 hover:bg-white/70 hover:text-zinc-800"
-              }`}
-            >
-              {s}
-            </button>
-          ))}
-        </div>
+        <SegmentedControl
+          lensId="agents-status"
+          label="Agent status"
+          value={statusFilter}
+          onChange={setStatusFilter}
+          options={["all", "running", "completed", "failed"].map((status) => ({
+            value: status,
+            label: status[0].toUpperCase() + status.slice(1),
+          }))}
+        />
       }
     >
 
-      <div className="space-y-3">
+      <div className="source-table" role="list" aria-label="Agent runs">
         {agents === undefined ? (
           <div className="space-y-3">
             {[1, 2, 3].map((i) => (
@@ -533,7 +521,15 @@ export function AgentsPanel({ isDark }: { isDark: boolean }) {
               <div
                 key={agent._id}
                 onClick={() => setSelected(agent.agentId)}
-                className={`${panelCardClass(isDark, "cursor-pointer px-4 py-3.5 transition-colors fade-in")} ${hoverBg}`}
+                role="button"
+                tabIndex={0}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    setSelected(agent.agentId);
+                  }
+                }}
+                className={`${panelCardClass(isDark, "source-row cursor-pointer px-4 py-3.5 transition-colors fade-in")} ${hoverBg}`}
               >
                 <div className="flex items-center gap-2.5 mb-1.5">
                   <span className="relative flex h-2.5 w-2.5 shrink-0">

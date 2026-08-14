@@ -4,6 +4,7 @@ import MemorySourceExplorer, {
   type MemoryVersionSummary,
 } from "./MemoryGraphView.js";
 import { SupermemoryStatusBanner } from "./EmbeddingBanner.js";
+import { SegmentedControl } from "./GlassPrimitives.js";
 import {
   EmptyState,
   HeaderPill,
@@ -271,13 +272,6 @@ export function MemoryPanel({ isDark }: { isDark: boolean }) {
   const profileCount = (profile?.stable.length ?? 0) + (profile?.recent.length ?? 0);
   const displayedCount =
     view === "profile" ? profileCount : view === "search" ? searchResults.length : documents.length;
-  const activeButton = isDark
-    ? "bg-zinc-100 text-zinc-950 shadow-sm"
-    : "bg-white text-zinc-950 shadow-sm";
-  const inactiveButton = isDark
-    ? "text-zinc-400 hover:bg-white/5 hover:text-zinc-100"
-    : "text-zinc-600 hover:bg-white hover:text-zinc-950";
-
   return (
     <PanelPage
       eyebrow="Supermemory"
@@ -289,29 +283,17 @@ export function MemoryPanel({ isDark }: { isDark: boolean }) {
       <SupermemoryStatusBanner isDark={isDark} />
 
       <div className={panelCardClass(isDark, "flex flex-wrap items-center justify-between gap-3 px-3 py-3")}>
-        <div
-          role="tablist"
-          aria-label="Memory explorer views"
-          className={`segmented-control flex items-center rounded-2xl border p-1 ${
-            isDark ? "border-white/10 bg-[#17171a]" : "border-zinc-200 bg-zinc-100"
-          }`}
-        >
-          {VIEWS.map((item) => (
-            <button
-              key={item.id}
-              type="button"
-              role="tab"
-              aria-selected={view === item.id}
-              aria-controls={`memory-panel-${item.id}`}
-              onClick={() => setView(item.id)}
-              className={`min-h-8 rounded-xl px-3 text-xs outline-none transition focus-visible:ring-2 focus-visible:ring-emerald-500 ${
-                view === item.id ? activeButton : inactiveButton
-              }`}
-            >
-              {item.label}
-            </button>
-          ))}
-        </div>
+        <SegmentedControl
+          lensId="memory-explorer-view"
+          label="Memory explorer views"
+          value={view}
+          options={VIEWS.map((item) => ({
+            value: item.id,
+            label: item.label,
+            controls: `memory-panel-${item.id}`,
+          }))}
+          onChange={setView}
+        />
         <p className={`text-xs ${isDark ? "text-zinc-500" : "text-zinc-500"}`}>
           Provider identifiers are shown only for local debugging.
         </p>

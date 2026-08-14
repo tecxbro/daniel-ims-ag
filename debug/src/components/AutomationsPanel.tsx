@@ -58,7 +58,7 @@ export function AutomationsPanel({ isDark }: { isDark: boolean }) {
       description="Recurring jobs the agent runs without a live conversation."
       stat={<HeaderPill isDark={isDark}>{enabledCount} enabled / {list.length} total</HeaderPill>}
     >
-      <div className="space-y-3">
+      <div className="source-table" role="list" aria-label="Automations">
         {automations === undefined ? (
           <div className="space-y-3">
             {[1, 2, 3].map((i) => (
@@ -73,11 +73,23 @@ export function AutomationsPanel({ isDark }: { isDark: boolean }) {
           list.map((auto: any) => (
             <div
               key={auto._id}
-              className={`${panelCardClass(isDark, "cursor-pointer px-4 py-3.5 transition-colors fade-in")} ${hoverBg}`}
+              role="button"
+              tabIndex={0}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault();
+                  setSelectedId(auto.automationId);
+                }
+              }}
+              className={`${panelCardClass(isDark, "source-row cursor-pointer px-4 py-3.5 transition-colors fade-in")} ${hoverBg}`}
               onClick={() => setSelectedId(auto.automationId)}
             >
               <div className="flex items-center gap-2.5 mb-1.5">
                 <button
+                  type="button"
+                  role="switch"
+                  aria-checked={auto.enabled}
+                  aria-label={`${auto.enabled ? "Disable" : "Enable"} ${auto.name}`}
                   onClick={(e) => {
                     e.stopPropagation();
                     setEnabled({
