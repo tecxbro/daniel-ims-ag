@@ -11,7 +11,7 @@ import {
   memoryIdSaltFingerprint,
 } from "../server/memory/supermemory/identity.js";
 
-const TEST_SALT = "test-only-capture-salt-0123456789abcdef";
+const TEST_SALT = "3".repeat(64);
 
 function createOutbox(): {
   rows: Map<string, EnqueueMemorySyncJobInput>;
@@ -46,25 +46,31 @@ function normalTurn(overrides: Partial<Parameters<typeof captureRawTurn>[0]> = {
   };
 }
 
+function configuredDependencies(
+  outbox: ReturnType<typeof createOutbox>,
+  overrides: Partial<Parameters<typeof captureRawTurn>[1]> = {},
+) {
+  return {
+    jobStore: outbox.store,
+    memoryConfigured: true,
+    memoryIdSalt: TEST_SALT,
+    ...overrides,
+  };
+}
+
 describe("durable Supermemory turn capture", () => {
   it("uses one stable customId for delta turns in the same conversation", async () => {
     const outbox = createOutbox();
-    const first = await captureRawTurn(normalTurn(), {
-      jobStore: outbox.store,
-      writeMode: "dual",
-      memoryIdSalt: TEST_SALT,
+    const first = await captureRawTurn(normalTurn(), configuredDependencies(outbox, {
       createJobId: () => "job_001",
       now: () => 100,
-    });
+    }));
     const second = await captureRawTurn(
       normalTurn({ turnId: "turn_002", userMessage: "And no long preambles." }),
-      {
-        jobStore: outbox.store,
-        writeMode: "dual",
-        memoryIdSalt: TEST_SALT,
+      configuredDependencies(outbox, {
         createJobId: () => "job_002",
         now: () => 101,
-      },
+      }),
     );
 
     expect("identity" in first && "identity" in second).toBe(true);
@@ -79,13 +85,10 @@ describe("durable Supermemory turn capture", () => {
 
   it("creates only one durable job for a repeated turn", async () => {
     const outbox = createOutbox();
-    const dependencies = {
-      jobStore: outbox.store,
-      writeMode: "dual" as const,
-      memoryIdSalt: TEST_SALT,
+    const dependencies = configuredDependencies(outbox, {
       createJobId: vi.fn().mockReturnValueOnce("job_first").mockReturnValueOnce("job_retry"),
       now: () => 100,
-    };
+    });
 
     const first = await captureRawTurn(normalTurn(), dependencies);
     const retry = await captureRawTurn(normalTurn(), dependencies);
@@ -97,13 +100,10 @@ describe("durable Supermemory turn capture", () => {
 
   it("captures the raw exchange without a preprocessing or extraction dependency", async () => {
     const outbox = createOutbox();
-    await captureRawTurn(normalTurn(), {
-      jobStore: outbox.store,
-      writeMode: "dual",
-      memoryIdSalt: TEST_SALT,
+    await captureRawTurn(normalTurn(), configuredDependencies(outbox, {
       createJobId: () => "job_raw",
       now: () => 100,
-    });
+    }));
 
     const row = [...outbox.rows.values()][0];
     const payload = JSON.parse(row.payload);
@@ -133,41 +133,36 @@ describe("durable Supermemory turn capture", () => {
 
   it("never captures synthetic proactive notices", async () => {
     const outbox = createOutbox();
-    const result = await captureRawTurn(normalTurn({ kind: "proactive" }), {
-      jobStore: outbox.store,
-      writeMode: "dual",
-      memoryIdSalt: TEST_SALT,
-    });
+    const result = await captureRawTurn(
+      normalTurn({ kind: "proactive" }),
+      configuredDependencies(outbox),
+    );
 
     expect(result).toEqual({ enqueued: false, reason: "synthetic_proactive" });
     expect(outbox.rows).toHaveLength(0);
   });
 
-  it("does not enqueue when Supermemory writes are disabled", async () => {
+  it("does not enqueue when Supermemory is unconfigured", async () => {
     const outbox = createOutbox();
     const result = await captureRawTurn(normalTurn(), {
       jobStore: outbox.store,
-      writeMode: "convex",
-      memoryIdSalt: TEST_SALT,
+      memoryConfigured: false,
     });
 
-    expect(result).toEqual({ enqueued: false, reason: "write_mode_disabled" });
+    expect(result).toEqual({ enqueued: false, reason: "unconfigured" });
+    expect(outbox.store.enqueue).not.toHaveBeenCalled();
     expect(outbox.rows).toHaveLength(0);
   });
 
   it("isolates different users in different containers", async () => {
     const outbox = createOutbox();
-    const first = await captureRawTurn(normalTurn(), {
-      jobStore: outbox.store,
-      writeMode: "dual",
-      memoryIdSalt: TEST_SALT,
-    });
+    const first = await captureRawTurn(normalTurn(), configuredDependencies(outbox));
     const second = await captureRawTurn(
       normalTurn({
         conversationId: "sms:+15555550200",
         memoryOwnerId: "+15555550200",
       }),
-      { jobStore: outbox.store, writeMode: "dual", memoryIdSalt: TEST_SALT },
+      configuredDependencies(outbox),
     );
 
     if (!("identity" in first) || !("identity" in second)) throw new Error("capture skipped");
@@ -176,11 +171,10 @@ describe("durable Supermemory turn capture", () => {
 
   it("records ordinary image metadata without uploading durable image content", async () => {
     const outbox = createOutbox();
-    await captureRawTurn(normalTurn({ imageStorageIds: ["storage_1", "storage_2"] }), {
-      jobStore: outbox.store,
-      writeMode: "dual",
-      memoryIdSalt: TEST_SALT,
-    });
+    await captureRawTurn(
+      normalTurn({ imageStorageIds: ["storage_1", "storage_2"] }),
+      configuredDependencies(outbox),
+    );
 
     const payload = JSON.parse([...outbox.rows.values()][0].payload);
     expect(payload.providerInput.metadata).toMatchObject({ hasImages: true, imageCount: 2 });
@@ -204,19 +198,38 @@ describe("durable Supermemory turn capture", () => {
     expect(payload.providerInput.customId).toBe(identity.customId);
   });
 
-  it("checks the deployment salt fingerprint before creating an outbox row", async () => {
+  it("requires identity recovery without creating a job when the salt fingerprint drifts", async () => {
     const outbox = createOutbox();
-    const differentSalt = "test-only-different-capture-salt-987654321";
+    const differentSalt = "e".repeat(64);
 
-    await expect(captureRawTurn(normalTurn(), {
-      jobStore: outbox.store,
+    await expect(captureRawTurn(normalTurn(), configuredDependencies(outbox, {
       identityStateStore: {
         ensureIdentitySaltFingerprint: async () =>
           memoryIdSaltFingerprint(differentSalt),
       },
-      writeMode: "dual",
-      memoryIdSalt: TEST_SALT,
-    })).rejects.toThrow(/DANIEL_MEMORY_ID_SALT changed/);
+    }))).resolves.toEqual({ enqueued: false, reason: "recovery_required" });
+    expect(outbox.store.enqueue).not.toHaveBeenCalled();
+  });
+
+  it("requires identity recovery without creating a job when the configured salt is missing", async () => {
+    const outbox = createOutbox();
+
+    await expect(captureRawTurn(normalTurn(), {
+      jobStore: outbox.store,
+      memoryConfigured: true,
+      memoryIdSalt: undefined,
+    })).resolves.toEqual({ enqueued: false, reason: "recovery_required" });
+    expect(outbox.store.enqueue).not.toHaveBeenCalled();
+  });
+
+  it("requires identity recovery without creating a job when the configured salt is invalid", async () => {
+    const outbox = createOutbox();
+
+    await expect(captureRawTurn(normalTurn(), {
+      jobStore: outbox.store,
+      memoryConfigured: true,
+      memoryIdSalt: "x",
+    })).resolves.toEqual({ enqueued: false, reason: "recovery_required" });
     expect(outbox.store.enqueue).not.toHaveBeenCalled();
   });
 });

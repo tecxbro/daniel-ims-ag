@@ -6,8 +6,8 @@ import {
 } from "../server/memory/supermemory/container.js";
 import { memoryIdSaltFingerprint } from "../server/memory/supermemory/identity.js";
 
-const SALT_A = "test-only-container-salt-a-0123456789";
-const SALT_B = "test-only-container-salt-b-9876543210";
+const SALT_A = "9".repeat(64);
+const SALT_B = "a".repeat(64);
 
 describe("Supermemory container settings contract", () => {
   it("updates once, persists initialization, and skips later settings requests", async () => {

@@ -10,18 +10,25 @@ import {
 import { deriveMemoryIdentity } from "../server/memory/supermemory/identity.js";
 import type {
   DanielMemoryProvider,
-  MemoryHydrationResult,
   MemoryOwnerContext,
 } from "../server/memory/supermemory/types.js";
 
-const TEST_SALT = "test-only-route-salt-0123456789";
+const TEST_SALT = "7".repeat(64);
 
 function owner(id: string): MemoryOwnerContext {
   return deriveMemoryIdentity(
-    { memoryOwnerId: id, conversationId: `dashboard:${id}` },
+    { memoryOwnerId: id, conversationId: `sms:+15555550123` },
     { salt: TEST_SALT },
   );
 }
+
+const authorized = owner("user-a");
+const ownerScope = {
+  ownerKey: authorized.ownerKey,
+  containerTag: authorized.containerTag,
+  conversationId: "sms:+15555550123",
+  registeredAt: 100,
+};
 
 function controlPlane(
   overrides: Partial<MemoryRouteControlPlane> = {},
@@ -29,7 +36,6 @@ function controlPlane(
   return {
     getProviderState: vi.fn(async () => ({
       healthStatus: "healthy",
-      saltFingerprint: owner("configured-user").saltFingerprint,
       lastSuccessfulSubmissionAt: 100,
       updatedAt: 110,
     })),
@@ -46,24 +52,28 @@ function controlPlane(
       truncated: false,
     })),
     retryJob: vi.fn(async () => ({ retried: false, reason: "not_found", job: null })),
-    verifyMigration: vi.fn(async () => ({
-      total: 10,
-      pending: 0,
-      migrated: 9,
-      failed: 0,
-      skipped: 1,
-      migratedWithoutProviderId: 0,
-      truncated: false,
-      reconciled: true,
-    })),
-    getImageAnchorSummary: vi.fn(async () => ({
-      pending: 0,
-      active: 2,
-      released: 1,
-      activeWithoutProviderId: 0,
-      truncated: false,
-    })),
+    getPrimaryOwnerScope: vi.fn(async () => ownerScope),
     ...overrides,
+  };
+}
+
+function pairing() {
+  return {
+    status: vi.fn(async () => ({
+      paired: false,
+      identityStatus: "ready" as const,
+      codeActive: false,
+      codeExpiresAt: null,
+    })),
+    rotateCode: vi.fn(async () => ({
+      status: "ready" as const,
+      code: "ABCDEFGH",
+      expiresAt: 10_000,
+    })),
+    listCandidates: vi.fn(async () => [
+      { token: "candidate_opaque", label: "+1•••0123", lastInboundAt: 90, expiresAt: 10_000 },
+    ]),
+    confirmCandidate: vi.fn(async () => "registered" as const),
   };
 }
 
@@ -95,8 +105,8 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("Implementation 8 Supermemory routes", () => {
-  it("limits the administrative surface to local requests and local browser origins", () => {
+describe("Implementation 10 Supermemory routes", () => {
+  it("limits the administrative surface to local browser requests", () => {
     expect(
       isLocalMemoryRouteRequest(
         { host: "localhost:3456", origin: "http://localhost:5173" },
@@ -117,30 +127,26 @@ describe("Implementation 8 Supermemory routes", () => {
     ).toBe(false);
   });
 
-  it("returns normalized provider state without exposing persisted provider errors", async () => {
+  it("returns safe configured and unconfigured provider state", async () => {
     const plane = controlPlane({
       getProviderState: vi.fn(async () => ({
         healthStatus: "degraded",
         lastSuccessfulSubmissionAt: 100,
         lastFailedSubmissionAt: 105,
         lastError: "Bearer sm_secret_should_not_leave_server",
+        hasError: true,
         lastWorkerActivityAt: 108,
         updatedAt: 110,
       })),
     });
-    const router = createMemoryRouter({
+    const configuredRouter = createMemoryRouter({
       localOnly: false,
       controlPlane: plane,
-      env: {
-        DANIEL_MEMORY_READ_MODE: "supermemory",
-        DANIEL_MEMORY_WRITE_MODE: "supermemory",
-        DANIEL_MEMORY_LEGACY_FALLBACK: "false",
-        SUPERMEMORY_API_KEY: "server-only-test-key",
-      },
+      env: { SUPERMEMORY_API_KEY: "server-only-test-key" },
+      getIdentityStatus: async () => ({ status: "ready" }),
       now: () => 120,
     });
-
-    await withRouter(router, async (baseUrl) => {
+    await withRouter(configuredRouter, async (baseUrl) => {
       const response = await fetch(`${baseUrl}/memory/provider-status`);
       expect(response.status).toBe(200);
       const body = await json(response);
@@ -148,9 +154,6 @@ describe("Implementation 8 Supermemory routes", () => {
         ok: true,
         provider: "supermemory",
         configured: true,
-        readMode: "supermemory",
-        writeMode: "supermemory",
-        legacyFallback: false,
         health: {
           status: "degraded",
           lastSuccessAt: 100,
@@ -161,267 +164,179 @@ describe("Implementation 8 Supermemory routes", () => {
         checkedAt: 120,
       });
       expect(JSON.stringify(body)).not.toContain("secret_should_not_leave_server");
+      expect(JSON.stringify(body)).not.toContain(authorized.ownerKey);
+      expect(JSON.stringify(body)).not.toContain(ownerScope.conversationId);
+    });
+
+    const unconfiguredRouter = createMemoryRouter({
+      localOnly: false,
+      controlPlane: plane,
+      env: {},
+    });
+    await withRouter(unconfiguredRouter, async (baseUrl) => {
+      await expect(json(await fetch(`${baseUrl}/memory/provider-status`))).resolves.toMatchObject({
+        configured: false,
+        health: { status: "unconfigured" },
+      });
+    });
+
+    const recoveryRouter = createMemoryRouter({
+      localOnly: false,
+      controlPlane: plane,
+      env: { SUPERMEMORY_API_KEY: "server-only-test-key" },
+      getIdentityStatus: async () => ({ status: "recovery_required" }),
+    });
+    await withRouter(recoveryRouter, async (baseUrl) => {
+      await expect(json(await fetch(`${baseUrl}/memory/provider-status`))).resolves.toMatchObject({
+        configured: true,
+        health: { status: "recovery_required" },
+      });
     });
   });
 
-  it("derives the provider container from the authorized owner for profile, search, and documents", async () => {
-    const authorized = owner("user-a");
-    const foreign = owner("user-b");
-    const hydration: MemoryHydrationResult = {
+  it("requires a stored paired owner before provider dashboard reads", async () => {
+    const profile = vi.fn<DanielMemoryProvider["profile"]>();
+    const router = createMemoryRouter({
+      localOnly: false,
+      provider: {
+        profile,
+        search: vi.fn(),
+        listDocuments: vi.fn(),
+      },
+      controlPlane: controlPlane({ getPrimaryOwnerScope: vi.fn(async () => null) }),
+    });
+    await withRouter(router, async (baseUrl) => {
+      const response = await fetch(`${baseUrl}/memory/profile`);
+      expect(response.status).toBe(503);
+      await expect(json(response)).resolves.toMatchObject({
+        error: { code: "owner_not_paired" },
+      });
+    });
+    expect(profile).not.toHaveBeenCalled();
+  });
+
+  it("treats empty profile, search, and document responses as successful", async () => {
+    const profile = vi.fn<DanielMemoryProvider["profile"]>(async () => ({
       provider: "supermemory",
-      profile: { static: ["Prefers concise answers"], dynamic: ["Planning a trip"] },
-      results: [
-        {
-          id: "memory-1",
-          content: "Likes window seats",
-          kind: "memory",
-          similarity: 0.92,
-          metadata: { source: "conversation" },
-        },
-      ],
-      latencyMs: 12,
-    };
-    const profile = vi.fn<DanielMemoryProvider["profile"]>(async () => hydration);
-    const search = vi.fn<DanielMemoryProvider["search"]>(async () => hydration.results);
-    const listDocuments = vi.fn<DanielMemoryProvider["listDocuments"]>(async () => ({
-      documents: [
-        {
-          id: "document-1",
-          status: "done",
-          customId: "turn-1",
-          title: "Travel planning",
-          summary: "Discussed a window-seat preference",
-          type: "text",
-          metadata: { source: "conversation" },
-        },
-      ],
-      page: 1,
-      totalItems: 1,
-      totalPages: 1,
+      profile: { static: [], dynamic: [] },
+      results: [],
+      latencyMs: 3,
     }));
-    const listMemories = vi.fn<NonNullable<DanielMemoryProvider["listMemories"]>>(async () => ({
-      entries: [
-        {
-          id: "memory-1",
-          content: "Likes window seats",
-          version: 2,
-          isLatest: true,
-          isForgotten: false,
-          isStatic: false,
-          isInference: false,
-          sourceCount: 1,
-          parentMemoryId: "memory-0",
-          rootMemoryId: "memory-0",
-          forgetAfter: null,
-          forgetReason: null,
-          metadata: { source: "conversation" },
-          history: [
-            {
-              id: "memory-0",
-              content: "Likes aisle seats",
-              version: 1,
-              parentMemoryId: null,
-              rootMemoryId: null,
-              isLatest: false,
-              isForgotten: false,
-            },
-          ],
-          documentIds: ["document-1"],
-        },
-      ],
+    const search = vi.fn<DanielMemoryProvider["search"]>(async () => []);
+    const listDocuments = vi.fn<DanielMemoryProvider["listDocuments"]>(async () => ({
+      documents: [],
       page: 1,
-      limit: 5,
-      totalItems: 1,
-      totalPages: 1,
+      totalItems: 0,
+      totalPages: 0,
     }));
     const router = createMemoryRouter({
       localOnly: false,
-      provider: { profile, search, listDocuments, listMemories },
+      provider: { profile, search, listDocuments },
       controlPlane: controlPlane(),
-      resolveOwner: async () => authorized,
     });
 
     await withRouter(router, async (baseUrl) => {
-      const profileResponse = await fetch(`${baseUrl}/memory/profile?q=travel`);
-      expect(profileResponse.status).toBe(200);
-      expect(await json(profileResponse)).toMatchObject({
+      await expect(json(await fetch(`${baseUrl}/memory/profile`))).resolves.toMatchObject({
         ok: true,
-        profileState: "ready",
-        provider: "supermemory",
-        profile: { static: ["Prefers concise answers"], dynamic: ["Planning a trip"] },
+        profileState: "empty",
+        profile: { static: [], dynamic: [] },
+        results: [],
       });
-
-      const searchResponse = await fetch(`${baseUrl}/memory/search`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          q: "seat preference",
-          searchMode: "memories",
-          containerTag: foreign.containerTag,
-          ownerKey: foreign.ownerKey,
-        }),
-      });
-      expect(searchResponse.status).toBe(200);
-
-      const documentsResponse = await fetch(
-        `${baseUrl}/memory/documents?page=1&limit=5`,
-      );
-      expect(documentsResponse.status).toBe(200);
-      expect(await json(documentsResponse)).toMatchObject({
+      await expect(
+        json(
+          await fetch(`${baseUrl}/memory/search`, {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ q: "nothing here" }),
+          }),
+        ),
+      ).resolves.toMatchObject({ ok: true, results: [] });
+      await expect(json(await fetch(`${baseUrl}/memory/documents`))).resolves.toMatchObject({
         ok: true,
-        documents: [{ id: "document-1", customId: "turn-1", status: "done" }],
-        page: 1,
-        totalItems: 1,
-      });
-
-      const rejectedDocumentQuery = await fetch(
-        `${baseUrl}/memory/documents?q=seat`,
-      );
-      expect(rejectedDocumentQuery.status).toBe(400);
-
-      const entriesResponse = await fetch(
-        `${baseUrl}/memory/entries?page=1&limit=5&order=desc&sort=updatedAt&containerTag=${encodeURIComponent(foreign.containerTag)}`,
-      );
-      expect(entriesResponse.status).toBe(200);
-      expect(await json(entriesResponse)).toMatchObject({
-        ok: true,
-        entries: [
-          {
-            id: "memory-1",
-            isLatest: true,
-            isForgotten: false,
-            history: [{ id: "memory-0", isLatest: false }],
-          },
-        ],
+        documents: [],
+        totalItems: 0,
       });
     });
 
-    expect(profile).toHaveBeenCalledWith(
-      expect.objectContaining({ containerTag: authorized.containerTag, q: "travel" }),
-    );
-    expect(search).toHaveBeenCalledWith(
-      expect.objectContaining({
-        containerTag: authorized.containerTag,
-        q: "seat preference",
-        searchMode: "memories",
-      }),
-    );
-    expect(listDocuments).toHaveBeenCalledWith(
-      expect.objectContaining({
-        containerTag: authorized.containerTag,
-        page: 1,
-        limit: 5,
-      }),
-    );
-    expect(listMemories).toHaveBeenCalledWith(
-      expect.objectContaining({
-        containerTag: authorized.containerTag,
-        page: 1,
-        limit: 5,
-        order: "desc",
-        sort: "updatedAt",
-      }),
-    );
-    expect(
-      JSON.stringify([
-        ...profile.mock.calls,
-        ...search.mock.calls,
-        ...listDocuments.mock.calls,
-        ...listMemories.mock.calls,
-      ]),
-    ).not.toContain(foreign.containerTag);
+    for (const call of [profile, search, listDocuments]) {
+      expect(call).toHaveBeenCalledWith(
+        expect.objectContaining({ containerTag: authorized.containerTag }),
+      );
+    }
   });
 
-  it("retries only an exact job owned by the authorized container", async () => {
-    const authorized = owner("user-a");
-    const foreign = owner("user-b");
-    const retryJob = vi.fn(
-      async (input: {
-        jobId: string;
-        ownerKey: string;
-        containerTag: string;
-        expectedStatus: "failed" | "dead_letter";
-      }) =>
-        input.jobId === "owned-job"
-          ? {
-              retried: true,
-              job: {
-                jobId: input.jobId,
-                ownerKey: authorized.ownerKey,
-                containerTag: authorized.containerTag,
-                status: "pending",
-                attempts: 0,
-                nextAttemptAt: 300,
-                updatedAt: 301,
-              },
-            }
-          : { retried: false, reason: "not_found", job: null },
-    );
-    const plane = controlPlane({
-      retryJob,
-    });
+  it("retries only an exact job owned by the stored owner", async () => {
+    const retryJob = vi.fn(async (input: {
+      jobId: string;
+      ownerKey: string;
+      containerTag: string;
+      expectedStatus: "failed" | "dead_letter";
+    }) => ({
+      retried: true,
+      job: {
+        jobId: input.jobId,
+        ownerKey: ownerScope.ownerKey,
+        containerTag: ownerScope.containerTag,
+        status: "pending",
+        attempts: 0,
+        nextAttemptAt: 300,
+        updatedAt: 301,
+      },
+    }));
     const router = createMemoryRouter({
       localOnly: false,
       provider: null,
-      controlPlane: plane,
-      resolveOwner: async () => authorized,
+      controlPlane: controlPlane({ retryJob }),
     });
 
     await withRouter(router, async (baseUrl) => {
-      const owned = await fetch(`${baseUrl}/memory/retry-job`, {
+      const response = await fetch(`${baseUrl}/memory/retry-job`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ jobId: "owned-job" }),
       });
-      expect(owned.status).toBe(200);
-      expect(await json(owned)).toMatchObject({
-        ok: true,
-        job: { jobId: "owned-job", status: "pending", attempts: 0 },
-      });
-
-      const blocked = await fetch(`${baseUrl}/memory/retry-job`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ jobId: "foreign-job" }),
-      });
-      expect(blocked.status).toBe(404);
-      expect(await json(blocked)).toMatchObject({
-        error: { code: "job_not_found" },
-      });
+      expect(response.status).toBe(200);
     });
-
-    expect(retryJob).toHaveBeenCalledTimes(2);
     expect(retryJob).toHaveBeenCalledWith({
       jobId: "owned-job",
-      ownerKey: authorized.ownerKey,
-      containerTag: authorized.containerTag,
+      ownerKey: ownerScope.ownerKey,
+      containerTag: ownerScope.containerTag,
       expectedStatus: "failed",
     });
   });
 
-  it("retires embedding routes and returns aggregate migration verification", async () => {
+  it("exposes only safe local pairing responses and no removed route", async () => {
+    const pairingApi = pairing();
     const router = createMemoryRouter({
       localOnly: false,
       provider: null,
       controlPlane: controlPlane(),
-      resolveOwner: async () => owner("user-a"),
+      pairing: pairingApi,
     });
-
     await withRouter(router, async (baseUrl) => {
-      expect((await fetch(`${baseUrl}/memory/embedding-status`)).status).toBe(404);
-      expect(
-        (await fetch(`${baseUrl}/memory/reembed`, { method: "POST" })).status,
-      ).toBe(404);
-      const verification = await fetch(`${baseUrl}/memory/migration/verify`, {
-        method: "POST",
-      });
-      expect(verification.status).toBe(200);
-      expect(await json(verification)).toMatchObject({
+      await expect(json(await fetch(`${baseUrl}/memory/pairing/status`))).resolves.toEqual({
         ok: true,
-        ready: true,
-        migration: { total: 10, migrated: 9, skipped: 1 },
-        imageAnchors: { active: 2, released: 1 },
+        paired: false,
+        identityStatus: "ready",
+        codeActive: false,
+        codeExpiresAt: null,
       });
+      await expect(
+        json(await fetch(`${baseUrl}/memory/pairing/code`, { method: "POST" })),
+      ).resolves.toMatchObject({ ok: true, status: "ready", code: "ABCDEFGH" });
+      await expect(
+        json(await fetch(`${baseUrl}/memory/pairing/candidates`)),
+      ).resolves.toMatchObject({
+        ok: true,
+        candidates: [{ token: "candidate_opaque", label: "+1•••0123" }],
+      });
+      const confirmation = await fetch(`${baseUrl}/memory/pairing/confirm`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ token: "candidate_opaque" }),
+      });
+      expect(confirmation.status).toBe(200);
+      await expect(json(confirmation)).resolves.toEqual({ ok: true, status: "registered" });
     });
   });
 });

@@ -40,6 +40,7 @@ import {
 } from "./lib/theme.js";
 import { useLiquidSelectionAnchor } from "./lib/liquidSelection.js";
 import { useMemoryProfileState } from "./lib/memoryProfile.js";
+import { normalizeDashboardSnapshot } from "./lib/dashboardSnapshot.js";
 import metadata from "../../project-metadata.json";
 
 const AgentsPanel = lazy(() =>
@@ -62,7 +63,7 @@ const ConnectionsPanel = lazy(() =>
   })),
 );
 const MemorySyncPanel = lazy(() =>
-  import("./components/ConsolidationPanel.js").then((module) => ({
+  import("./components/MemorySyncPanel.js").then((module) => ({
     default: module.MemorySyncPanel,
   })),
 );
@@ -73,15 +74,6 @@ const SettingsPanel = lazy(() =>
 interface RuntimeConfigSnapshot {
   runtime: RuntimeProvider;
   model: string;
-}
-
-interface MemoryOperationalSummary {
-  memoryProvider: {
-    healthStatus: string;
-    readMode: string;
-    writeMode: string;
-  };
-  sync: { active: number; failed: number; deadLetter: number };
 }
 
 interface AgentSummary {
@@ -135,9 +127,11 @@ export function App() {
   const { connected } = useSocket();
   const memoryProfileState = useMemoryProfileState();
 
-  const memorySummary = useQuery(api.dashboard.metrics, {}) as
-    | MemoryOperationalSummary
-    | undefined;
+  const rawMemorySummary = useQuery(api.dashboard.metrics, {}) as unknown;
+  const memorySummary =
+    rawMemorySummary === undefined
+      ? undefined
+      : normalizeDashboardSnapshot(rawMemorySummary);
   const agents = useQuery(api.agents.list, {}) as AgentSummary[] | undefined;
   const storedRuntime = useQuery(api.settings.get, { key: "runtime" }) as
     | string
@@ -371,21 +365,24 @@ export function App() {
           <div className="memory-counts" aria-label="Supermemory operational summary">
             <MetricPill
               label="Provider"
-              value={memorySummary?.memoryProvider.healthStatus ?? "—"}
-              tone={memorySummary?.memoryProvider.healthStatus === "healthy" ? "success" : "warm"}
+              value={
+                memorySummary === undefined
+                  ? "—"
+                  : memorySummary.memoryProvider?.healthStatus ?? "Unavailable"
+              }
+              tone={memorySummary?.memoryProvider?.healthStatus === "healthy" ? "success" : "warm"}
             />
             <MetricPill label="Profile" value={memoryProfileState} />
             <MetricPill
               label="Backlog"
-              value={memorySummary?.sync.active}
-              tone={(memorySummary?.sync.failed ?? 0) + (memorySummary?.sync.deadLetter ?? 0) > 0 ? "danger" : undefined}
+              value={
+                memorySummary === undefined
+                  ? undefined
+                  : memorySummary.sync?.active ?? "Unavailable"
+              }
+              tone={(memorySummary?.sync?.failed ?? 0) + (memorySummary?.sync?.deadLetter ?? 0) > 0 ? "danger" : undefined}
             />
           </div>
-          {memorySummary && (
-            <div className="sidebar-summary-mode" title={`Read ${memorySummary.memoryProvider.readMode}; write ${memorySummary.memoryProvider.writeMode}`}>
-              {memorySummary.memoryProvider.readMode} → {memorySummary.memoryProvider.writeMode}
-            </div>
-          )}
           <button type="button" className="version-button" onClick={() => setChangelogOpen(true)}>
             Daniel {metadata.version}
           </button>

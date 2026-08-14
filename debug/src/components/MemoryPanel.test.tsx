@@ -12,14 +12,10 @@ function json(value: unknown, status = 200) {
 
 function providerStatus() {
   return {
+    ok: true,
     configured: true,
-    health: "healthy",
-    readMode: "supermemory",
-    writeMode: "supermemory",
-    profileState: "ready",
+    health: { status: "healthy" },
     backlog: { total: 0, active: 0 },
-    recentJobs: [],
-    recentEvents: [],
   };
 }
 
@@ -56,7 +52,10 @@ function installFetch(profileResponse: Response | (() => Response)) {
       return json({ documents: [{ id: "document-1", title: "Launch notes" }] });
     }
     if (path === "/api/memory/search" && init?.method === "POST") {
-      return json({ documents: [{ id: "document-2", title: "Matching notes" }] });
+      const body = JSON.parse(String(init.body)) as { searchMode?: string };
+      return body.searchMode === "documents"
+        ? json({ ok: true, documents: [{ id: "document-2", title: "Matching notes" }] })
+        : json({ ok: true, results: [] });
     }
     throw new Error(`Unexpected request: ${path}`);
   });
@@ -90,6 +89,43 @@ describe("MemoryPanel provider contracts", () => {
     installFetch(json({ profileState: "empty", profile: { static: [], dynamic: [] } }));
     render(<MemoryPanel isDark />);
     expect(await screen.findByText(/No profile facts yet/)).toBeTruthy();
+  });
+
+  it("treats an empty semantic search response as a successful result", async () => {
+    installFetch(json({ profileState: "empty", profile: { static: [], dynamic: [] } }));
+    const user = userEvent.setup();
+    render(<MemoryPanel isDark={false} />);
+
+    await user.click(await screen.findByRole("tab", { name: "Search" }));
+    await user.type(screen.getByRole("searchbox", { name: "Semantic memory search" }), "launch preferences");
+    await user.click(screen.getByRole("button", { name: "Search" }));
+
+    expect(await screen.findByText("0 results found.")).toBeTruthy();
+    expect(screen.getByText("No search results to show.")).toBeTruthy();
+  });
+
+  it("treats an empty document browse response as a successful result", async () => {
+    const fetchMock = installFetch(
+      json({ profileState: "empty", profile: { static: [], dynamic: [] } }),
+    );
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      if (path === "/api/memory/provider-status") return json(providerStatus());
+      if (path === "/api/memory/profile") {
+        return json({ profileState: "empty", profile: { static: [], dynamic: [] } });
+      }
+      if (path.startsWith("/api/memory/entries?")) return json({ entries: [] });
+      if (path.startsWith("/api/memory/documents?")) {
+        return json({ ok: true, documents: [] });
+      }
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    const user = userEvent.setup();
+    render(<MemoryPanel isDark={false} />);
+
+    await user.click(await screen.findByRole("tab", { name: "Documents" }));
+    expect(await screen.findByText("0 documents browsed.")).toBeTruthy();
+    expect(screen.getByText("No source documents yet.")).toBeTruthy();
   });
 
   it("renders unavailable when the profile route fails", async () => {

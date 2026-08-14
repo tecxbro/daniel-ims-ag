@@ -11,7 +11,7 @@ import type {
   MemorySearchResult,
 } from "../server/memory/supermemory/types.js";
 
-const TEST_SALT = "test-only-isolation-salt-0123456789";
+const TEST_SALT = "6".repeat(64);
 
 function identity(memoryOwnerId: string): MemoryOwnerContext {
   return deriveMemoryIdentity(
@@ -53,14 +53,12 @@ describe("Supermemory per-user request isolation", () => {
       provider,
       owner: userA,
       currentUserMessage: "project",
-      mode: "shadow",
       env: {},
     });
     const recalledB = await recallMemory({
       provider,
       owner: userB,
       q: "travel",
-      mode: "shadow",
       env: {},
     });
 
@@ -87,7 +85,6 @@ describe("Supermemory per-user request isolation", () => {
       provider: { profile, search },
       owner: mistyped,
       currentUserMessage: "hello",
-      mode: "shadow",
       env: {},
       instrumentation: vi.fn(),
     });
@@ -95,7 +92,6 @@ describe("Supermemory per-user request isolation", () => {
       provider: { profile, search },
       owner: mistyped,
       q: "hello",
-      mode: "shadow",
       env: {},
       instrumentation: vi.fn(),
     });
@@ -117,14 +113,12 @@ describe("Supermemory per-user request isolation", () => {
       provider,
       owner,
       currentUserMessage: "hello",
-      mode: "shadow",
       env: {},
     });
     await recallMemory({
       provider,
       owner,
       q: "travel preferences",
-      mode: "shadow",
       env: {},
     });
 

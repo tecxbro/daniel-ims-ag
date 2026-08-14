@@ -1,7 +1,12 @@
 import { useState } from "react";
 import { useQuery } from "convex/react";
 import { api } from "../../../convex/_generated/api.js";
-import type { MemorySyncJobSummary, MemorySyncStatus } from "./EmbeddingBanner.js";
+import {
+  normalizeDashboardSnapshot,
+  type DashboardSyncSnapshot,
+  type MemorySyncJobSummary,
+  type MemorySyncStatus,
+} from "../lib/dashboardSnapshot.js";
 import {
   EmptyState,
   HeaderPill,
@@ -9,23 +14,13 @@ import {
   panelCardClass,
 } from "./PanelPrimitives.js";
 
-interface SyncDashboardData {
-  sync: {
-    pending: number;
-    processing: number;
-    submitted: number;
-    completed: number;
-    failed: number;
-    deadLetter: number;
-    active: number;
-    total: number;
-    captureCompletionRate: number | null;
-    recentJobs: MemorySyncJobSummary[];
-  };
-  truncated: boolean;
-}
-
-const STATUS_ORDER: { key: keyof Omit<SyncDashboardData["sync"], "active" | "total" | "captureCompletionRate" | "recentJobs">; label: string }[] = [
+const STATUS_ORDER: {
+  key: keyof Omit<
+    DashboardSyncSnapshot,
+    "active" | "total" | "captureCompletionRate" | "recentJobs"
+  >;
+  label: string;
+}[] = [
   { key: "pending", label: "Pending" },
   { key: "processing", label: "Processing" },
   { key: "submitted", label: "Submitted" },
@@ -89,10 +84,11 @@ async function retryMemoryJob(job: MemorySyncJobSummary): Promise<void> {
 }
 
 export function MemorySyncPanel({ isDark }: { isDark: boolean }) {
-  const data = useQuery(api.dashboard.metrics, {}) as SyncDashboardData | undefined;
+  const rawData = useQuery(api.dashboard.metrics, {}) as unknown;
+  const data = rawData === undefined ? undefined : normalizeDashboardSnapshot(rawData);
   const [retryingJobId, setRetryingJobId] = useState<string | null>(null);
   const [retryMessage, setRetryMessage] = useState("Select a failed job to retry it.");
-  const sync = data?.sync;
+  const sync = data?.sync ?? null;
 
   async function retry(job: MemorySyncJobSummary) {
     setRetryingJobId(job.jobId);
@@ -107,12 +103,14 @@ export function MemorySyncPanel({ isDark }: { isDark: boolean }) {
     }
   }
 
+  const activeLabel = data === undefined ? "Loading" : sync ? `${sync.active} active` : "Unavailable";
+
   return (
     <PanelPage
       eyebrow="Durable outbox"
       title="Memory sync"
-      description="Synchronization state between Convex application data and the Supermemory provider."
-      stat={<HeaderPill isDark={isDark}>{sync?.active ?? 0} active</HeaderPill>}
+      description="Conversation capture state between Convex application data and the Supermemory provider."
+      stat={<HeaderPill isDark={isDark}>{activeLabel}</HeaderPill>}
       maxWidth="max-w-[1120px]"
     >
       <section aria-label="Synchronization counts" className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
@@ -120,7 +118,7 @@ export function MemorySyncPanel({ isDark }: { isDark: boolean }) {
           <div key={key} className={panelCardClass(isDark, "min-w-0 p-4")}>
             <div className={`text-[11px] font-medium ${isDark ? "text-zinc-500" : "text-zinc-500"}`}>{label}</div>
             <div className={`mt-1 text-2xl font-semibold mono ${key === "deadLetter" && (sync?.[key] ?? 0) > 0 ? "text-rose-400" : isDark ? "text-zinc-100" : "text-zinc-950"}`}>
-              {sync?.[key] ?? 0}
+              {sync?.[key] ?? "—"}
             </div>
           </div>
         ))}
@@ -131,9 +129,11 @@ export function MemorySyncPanel({ isDark }: { isDark: boolean }) {
           <div>
             <h2 id="sync-summary-heading" className={`text-sm font-semibold ${isDark ? "text-zinc-100" : "text-zinc-950"}`}>Outbox health</h2>
             <p className={`mt-1 text-xs ${isDark ? "text-zinc-500" : "text-zinc-500"}`}>
-              {sync?.captureCompletionRate === null || sync?.captureCompletionRate === undefined
-                ? "Completion rate is unavailable until terminal jobs exist."
-                : `${(sync.captureCompletionRate * 100).toFixed(1)}% terminal-job completion rate.`}
+              {!sync
+                ? "Completion rate is unavailable."
+                : sync.captureCompletionRate === null
+                  ? "Completion rate is unavailable until terminal jobs exist."
+                  : `${(sync.captureCompletionRate * 100).toFixed(1)}% terminal-job completion rate.`}
               {data?.truncated ? " Counts are a bounded snapshot." : ""}
             </p>
           </div>
@@ -142,15 +142,19 @@ export function MemorySyncPanel({ isDark }: { isDark: boolean }) {
           </p>
         </div>
 
-        {!data ? (
+        {data === undefined ? (
           <div className="space-y-3 p-5" aria-label="Loading synchronization jobs">
             {[1, 2, 3].map((item) => (
               <div key={item} className={`h-20 rounded-xl shimmer ${isDark ? "bg-white/5" : "bg-zinc-100"}`} />
             ))}
           </div>
-        ) : data.sync.recentJobs.length === 0 ? (
+        ) : !sync ? (
           <EmptyState isDark={isDark}>
-            No synchronization jobs yet. Completed conversations and explicit memory operations will enqueue durable work.
+            Synchronization data is unavailable. The dashboard will recover when Convex returns the current contract.
+          </EmptyState>
+        ) : sync.recentJobs.length === 0 ? (
+          <EmptyState isDark={isDark}>
+            No synchronization jobs yet. Completed conversations will enqueue durable capture work.
           </EmptyState>
         ) : (
           <div className="overflow-x-auto">
@@ -166,7 +170,7 @@ export function MemorySyncPanel({ isDark }: { isDark: boolean }) {
                 </tr>
               </thead>
               <tbody className={isDark ? "divide-y divide-white/10" : "divide-y divide-zinc-200"}>
-                {data.sync.recentJobs.map((job) => {
+                {sync.recentJobs.map((job) => {
                   const retryable = job.status === "failed" || job.status === "dead_letter";
                   const busy = retryingJobId === job.jobId;
                   return (

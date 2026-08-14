@@ -8,6 +8,7 @@ import {
 } from "../lib/branding.js";
 import { BrowserSection } from "./BrowserSection.js";
 import { SegmentedControl } from "./GlassPrimitives.js";
+import { PrimaryOwnerPairing } from "./PrimaryOwnerPairing.js";
 
 type RuntimeChoice = "claude" | "codex";
 type ReasoningEffort = "minimal" | "low" | "medium" | "high" | "xhigh";
@@ -59,7 +60,7 @@ const SETTINGS: Setting[] = [
   },
 ];
 
-const RUNTIME_SETTING_COUNT = SETTINGS.length + 2;
+const RUNTIME_SETTING_COUNT = SETTINGS.length + 4;
 
 const RUNTIME_OPTIONS: Option<RuntimeChoice>[] = [
   { value: "claude", label: "Claude" },
@@ -162,6 +163,13 @@ export function SettingsPanel({ isDark }: { isDark: boolean }) {
             <TimezoneRow key={s.key} setting={s} isDark={isDark} />
           ),
         )}
+        <SettingShell
+          label="Primary memory owner"
+          description="Pair the one conversation allowed to use the local memory dashboard and receive proactive Gmail notices. Other senders can keep chatting without becoming the primary owner."
+          debugLine="memory.primary_owner = protected local state"
+          isDark={isDark}
+          control={<PrimaryOwnerPairing isDark={isDark} />}
+        />
         <BrowserSection isDark={isDark} />
         <DemoModeRow isDark={isDark} />
       </div>
@@ -269,7 +277,7 @@ function DemoModeRow({ isDark }: { isDark: boolean }) {
   return (
     <SettingShell
       label="Demo mode"
-      description="Seeds realistic namespaced records across agents, tool traces, memories, memory events, automations, conversations, consolidation, and usage so every dashboard screen has data to inspect."
+      description="Seeds realistic namespaced records across agents, tool traces, Supermemory provider state, synchronization jobs, automations, conversations, and usage so every dashboard screen has data to inspect."
       debugLine={debugLine}
       isDark={isDark}
       control={

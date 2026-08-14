@@ -20,44 +20,40 @@ and retrieves long-term semantic memory.
 
 Memory changes must preserve these boundaries:
 
-- Keep the raw transcript, recent prompt history, durable outbox, migration
-  ledger, pending operations, image anchors, and provider health in Convex.
+- Keep the raw transcript, recent prompt history, durable outbox, pending
+  operations, image anchors, provider health, metrics, and events in Convex.
 - Use one SuperMemory container per memory owner across conversations. Keep
   `memoryOwnerId` separate from `conversationId`, and derive provider
   identifiers with the stable HMAC salt; never send a raw phone number as a
   container tag or custom ID.
 - Hydrate the profile and query-relevant context before dispatcher execution,
   but fail open when the provider is unavailable.
-- Capture completed turns as `delta_turn_v1` jobs in `memorySyncJobs`. Do not
-  replace the stable conversation document with an ever-growing transcript or
-  bypass the durable outbox.
+- Capture completed normal turns as `delta_turn_v1` jobs in `memorySyncJobs`.
+  `conversation_turn` is the only accepted outbox kind. Do not replace the
+  stable conversation document with an ever-growing transcript or bypass the
+  durable outbox.
 - Put every SuperMemory SDK or direct HTTP call behind the server-only adapter
   in `server/memory/supermemory/`. UI, routes, tools, and unrelated server code
   use the adapter or normalized server APIs; the browser must never receive
   `SUPERMEMORY_API_KEY`.
-- Use exact creation for explicit and migrated facts, provider versions for
-  corrections, and the two-stage forget flow. Forget confirmation must apply
-  the exact IDs saved during preview and must not rerun the semantic query.
+- Keep explicit remember, update, forget, and image operations synchronous.
+  Use exact creation for `remember_memory`, provider versions for corrections,
+  and the two-stage forget flow. Forget confirmation must apply the exact IDs
+  saved during preview and must not rerun the semantic query.
 - Upload images only when the durable-image policy allows it. Pending and
   active `memoryImageAnchors` retain Convex bytes; release an anchor only after
   provider deletion is confirmed.
-
-The legacy `memoryRecords`, `memoryEvents`, and `consolidationRuns` APIs and
-data may appear in migration code only when explicitly labeled **legacy**.
-They remain read-only for 30 days after SuperMemory-only write cutover. A PR
-must not delete them unless it is the final decommission change and proves the
-retention and reconciliation gates. That change must delete rows in this
-order—`memoryRecords`, `memoryEvents`, `consolidationRuns`—verify all three are
-empty, then remove functions, schema definitions, generated references, and
-retired server files.
-
-Migration PRs must test each mode they touch. During shadow evaluation use
-`shadow` reads with `dual` writes; during the seven-day user-facing read
-burn-in use `supermemory` reads with `dual` writes. After SuperMemory-only
-write cutover, the frozen Convex legacy store is stale: rollback favors
-provider repair or outbox replay. After legacy schema retirement, recovery
-requires reverting the decommission and restoring the immutable checksummed
-export, not only changing flags.
+- Treat missing provider credentials as `unconfigured`: persist and reply
+  normally, make no provider request, and create no memory job. Provider
+  outages must fail open for reads and preserve configured captures for retry.
+- Treat a missing or changed identity salt after identity state exists as
+  `recovery_required`. Never create a replacement identity silently.
+- Keep primary-owner pairing local-only, explicit, and non-replacing. The
+  browser must receive only masked candidate labels and opaque tokens, never
+  raw owner, container, conversation, fingerprint, salt, or authority values.
+- Do not infer the dashboard or proactive-notice owner from the first inbound
+  sender or an environment phone number. Owner-scoped features remain
+  unavailable until code pairing or local candidate confirmation succeeds.
 
 ## Bug-fix PRs
 

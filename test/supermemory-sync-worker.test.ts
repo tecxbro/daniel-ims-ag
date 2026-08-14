@@ -26,6 +26,7 @@ function conversationJob(overrides: Partial<MemorySyncJob> = {}): MemorySyncJob 
     turnId: "turn_001",
     payload: JSON.stringify({
       schemaVersion: 1,
+      kind: "conversation_turn",
       ingestionStrategy: "delta_turn_v1",
       providerInput: {
         content: "Conversation between the user and Daniel.\nTurn: turn_001\n\nUSER: hi\n\nDANIEL: hello",
@@ -140,14 +141,7 @@ function providerState(): MemoryProviderStateWriter & {
 }
 
 function provider(captureTurn = vi.fn(async () => ({ id: "doc_001", status: "queued" }))) {
-  return {
-    captureTurn,
-    createExact: vi.fn(async () => []),
-    update: vi.fn(async () => ({ id: "memory_001", content: "updated" })),
-    forget: vi.fn(async () => undefined),
-    uploadImageJob: vi.fn(async () => ({ id: "image_doc_001", status: "queued" })),
-    forgetMany: vi.fn(async () => undefined),
-  };
+  return { captureTurn };
 }
 
 describe("durable Supermemory synchronization worker", () => {
@@ -421,10 +415,14 @@ describe("durable Supermemory synchronization worker", () => {
       .fn()
       .mockResolvedValueOnce({ job: claimed, resumeFrom: "dispatch" })
       .mockResolvedValue({ updated: true, job: claimed });
-    const persistence = new ConvexMemorySyncPersistence({
-      query: vi.fn(),
-      mutation,
-    } as never);
+    const authorityProof = "b".repeat(64);
+    const persistence = new ConvexMemorySyncPersistence(
+      {
+        query: vi.fn(),
+        mutation,
+      } as never,
+      authorityProof,
+    );
 
     await persistence.claimDue({ now: 100, leaseMs: 10_000, workerId: "worker_a" });
     await persistence.recordSubmitted({
@@ -445,6 +443,7 @@ describe("durable Supermemory synchronization worker", () => {
       now: 100,
       leaseMs: 10_000,
       workerId: "worker_a",
+      pairingAuthorityProof: authorityProof,
     });
     expect(mutation.mock.calls[1][1]).toMatchObject({
       expectedAttempt: 1,
@@ -457,60 +456,8 @@ describe("durable Supermemory synchronization worker", () => {
     });
   });
 
-  it("dispatches every planned job kind through the typed provider boundary", async () => {
-    const currentProvider = provider();
-    const jobs = new InMemoryJobs([
-      conversationJob(),
-      conversationJob({
-        jobId: "job_explicit",
-        kind: "explicit_memory",
-        customId: undefined,
-        turnId: undefined,
-        payload: JSON.stringify({
-          memories: [{ content: "The user prefers concise answers" }],
-        }),
-      }),
-      conversationJob({
-        jobId: "job_image",
-        kind: "image",
-        payload: JSON.stringify({
-          storageId: "storage_001",
-          customId: "daniel-conv-conversation001",
-          reason: "migration",
-        }),
-      }),
-      conversationJob({
-        jobId: "job_update",
-        kind: "memory_update",
-        customId: undefined,
-        payload: JSON.stringify({ id: "memory_001", newContent: "Updated fact" }),
-      }),
-      conversationJob({
-        jobId: "job_forget",
-        kind: "memory_forget",
-        customId: undefined,
-        payload: JSON.stringify({ id: "memory_001", reason: "user requested" }),
-      }),
-    ]);
-    const worker = new MemorySyncWorker({
-      jobs,
-      providerState: providerState(),
-      provider: currentProvider,
-      ensureContainerSettings: async () => undefined,
-      now: () => 0,
-    });
-
-    for (let index = 0; index < 5; index += 1) await worker.runOnce();
-
-    expect(jobs.jobs.every((job) => job.status === "completed")).toBe(true);
-    expect(currentProvider.captureTurn).toHaveBeenCalledOnce();
-    expect(currentProvider.createExact).toHaveBeenCalledOnce();
-    expect(currentProvider.uploadImageJob).toHaveBeenCalledOnce();
-    expect(currentProvider.update).toHaveBeenCalledOnce();
-    expect(currentProvider.forgetMany).toHaveBeenCalledOnce();
-  });
-
-  it("does not start when capture is disabled and the durable backlog is empty", async () => {
+  it("does not start or call a provider when the API key is missing and backlog is empty", async () => {
+    const captureTurn = vi.fn(async () => ({ id: "must_not_run", status: "queued" }));
     const client = {
       query: vi.fn(async () => ({
         counts: {
@@ -527,13 +474,12 @@ describe("durable Supermemory synchronization worker", () => {
 
     const result = await startConfiguredMemorySyncWorker({
       client: client as never,
-      env: {
-        DANIEL_MEMORY_READ_MODE: "convex",
-        DANIEL_MEMORY_WRITE_MODE: "convex",
-      },
+      env: {},
+      provider: { captureTurn },
     });
 
     expect(result).toMatchObject({ worker: null, reason: "no_backlog" });
+    expect(captureTurn).not.toHaveBeenCalled();
     expect(client.mutation).not.toHaveBeenCalled();
   });
 
@@ -554,14 +500,10 @@ describe("durable Supermemory synchronization worker", () => {
 
     const result = await startConfiguredMemorySyncWorker({
       client: client as never,
-      env: {
-        DANIEL_MEMORY_READ_MODE: "convex",
-        DANIEL_MEMORY_WRITE_MODE: "convex",
-      },
+      env: {},
     });
 
     expect(result).toMatchObject({ worker: null, reason: "provider_unconfigured" });
-    expect(client.mutation).toHaveBeenCalledOnce();
-    expect(client.mutation.mock.calls[0][1]).toMatchObject({ healthStatus: "unconfigured" });
+    expect(client.mutation).not.toHaveBeenCalled();
   });
 });

@@ -2,13 +2,14 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   assertMemoryIdSaltStable,
   deriveMemoryIdentity,
+  isValidMemoryIdSalt,
   memoryIdSaltFingerprint,
   normalizeMemoryOwnerId,
   validateProviderIdentifier,
 } from "../server/memory/supermemory/identity.js";
 
-const SALT_A = "test-only-memory-id-salt-a-0123456789";
-const SALT_B = "test-only-memory-id-salt-b-9876543210";
+const SALT_A = "1".repeat(64);
+const SALT_B = "2".repeat(64);
 
 describe("Supermemory identity derivation", () => {
   const originalSalt = process.env.DANIEL_MEMORY_ID_SALT;
@@ -91,6 +92,17 @@ describe("Supermemory identity derivation", () => {
     expect(() =>
       deriveMemoryIdentity({ memoryOwnerId: "user", conversationId: "conversation" }),
     ).toThrow(/DANIEL_MEMORY_ID_SALT is required/);
+  });
+
+  it("rejects malformed or weak salts", () => {
+    expect(isValidMemoryIdSalt("a".repeat(64))).toBe(true);
+    expect(isValidMemoryIdSalt("x")).toBe(false);
+    expect(() =>
+      deriveMemoryIdentity(
+        { memoryOwnerId: "user", conversationId: "conversation" },
+        { salt: "x" },
+      ),
+    ).toThrow(/32-byte lowercase hexadecimal value/);
   });
 
   it("detects salt drift as a deployment-breaking error", () => {

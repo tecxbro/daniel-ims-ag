@@ -1,39 +1,16 @@
 import { useMemo } from "react";
 import { useQuery } from "convex/react";
 import { api } from "../../../convex/_generated/api.js";
-import type { MemorySyncJobSummary } from "./EmbeddingBanner.js";
+import {
+  normalizeDashboardSnapshot,
+  type MemorySyncJobSummary,
+} from "../lib/dashboardSnapshot.js";
 import {
   EmptyState,
   HeaderPill,
   PanelPage,
   panelCardClass,
 } from "./PanelPrimitives.js";
-
-interface DashboardEventData {
-  memoryProvider: {
-    healthStatus: string;
-    lastSuccessfulSubmissionAt?: number;
-    lastFailedSubmissionAt?: number;
-    lastWorkerActivityAt?: number;
-  };
-  sync: { recentJobs: MemorySyncJobSummary[] };
-  providerEvents: Array<{
-    eventId: string;
-    operation: string;
-    outcome: "success" | "failure";
-    latencyMs?: number;
-    errorCode?: string;
-    createdAt: number;
-  }>;
-  migration: {
-    pending: number;
-    migrated: number;
-    failed: number;
-    skipped: number;
-    total: number;
-    reconciled: boolean;
-  };
-}
 
 interface MemoryEventView {
   id: string;
@@ -44,14 +21,6 @@ interface MemoryEventView {
   tone: "normal" | "success" | "warning" | "danger";
 }
 
-const KIND_LABELS: Record<string, string> = {
-  conversation_turn: "capture submission",
-  explicit_memory: "explicit write",
-  memory_update: "update operation",
-  memory_forget: "forget operation",
-  image: "image operation",
-};
-
 function eventTone(status: string): MemoryEventView["tone"] {
   if (status === "completed") return "success";
   if (status === "failed") return "warning";
@@ -60,11 +29,11 @@ function eventTone(status: string): MemoryEventView["tone"] {
 }
 
 function eventsForJob(job: MemorySyncJobSummary): MemoryEventView[] {
-  const operation = KIND_LABELS[job.kind] ?? job.kind.replaceAll("_", " ");
+  const operation = "conversation capture";
   const events: MemoryEventView[] = [
     {
       id: `${job.jobId}:state`,
-      type: `memory.${job.kind}`,
+      type: "memory.conversation_turn",
       summary: `${operation} · ${job.status.replace("_", " ")}`,
       detail:
         job.lastError ||
@@ -93,37 +62,28 @@ function formatTime(value: number | undefined): string {
 }
 
 export function EventsPanel({ isDark }: { isDark: boolean }) {
-  const data = useQuery(api.dashboard.metrics, {}) as DashboardEventData | undefined;
+  const rawData = useQuery(api.dashboard.metrics, {}) as unknown;
+  const data = rawData === undefined ? undefined : normalizeDashboardSnapshot(rawData);
   const events = useMemo(() => {
     if (!data) return [];
-    const next = data.sync.recentJobs.flatMap(eventsForJob);
+    const next = (data.sync?.recentJobs ?? []).flatMap(eventsForJob);
     next.push(
-      ...data.providerEvents.map((event) => ({
+      ...(data.providerEvents ?? []).map((event) => ({
         id: event.eventId,
         type: `memory.provider_${event.operation}`,
         summary: `${event.operation} · ${event.outcome}`,
-        detail: [
-          event.latencyMs === undefined ? undefined : `${Math.round(event.latencyMs)} ms`,
-          event.errorCode ? `Error ${event.errorCode}` : undefined,
-        ]
-          .filter(Boolean)
-          .join(" · ") || undefined,
+        detail:
+          [
+            event.latencyMs === undefined ? undefined : `${Math.round(event.latencyMs)} ms`,
+            event.errorCode ? `Error ${event.errorCode}` : undefined,
+          ]
+            .filter(Boolean)
+            .join(" · ") || undefined,
         at: event.createdAt,
         tone: event.outcome === "success" ? "success" as const : "warning" as const,
       })),
     );
-    if (data.migration.total > 0) {
-      next.push({
-        id: "migration:verification",
-        type: "memory.migration_verification",
-        summary: data.migration.reconciled
-          ? "Migration ledger reconciled"
-          : "Migration ledger needs attention",
-        detail: `${data.migration.migrated} migrated · ${data.migration.pending} pending · ${data.migration.failed} failed · ${data.migration.skipped} skipped`,
-        tone: data.migration.reconciled ? "success" : data.migration.failed > 0 ? "danger" : "warning",
-      });
-    }
-    if (data.memoryProvider.lastWorkerActivityAt) {
+    if (data.memoryProvider?.lastWorkerActivityAt) {
       next.push({
         id: "provider:worker",
         type: "memory.provider_status",
@@ -140,24 +100,29 @@ export function EventsPanel({ isDark }: { isDark: boolean }) {
     }
     return next.sort((left, right) => (right.at ?? 0) - (left.at ?? 0));
   }, [data]);
+  const available = Boolean(data?.sync || data?.providerEvents || data?.memoryProvider);
 
   return (
     <PanelPage
       eyebrow="Memory operations"
       title="Events"
-      description="Durable capture, explicit operation, retry, failure, image, and migration activity."
+      description="Durable conversation captures, provider reads, retries, failures, and worker activity."
       stat={<HeaderPill isDark={isDark}>{events.length} recent</HeaderPill>}
       maxWidth="max-w-[1040px]"
     >
-      {!data ? (
+      {data === undefined ? (
         <div className="space-y-2" aria-label="Loading memory events">
           {[1, 2, 3, 4].map((item) => (
             <div key={item} className={panelCardClass(isDark, "h-16 shimmer")} />
           ))}
         </div>
+      ) : !available ? (
+        <EmptyState isDark={isDark}>
+          Memory operation data is unavailable. The dashboard will recover when Convex returns the current contract.
+        </EmptyState>
       ) : events.length === 0 ? (
         <EmptyState isDark={isDark}>
-          No persisted provider operations yet. Completed turns and explicit memory actions will appear here.
+          No persisted provider operations yet. Completed conversations and provider reads will appear here.
         </EmptyState>
       ) : (
         <ol className="space-y-2" aria-label="Recent memory operations">
@@ -189,7 +154,7 @@ export function EventsPanel({ isDark }: { isDark: boolean }) {
                   <span className={`text-sm font-medium ${isDark ? "text-zinc-200" : "text-zinc-800"}`}>
                     {event.summary}
                   </span>
-                  <time className={`ms-auto text-[11px] mono ${isDark ? "text-zinc-500" : "text-zinc-500"}`}>
+                  <time className="ms-auto text-[11px] mono text-zinc-500">
                     {formatTime(event.at)}
                   </time>
                 </div>

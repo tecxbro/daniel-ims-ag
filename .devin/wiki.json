@@ -85,7 +85,7 @@
     },
     {
       "title": "Memory System",
-      "purpose": "Overview of Daniel's tiered memory architecture: extraction, storage, recall, decay, and consolidation. Links to child pages for each subsystem.",
+      "purpose": "Overview of Daniel's SuperMemory-only architecture: identity isolation, fail-open context hydration, durable conversation capture, exact operations, and primary-owner pairing. Links to child pages for each subsystem.",
       "page_notes": [
         {
           "content": ""
@@ -93,8 +93,8 @@
       ]
     },
     {
-      "title": "Memory Tiers, Segments & Storage",
-      "purpose": "The three memory tiers (short/long/permanent), seven segments (identity, preference, correction, relationship, project, knowledge, context), decay rates, the Convex memoryRecords schema, and the write_memory/recall tools.",
+      "title": "Memory Identity & Exact Operations",
+      "purpose": "Opaque sender isolation, salt-fingerprint validation, recovery-required behavior, local primary-owner pairing, and the recall/remember_memory/update_memory/forget_memory/remember_image tools.",
       "parent": "Memory System",
       "page_notes": [
         {
@@ -103,8 +103,8 @@
       ]
     },
     {
-      "title": "Embeddings & Semantic Recall",
-      "purpose": "How embeddings are generated (Voyage → OpenAI → local Xenova/bge-large-en-v1.5 fallback), the 1024-dimension vector index in Convex, and how recall() performs semantic search.",
+      "title": "SuperMemory Context & Search",
+      "purpose": "How the server-only SuperMemory adapter hydrates static and dynamic profile facts, performs bounded semantic search, and fails open when the provider is unavailable.",
       "parent": "Memory System",
       "page_notes": [
         {
@@ -113,8 +113,8 @@
       ]
     },
     {
-      "title": "Memory Consolidation Pipeline",
-      "purpose": "The proposer/adversary/judge LLM pipeline that merges, supersedes, and prunes memories. Scheduling, real-time broadcast telemetry, and usage tracking.",
+      "title": "Durable Memory Capture",
+      "purpose": "The sole conversation_turn outbox contract, atomic assistant persistence, idempotency, retries, fencing, submitted-state recovery, dead letters, and recovery journal.",
       "parent": "Memory System",
       "page_notes": [
         {
@@ -230,7 +230,7 @@
     },
     {
       "title": "Database Schema & Tables",
-      "purpose": "All Convex tables: messages, conversations, memoryRecords (with vector index), executionAgents, codingProjects, codingSessions, codingEvents, codingPendingInputs, automations, drafts, consolidationRuns, usageRecords, settings, and messageDedup.",
+      "purpose": "All Convex tables: application data plus the six SuperMemory support tables for the conversation outbox, provider state, pending exact operations, image anchors, metrics, and events.",
       "parent": "Persistence Layer (Convex)",
       "page_notes": [
         {
@@ -240,7 +240,7 @@
     },
     {
       "title": "Usage Tracking & Cost Accounting",
-      "purpose": "The usageRecords table, how every LLM call (dispatcher, execution, extract, consolidation phases, proactive, coding) logs tokens and cost, and the billingMode (api vs codex-subscription) distinction.",
+      "purpose": "The usageRecords table, how dispatcher, execution, proactive, and coding LLM calls log tokens and cost, and the billingMode (api vs codex-subscription) distinction.",
       "parent": "Persistence Layer (Convex)",
       "page_notes": [
         {
@@ -250,7 +250,7 @@
     },
     {
       "title": "Operations Dashboard",
-      "purpose": "The React/Vite debug dashboard: panels for agents, memory, automations, connections, consolidation, events, settings, and the changelog drawer. WebSocket live updates.",
+      "purpose": "The React/Vite debug dashboard: panels for agents, SuperMemory profiles/search/documents/history/sync, automations, connections, events, local owner pairing, settings, and the changelog drawer. WebSocket live updates.",
       "page_notes": [
         {
           "content": ""
@@ -259,7 +259,7 @@
     },
     {
       "title": "Dashboard Panels & Components",
-      "purpose": "Each panel in the debug UI: DashboardPanel, AgentsPanel, MemoryPanel (with graph view), AutomationsPanel, ConnectionsPanel, ConsolidationPanel, EventsPanel, SettingsPanel, and ChangelogDrawer.",
+      "purpose": "Each panel in the debug UI: DashboardPanel, AgentsPanel, MemoryPanel, MemorySyncPanel, AutomationsPanel, ConnectionsPanel, EventsPanel, SettingsPanel pairing controls, and ChangelogDrawer.",
       "parent": "Operations Dashboard",
       "page_notes": [
         {
@@ -269,7 +269,7 @@
     },
     {
       "title": "Real-time Events & Broadcast",
-      "purpose": "The WebSocket broadcast system (server/broadcast.ts), event types (agent_spawned, agent_stale, automation_started, consolidation_phase, etc.), and how the dashboard subscribes via useSocket.",
+      "purpose": "The WebSocket broadcast system (server/broadcast.ts), agent and automation event types, and how the dashboard subscribes via useSocket.",
       "parent": "Operations Dashboard",
       "page_notes": [
         {

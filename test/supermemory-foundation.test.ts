@@ -9,6 +9,8 @@ import {
   shouldInitializeSupermemoryClient,
   type SupermemorySdkClient,
 } from "../server/memory/supermemory/client.js";
+import { deriveMemoryIdentity } from "../server/memory/supermemory/identity.js";
+import { createConfiguredSupermemoryService } from "../server/memory/supermemory/service.js";
 
 function sourceFiles(directory: string): string[] {
   return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
@@ -26,35 +28,51 @@ function jsonResponse(body: unknown, status = 200): Response {
 }
 
 describe("Supermemory foundation configuration", () => {
-  it("defaults to the Supermemory-only cutover when modes are omitted", () => {
+  it("reports an unconfigured provider when the API key is absent", () => {
     const config = readMemoryProviderConfiguration({});
-    expect(config).toMatchObject({
-      readMode: "supermemory",
-      writeMode: "supermemory",
+    expect(config).toEqual({
       timeoutMs: 1200,
       threshold: 0.6,
       searchLimit: 8,
-      legacyFallback: false,
+      dreaming: "dynamic",
       apiKeyConfigured: false,
     });
-    expect(shouldInitializeSupermemoryClient(config)).toBe(true);
+    expect(shouldInitializeSupermemoryClient(config)).toBe(false);
   });
 
-  it("requires an API key for the default Supermemory-only runtime", () => {
+  it("does not initialize or call the SDK when the API key is absent", () => {
     const sdkFactory = vi.fn();
-    expect(() => createConfiguredSupermemoryProvider({ env: {}, sdkFactory })).toThrow(
-      /SUPERMEMORY_API_KEY is required/,
-    );
+    expect(createConfiguredSupermemoryProvider({ env: {}, sdkFactory })).toBeNull();
+    expect(
+      createConfiguredSupermemoryService({
+        owner: deriveMemoryIdentity(
+          { memoryOwnerId: "fixture-user", conversationId: "fixture-conversation" },
+          { salt: "b".repeat(64) },
+        ),
+        turnId: "turn_1",
+        env: {},
+      }),
+    ).toBeNull();
     expect(sdkFactory).not.toHaveBeenCalled();
   });
 
-  it("requires an API key only when a Supermemory mode is enabled", () => {
-    expect(() =>
+  it("initializes the provider only for a non-empty API key", () => {
+    const sdkFactory = vi.fn(() => ({
+      add: vi.fn(),
+      profile: vi.fn(),
+      search: vi.fn(),
+    }));
+    const config = readMemoryProviderConfiguration({ SUPERMEMORY_API_KEY: "fixture-api-key" });
+
+    expect(config.apiKeyConfigured).toBe(true);
+    expect(shouldInitializeSupermemoryClient(config)).toBe(true);
+    expect(
       createConfiguredSupermemoryProvider({
-        env: { DANIEL_MEMORY_READ_MODE: "shadow" },
-        sdkFactory: vi.fn(),
+        env: { SUPERMEMORY_API_KEY: "fixture-api-key" },
+        sdkFactory,
       }),
-    ).toThrow(/SUPERMEMORY_API_KEY is required/);
+    ).toBeInstanceOf(SupermemoryAdapter);
+    expect(sdkFactory).toHaveBeenCalledOnce();
   });
 
   it("keeps server secrets and the SDK out of browser source", () => {
@@ -68,12 +86,20 @@ describe("Supermemory foundation configuration", () => {
     expect(browserSource).not.toMatch(/server\/memory\/supermemory/);
   });
 
-  it("integrates Supermemory without an active Convex extraction pipeline", () => {
+  it("keeps tool handlers on a thin Supermemory service facade", () => {
     const interactionSource = readFileSync(resolve(process.cwd(), "server/interaction-agent.ts"), "utf8");
-    expect(interactionSource).not.toContain('import { extractAndStore } from "./memory/extract.js"');
+    const serviceSource = readFileSync(
+      resolve(process.cwd(), "server/memory/supermemory/service.ts"),
+      "utf8",
+    );
+    const toolsSource = readFileSync(resolve(process.cwd(), "server/memory/tools.ts"), "utf8");
     expect(interactionSource).toContain('from "./memory/tools.js"');
-    expect(interactionSource).toContain("prepareRuntimeMemoryContext(");
-    expect(interactionSource).toContain("getSupermemoryProvider()");
+    expect(interactionSource).toContain("createConfiguredSupermemoryService(");
+    expect(serviceSource).toContain('from "./context.js"');
+    expect(serviceSource).toContain('from "./operations.js"');
+    expect(serviceSource).toContain("retries: 0");
+    expect(toolsSource).toContain('from "./supermemory/service.js"');
+    expect(toolsSource).not.toContain('from "./supermemory/operations.js"');
   });
 
   it("keeps memory owner and conversation identity distinct at current entry points", () => {
@@ -192,7 +218,7 @@ describe("Supermemory adapter contract", () => {
         apiKey: "test-api-key",
         baseURL: "https://api.supermemory.ai",
         timeout: 1200,
-        maxRetries: 2,
+        maxRetries: 0,
       }),
     );
     expect(add).toHaveBeenCalledWith(
@@ -316,5 +342,26 @@ describe("Supermemory adapter contract", () => {
       .catch((caught) => caught);
     expect(error).toBeInstanceOf(SupermemoryProviderError);
     expect(String(error)).not.toContain("never-leak-this-key");
+  });
+
+  it("does not retry an exact mutation after an ambiguous network failure", async () => {
+    const fetchImpl = vi.fn(async () => {
+      throw new TypeError("socket closed after write");
+    });
+    const adapter = new SupermemoryAdapter({
+      apiKey: "test-api-key",
+      sdkFactory: () =>
+        ({ add: vi.fn(), profile: vi.fn(), search: vi.fn() }) as unknown as SupermemorySdkClient,
+      fetchImpl: fetchImpl as typeof fetch,
+      sleep: async () => undefined,
+    });
+
+    await expect(
+      adapter.createExact({
+        containerTag: "daniel-user-abc123",
+        memories: [{ content: "The user prefers concise answers.", isStatic: false }],
+      }),
+    ).rejects.toBeInstanceOf(SupermemoryProviderError);
+    expect(fetchImpl).toHaveBeenCalledOnce();
   });
 });

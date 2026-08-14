@@ -1,5 +1,3 @@
-import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   runImageCleanupWithDependencies,
@@ -189,12 +187,6 @@ describe("image cleanup retention anchors", () => {
       kept: 1,
     });
   });
-
-  it("no longer consults legacy memoryRecords", () => {
-    const source = readFileSync(resolve(process.cwd(), "server/images/clean.ts"), "utf8");
-    expect(source).toContain("memoryImageAnchors.findRetainedStorageIds");
-    expect(source).not.toContain("memoryRecords");
-  });
 });
 
 describe("durable image operations", () => {
@@ -215,7 +207,8 @@ describe("durable image operations", () => {
     expect(deps.imageAnchors.events).toEqual(["pending", "uploaded", "active"]);
     expect(result.anchor.status).toBe("active");
     expect(result.providerDocumentId).toBe("provider_doc_1");
-    expect(result.outboxPayload.providerInput).not.toHaveProperty("bytes");
+    expect(Object.keys(result).sort()).toEqual(["anchor", "providerDocumentId"]);
+    expect(deps.provider.uploadImage).toHaveBeenCalledOnce();
 
     const repeated = await rememberDurableImage(
       {
@@ -298,8 +291,8 @@ describe("durable image operations", () => {
       },
       {
         jobStore: { enqueue },
-        writeMode: "dual",
-        memoryIdSalt: "test-memory-salt",
+        memoryConfigured: true,
+        memoryIdSalt: "d".repeat(64),
         createJobId: () => "job_1",
       },
     );

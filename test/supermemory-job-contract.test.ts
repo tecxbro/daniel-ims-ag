@@ -1,10 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   buildConversationTurnJobPayload,
-  buildExplicitMemoryOutboxPayload,
-  buildImageOutboxPayload,
-  buildMemoryForgetOutboxPayload,
-  buildMemoryUpdateOutboxPayload,
   parseMemorySyncJobPayload,
   type MemorySyncJobPayload,
 } from "../server/memory/supermemory/job-contract.js";
@@ -19,15 +15,12 @@ const customId = "daniel-conv-conversation001";
 
 function job(payload: MemorySyncJobPayload): MemorySyncJob {
   return {
-    jobId: `job_${payload.kind}`,
-    kind: payload.kind,
+    jobId: "job_conversation_turn",
+    kind: "conversation_turn",
     ownerKey: "owner001",
     containerTag,
-    customId:
-      payload.kind === "conversation_turn" || payload.kind === "image"
-        ? customId
-        : undefined,
-    turnId: payload.kind === "conversation_turn" ? "turn_001" : undefined,
+    customId,
+    turnId: "turn_001",
     payload: JSON.stringify(payload),
     payloadHash: "a".repeat(64),
     status: "pending",
@@ -38,71 +31,59 @@ function job(payload: MemorySyncJobPayload): MemorySyncJob {
   };
 }
 
-function payloads(): MemorySyncJobPayload[] {
-  return [
-    buildConversationTurnJobPayload({
-      content: "USER: hello\nDANIEL: hi",
-      containerTag,
-      customId,
-      taskType: "memory",
-    }),
-    buildExplicitMemoryOutboxPayload({
-      containerTag,
-      memories: [{ content: "The user prefers concise answers" }],
-    }),
-    buildImageOutboxPayload({
-      containerTag,
-      customId,
-      storageId: "storage_001",
-      reason: "explicit_request",
-    }),
-    buildMemoryUpdateOutboxPayload({
-      containerTag,
-      memoryId: "memory_001",
-      newContent: "The user now prefers detailed answers",
-    }),
-    buildMemoryForgetOutboxPayload({
-      containerTag,
-      providerMemoryIds: ["memory_001", "memory_002", "memory_001"],
-      reason: "user requested",
-    }),
-  ];
+function conversationPayload(): MemorySyncJobPayload {
+  return buildConversationTurnJobPayload({
+    content: "USER: hello\nDANIEL: hi",
+    containerTag,
+    customId,
+    taskType: "memory",
+  });
 }
 
 describe("canonical memory sync job contract", () => {
-  it("round-trips every producer through serialization, parsing, and dispatch", async () => {
-    const handlers = Object.fromEntries(
-      ["conversation_turn", "explicit_memory", "image", "memory_update", "memory_forget"].map(
-        (kind) => [kind, vi.fn(async () => ({}))],
-      ),
-    ) as unknown as MemorySyncDispatchHandlers;
+  it("round-trips a conversation turn through serialization, parsing, and dispatch", async () => {
+    const handler = vi.fn(async () => ({ providerDocumentId: "doc_001" }));
+    const handlers: MemorySyncDispatchHandlers = { conversation_turn: handler };
     const dispatcher = new MemorySyncDispatcher(handlers);
+    const durableJob = job(conversationPayload());
 
-    for (const payload of payloads()) await dispatcher.dispatch(job(payload));
-
-    for (const handler of Object.values(handlers)) expect(handler).toHaveBeenCalledOnce();
-    expect(handlers.image).toHaveBeenCalledWith(
-      expect.objectContaining({ storageId: "storage_001", customId }),
-      expect.objectContaining({ kind: "image" }),
-    );
-    expect(handlers.memory_forget).toHaveBeenCalledWith(
-      expect.objectContaining({ ids: ["memory_001", "memory_002"] }),
-      expect.objectContaining({ kind: "memory_forget" }),
+    await expect(dispatcher.dispatch(durableJob)).resolves.toEqual({
+      providerDocumentId: "doc_001",
+    });
+    expect(handler).toHaveBeenCalledOnce();
+    expect(handler).toHaveBeenCalledWith(
+      expect.objectContaining({ containerTag, customId }),
+      durableJob,
     );
   });
 
-  it("rejects unknown schema versions and cross-container payloads", () => {
-    const payload = buildConversationTurnJobPayload({
-      content: "USER: hello\nDANIEL: hi",
-      containerTag,
-      customId,
-    });
+  it("accepts only conversation_turn as the durable outbox kind", () => {
+    const payload = conversationPayload();
+
     expect(() =>
-      parseMemorySyncJobPayload({ ...payload, schemaVersion: 2 }, {
-        kind: "conversation_turn",
-        containerTag,
-        customId,
-      }),
+      parseMemorySyncJobPayload(
+        { ...payload, kind: "unsupported_kind" },
+        {
+          kind: "conversation_turn",
+          containerTag,
+          customId,
+        },
+      ),
+    ).toThrow(/kind .* does not match durable job/);
+  });
+
+  it("rejects unknown schema versions and cross-container payloads", () => {
+    const payload = conversationPayload();
+
+    expect(() =>
+      parseMemorySyncJobPayload(
+        { ...payload, schemaVersion: 2 },
+        {
+          kind: "conversation_turn",
+          containerTag,
+          customId,
+        },
+      ),
     ).toThrow(/schemaVersion/);
     expect(() =>
       parseMemorySyncJobPayload(payload, {

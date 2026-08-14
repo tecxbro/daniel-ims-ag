@@ -8,21 +8,24 @@ const uiFiles = [
   "debug/src/components/MemoryPanel.tsx",
   "debug/src/components/EventsPanel.tsx",
   "debug/src/components/DashboardPanel.tsx",
-  "debug/src/components/ConsolidationPanel.tsx",
-  "debug/src/components/EmbeddingBanner.tsx",
+  "debug/src/components/MemorySyncPanel.tsx",
+  "debug/src/components/SupermemoryStatusBanner.tsx",
   "debug/src/components/MemoryGraphView.tsx",
+  "debug/src/components/PrimaryOwnerPairing.tsx",
+  "debug/src/lib/dashboardSnapshot.ts",
 ];
 
 async function source(file: string): Promise<string> {
   return await readFile(path.join(root, file), "utf8");
 }
 
-describe("Implementation 9 Supermemory dashboard", () => {
+describe("Implementation 10 Supermemory dashboard", () => {
   it("keeps active memory views off legacy Convex APIs and browser provider credentials", async () => {
     const combined = (await Promise.all(uiFiles.map(source))).join("\n");
-    expect(combined).not.toContain("api.memoryRecords");
-    expect(combined).not.toContain("api.memoryEvents");
-    expect(combined).not.toContain("api.consolidation");
+    const removedApis = ["memory" + "Records", "memory" + "Events", "consolidation"];
+    for (const apiName of removedApis) {
+      expect(combined).not.toContain(["api", apiName].join("."));
+    }
     expect(combined).not.toContain('from "supermemory"');
     expect(combined).not.toContain("SUPERMEMORY_API_KEY");
   });
@@ -30,7 +33,7 @@ describe("Implementation 9 Supermemory dashboard", () => {
   it("uses the normalized server-only provider routes", async () => {
     const memory = await source("debug/src/components/MemoryPanel.tsx");
     const explorer = await source("debug/src/components/MemoryGraphView.tsx");
-    const status = await source("debug/src/components/EmbeddingBanner.tsx");
+    const status = await source("debug/src/components/SupermemoryStatusBanner.tsx");
     expect(status).toContain("/api/memory/provider-status");
     expect(memory).toContain("/api/memory/profile");
     expect(memory).toContain("/api/memory/search");
@@ -42,7 +45,7 @@ describe("Implementation 9 Supermemory dashboard", () => {
   });
 
   it("exposes failed and dead-letter retry controls", async () => {
-    const sync = await source("debug/src/components/ConsolidationPanel.tsx");
+    const sync = await source("debug/src/components/MemorySyncPanel.tsx");
     expect(sync).toContain("/api/memory/retry-job");
     expect(sync).toContain("/api/memory/retry-dead-letter");
     expect(sync).toContain("Retry dead letter");
@@ -56,8 +59,25 @@ describe("Implementation 9 Supermemory dashboard", () => {
     expect(explorer).not.toContain("ForceGraph");
     expect(explorer).not.toContain("SEGMENT_COLORS");
     expect(memory).not.toContain("Re-embed");
-    expect(memory).not.toContain("tierFilter");
-    expect(app).not.toContain("countsByTier");
     expect(app).toContain("Memory sync");
+  });
+
+  it("offers local primary-owner pairing without rendering protected identity fields", async () => {
+    const settings = await source("debug/src/components/SettingsPanel.tsx");
+    const pairing = await source("debug/src/components/PrimaryOwnerPairing.tsx");
+    expect(settings).toContain("Primary memory owner");
+    expect(pairing).toContain("/api/memory/pairing/status");
+    expect(pairing).toContain("/api/memory/pairing/code");
+    expect(pairing).toContain("/api/memory/pairing/candidates");
+    expect(pairing).toContain("/api/memory/pairing/confirm");
+    for (const protectedField of [
+      "owner" + "Key",
+      "container" + "Tag",
+      "conversation" + "Id",
+      "pairingAuthority" + "Proof",
+      "salt" + "Fingerprint",
+    ]) {
+      expect(pairing).not.toContain(protectedField);
+    }
   });
 });

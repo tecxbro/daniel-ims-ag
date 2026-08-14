@@ -1,17 +1,14 @@
 import { describe, expect, it, vi } from "vitest";
+import { createMemoryTools } from "../server/memory/tools.js";
 import {
-  createMemoryTools,
-  type CreateMemoryToolsOptions,
-  type LegacyMemoryRecall,
-} from "../server/memory/tools.js";
-import type {
-  ForgetMatchingResult,
-  ImageAnchor,
-  MemoryOperationDependencies,
-  MemoryOperationProvider,
-  PendingOperation,
-  PendingOperationStore,
+  type ForgetMatchingResult,
+  type ImageAnchor,
+  type MemoryOperationDependencies,
+  type MemoryOperationProvider,
+  type PendingOperation,
+  type PendingOperationStore,
 } from "../server/memory/supermemory/operations.js";
+import { SupermemoryService } from "../server/memory/supermemory/service.js";
 import type {
   DanielMemoryProvider,
   MemoryOwnerContext,
@@ -29,21 +26,12 @@ const OWNER: MemoryOwnerContext = {
   saltFingerprint: "salt-fingerprint-a",
 };
 
-const BASE_CONFIG: Pick<
-  MemoryProviderConfiguration,
-  | "readMode"
-  | "writeMode"
-  | "timeoutMs"
-  | "threshold"
-  | "searchLimit"
-  | "legacyFallback"
-> = {
-  readMode: "shadow",
-  writeMode: "dual",
+const CONFIGURATION: MemoryProviderConfiguration = {
   timeoutMs: 1_200,
   threshold: 0.6,
   searchLimit: 8,
-  legacyFallback: true,
+  dreaming: "dynamic",
+  apiKeyConfigured: true,
 };
 
 function memoryResult(id: string, content: string) {
@@ -56,48 +44,22 @@ function memoryResult(id: string, content: string) {
   };
 }
 
-function provider(
-  search: DanielMemoryProvider["search"] = vi.fn(async () => []),
-): Pick<DanielMemoryProvider, "profile" | "search"> {
-  return {
-    profile: vi.fn(async () => ({
-      provider: "supermemory",
-      profile: { static: [], dynamic: [] },
-      results: [],
-      latencyMs: 1,
-    })),
-    search,
-  };
-}
-
-function legacyRecall(content = "Legacy aisle-seat preference") {
-  return vi.fn(async (): Promise<LegacyMemoryRecall> => ({
-    mode: "substring",
-    results: [
-      {
-        memoryId: "legacy_1",
-        content,
-        tier: "long",
-        segment: "preference",
-        importance: 0.8,
-      },
-    ],
-  }));
-}
-
 class PendingStore implements PendingOperationStore {
   operation: PendingOperation | null = null;
 
-  async create(input: Omit<PendingOperation, "status" | "createdAt" | "completedAt"> & { now: number }) {
-    this.operation = {
-      ...input,
-      status: "pending",
-      createdAt: input.now,
-    };
+  async create(
+    input: Omit<PendingOperation, "status" | "createdAt" | "completedAt"> & { now: number },
+  ) {
+    this.operation = { ...input, status: "pending", createdAt: input.now };
     return this.operation;
   }
 
-  async confirm(input: { operationId: string; ownerKey: string; conversationId: string; now: number }) {
+  async confirm(input: {
+    operationId: string;
+    ownerKey: string;
+    conversationId: string;
+    now: number;
+  }) {
     if (
       !this.operation ||
       this.operation.operationId !== input.operationId ||
@@ -110,10 +72,16 @@ class PendingStore implements PendingOperationStore {
     return { ok: true as const, operation: this.operation };
   }
 
-  async complete(input: { operationId: string; ownerKey: string; conversationId: string; now: number }) {
-    const confirmed = await this.confirm(input);
-    if (!confirmed.ok) return confirmed;
-    this.operation = { ...confirmed.operation, status: "completed", completedAt: input.now };
+  async complete(input: {
+    operationId: string;
+    ownerKey: string;
+    conversationId: string;
+    now: number;
+  }) {
+    if (!this.operation || this.operation.status !== "confirmed") {
+      return { ok: false as const, reason: "invalid_status" as const };
+    }
+    this.operation = { ...this.operation, status: "completed", completedAt: input.now };
     return { ok: true as const, operation: this.operation };
   }
 
@@ -126,7 +94,7 @@ class PendingStore implements PendingOperationStore {
   }
 }
 
-function operations(): MemoryOperationDependencies & {
+function operationDependencies(): MemoryOperationDependencies & {
   provider: MemoryOperationProvider;
   pendingOperations: PendingStore;
 } {
@@ -140,7 +108,7 @@ function operations(): MemoryOperationDependencies & {
     candidates: [{ id: "provider_rome", memory: "The Rome trip is in May", score: 0.9 }],
     forgotten: [],
   };
-  const operationProvider: MemoryOperationProvider = {
+  const provider: MemoryOperationProvider = {
     search: vi.fn(async () => [memoryResult("provider_old", "The user prefers dark mode")]),
     createExact: vi.fn(async (input) => ({
       documentId: "provider_doc",
@@ -173,7 +141,7 @@ function operations(): MemoryOperationDependencies & {
   };
 
   return {
-    provider: operationProvider,
+    provider,
     pendingOperations,
     imageAnchors: {
       async createPending(input) {
@@ -204,24 +172,37 @@ function operations(): MemoryOperationDependencies & {
   };
 }
 
-function options(
-  overrides: Partial<CreateMemoryToolsOptions> = {},
-): CreateMemoryToolsOptions {
+function provider(
+  search: DanielMemoryProvider["search"] = vi.fn(async () => []),
+): Pick<DanielMemoryProvider, "profile" | "search"> {
   return {
+    profile: vi.fn(async () => ({
+      provider: "supermemory",
+      profile: { static: [], dynamic: [] },
+      results: [],
+      latencyMs: 1,
+    })),
+    search,
+  };
+}
+
+function fixture(input?: {
+  search?: DanielMemoryProvider["search"];
+  imageStorageIds?: string[];
+}) {
+  const operations = operationDependencies();
+  const service = new SupermemoryService({
     owner: OWNER,
     turnId: "turn_tools",
-    imageStorageIds: ["storage_1"],
-    config: BASE_CONFIG,
-    provider: provider(),
-    operationDependencies: operations(),
-    legacyRecall: legacyRecall(),
-    legacyWrite: vi.fn(async (input) => ({
-      memoryId: "legacy_created",
-      tier: input.tier ?? "long",
-      segment: input.segment,
-    })),
-    ...overrides,
-  };
+    provider: provider(input?.search),
+    configuration: CONFIGURATION,
+    operations,
+  });
+  const tools = createMemoryTools({
+    service,
+    imageStorageIds: input?.imageStorageIds ?? ["storage_1"],
+  });
+  return { operations, service, tools };
 }
 
 function tool(tools: ReturnType<typeof createMemoryTools>, name: string) {
@@ -230,199 +211,104 @@ function tool(tools: ReturnType<typeof createMemoryTools>, name: string) {
   return selected;
 }
 
-describe("Implementation 7 memory tools", () => {
-  it("keeps shadow recall user-facing output on Convex while executing the provider query", async () => {
-    const providerSearch = vi.fn(async () => [memoryResult("provider_1", "Provider-only preference")]);
-    const legacy = legacyRecall();
-    const tools = createMemoryTools(
-      options({ provider: provider(providerSearch), legacyRecall: legacy }),
-    );
-
-    const result = await tool(tools, "recall").handle({ query: "seat preference" });
-
-    expect(result.text).toContain("Legacy aisle-seat preference");
-    expect(result.text).not.toContain("Provider-only preference");
-    expect(providerSearch).toHaveBeenCalledWith(
-      expect.objectContaining({ containerTag: OWNER.containerTag, q: "seat preference" }),
-    );
-    expect(legacy).toHaveBeenCalledOnce();
+describe("Implementation 10 Supermemory tools", () => {
+  it("exposes only the direct Supermemory tool surface", () => {
+    expect(fixture().tools.map(({ name }) => name)).toEqual([
+      "remember_memory",
+      "recall",
+      "update_memory",
+      "forget_memory",
+      "remember_image",
+    ]);
   });
 
-  it("uses Supermemory recall after cutover and falls back only on provider failure", async () => {
-    const legacy = legacyRecall();
-    const successfulSearch = vi.fn(async () => [memoryResult("provider_1", "Provider aisle-seat preference")]);
-    const successful = createMemoryTools(
-      options({
-        config: { ...BASE_CONFIG, readMode: "supermemory" },
-        provider: provider(successfulSearch),
-        legacyRecall: legacy,
-      }),
-    );
-
-    const found = await tool(successful, "recall").handle({ query: "seat preference" });
-    expect(found.text).toContain("Provider aisle-seat preference");
-    expect(legacy).not.toHaveBeenCalled();
-
-    const empty = createMemoryTools(
-      options({
-        config: { ...BASE_CONFIG, readMode: "supermemory" },
-        provider: provider(vi.fn(async () => [])),
-        legacyRecall: legacy,
-      }),
-    );
-    expect((await tool(empty, "recall").handle({ query: "unknown" })).text).toBe(
-      "No memories matched.",
-    );
-    expect(legacy).not.toHaveBeenCalled();
-
-    const failed = createMemoryTools(
-      options({
-        config: { ...BASE_CONFIG, readMode: "supermemory", legacyFallback: true },
-        provider: provider(vi.fn(async () => { throw new Error("provider unavailable"); })),
-        legacyRecall: legacy,
-      }),
-    );
-    expect((await tool(failed, "recall").handle({ query: "seat preference" })).text).toContain(
-      "Legacy aisle-seat preference",
-    );
-    expect(legacy).toHaveBeenCalledOnce();
-
-    const isolatedLegacy = legacyRecall();
-    const isolated = createMemoryTools(
-      options({
-        owner: { ...OWNER, containerTag: "daniel-user-wrong-owner" },
-        config: { ...BASE_CONFIG, readMode: "supermemory", legacyFallback: true },
-        provider: provider(successfulSearch),
-        legacyRecall: isolatedLegacy,
-      }),
-    );
-    const rejected = await tool(isolated, "recall").handle({ query: "seat preference" });
-    expect(rejected.success).toBe(false);
-    expect(isolatedLegacy).not.toHaveBeenCalled();
-  });
-
-  it("writes an exact provider memory plus the Convex rollback copy in dual mode", async () => {
-    const deps = operations();
-    const legacyWrite = vi.fn(async (input) => ({
-      memoryId: "legacy_created",
-      tier: input.tier ?? "permanent" as const,
-      segment: input.segment,
-    }));
-    const tools = createMemoryTools(
-      options({ operationDependencies: deps, legacyWrite }),
-    );
-
-    const result = await tool(tools, "write_memory").handle({
+  it("remembers one exact fact synchronously through the thin service facade", async () => {
+    const { operations, tools } = fixture();
+    const result = await tool(tools, "remember_memory").handle({
       content: "The user's preferred name is Alex.",
-      segment: "identity",
-      importance: 0.95,
       staticKind: "preferred_name",
     });
 
-    expect(result.success).toBe(true);
+    expect(result).toMatchObject({ success: true });
     expect(result.text).toContain("provider_created");
-    expect(result.text).toContain("legacy_created");
-    expect(deps.provider.createExact).toHaveBeenCalledWith({
+    expect(operations.provider.createExact).toHaveBeenCalledWith({
       containerTag: OWNER.containerTag,
       memories: [
         expect.objectContaining({
           content: "The user's preferred name is Alex.",
           isStatic: true,
+          metadata: expect.objectContaining({
+            conversationKey: OWNER.conversationKey,
+            turnId: "turn_tools",
+          }),
         }),
       ],
     });
-    expect(legacyWrite).toHaveBeenCalledOnce();
   });
 
-  it("still writes the Convex rollback copy when the dual-write provider is unavailable", async () => {
-    const legacyWrite = vi.fn(async (input) => ({
-      memoryId: "legacy_rollback_only",
-      tier: input.tier ?? "long" as const,
-      segment: input.segment,
-    }));
-    const tools = createMemoryTools(
-      options({
-        provider: null,
-        operationDependencies: null,
-        legacyWrite,
-      }),
-    );
-
-    const result = await tool(tools, "write_memory").handle({
-      content: "The user prefers window seats.",
-      segment: "preference",
-      importance: 0.8,
+  it("returns truthful empty recall and fails open on provider errors", async () => {
+    const empty = fixture();
+    await expect(tool(empty.tools, "recall").handle({ query: "unknown" })).resolves.toMatchObject({
+      success: true,
+      text: "No memories matched.",
     });
 
+    const unavailable = fixture({ search: vi.fn(async () => Promise.reject(new TypeError("offline"))) });
+    const result = await tool(unavailable.tools, "recall").handle({ query: "seat preference" });
     expect(result.success).toBe(false);
-    expect(result.text).toContain("legacy_rollback_only");
-    expect(result.text).toContain("Supermemory exact write was unavailable");
-    expect(legacyWrite).toHaveBeenCalledOnce();
+    expect(result.text).toContain("Continue the conversation");
+    expect(result.text).not.toContain("offline");
   });
 
-  it("searches update candidates, then versions only an exact selected ID", async () => {
-    const deps = operations();
-    const tools = createMemoryTools(options({ operationDependencies: deps }));
+  it("searches update candidates before updating one exact selected ID", async () => {
+    const { operations, tools } = fixture();
     const update = tool(tools, "update_memory");
 
-    const candidates = await update.handle({ query: "dark mode" });
-    expect(candidates.text).toContain("provider_old");
-    expect(deps.provider.search).toHaveBeenCalledWith(
-      expect.objectContaining({ q: "dark mode", containerTag: OWNER.containerTag }),
-    );
-
+    expect((await update.handle({ query: "dark mode" })).text).toContain("provider_old");
     const updated = await update.handle({
       memoryId: "provider_old",
       newContent: "The user now prefers light mode.",
     });
+
     expect(updated.text).toContain("provider_new");
-    expect(deps.provider.updateExact).toHaveBeenCalledWith(
-      expect.objectContaining({
-        id: "provider_old",
-        newContent: "The user now prefers light mode.",
-        containerTag: OWNER.containerTag,
-      }),
-    );
+    expect(operations.provider.updateExact).toHaveBeenCalledWith({
+      containerTag: OWNER.containerTag,
+      id: "provider_old",
+      newContent: "The user now prefers light mode.",
+      metadata: undefined,
+    });
+    expect((await update.handle({ query: "dark", memoryId: "provider_old" })).success).toBe(false);
   });
 
-  it("previews forget once and confirms the stored exact IDs without rerunning semantics", async () => {
-    const deps = operations();
-    const forget = tool(
-      createMemoryTools(options({ operationDependencies: deps })),
-      "forget_memory",
-    );
+  it("previews forget once and confirms only the stored exact IDs", async () => {
+    const { operations, tools } = fixture();
+    const forget = tool(tools, "forget_memory");
 
     const preview = await forget.handle({ query: "Rome trip" });
     expect(preview.text).toContain("memory-op-tools");
-    expect(preview.text).toContain("Rome trip");
+    const confirmed = await forget.handle({ operationId: "memory-op-tools", confirm: true });
 
-    const confirmed = await forget.handle({
-      operationId: "memory-op-tools",
-      confirm: true,
-    });
     expect(confirmed.text).toBe("Forgot 1 confirmed memory.");
-    expect(deps.provider.previewForget).toHaveBeenCalledOnce();
-    expect(deps.provider.applyExactForget).toHaveBeenCalledWith(
-      expect.objectContaining({ ids: ["provider_rome"], containerTag: OWNER.containerTag }),
-    );
+    expect(operations.provider.previewForget).toHaveBeenCalledOnce();
+    expect(operations.provider.applyExactForget).toHaveBeenCalledWith({
+      containerTag: OWNER.containerTag,
+      ids: ["provider_rome"],
+      reason: undefined,
+    });
   });
 
-  it("routes explicitly durable images through the anchor-backed image operation", async () => {
-    const deps = operations();
-    const rememberImage = tool(
-      createMemoryTools(options({ operationDependencies: deps })),
-      "remember_image",
-    );
+  it("remembers only an exact current-turn image synchronously", async () => {
+    const { operations, tools } = fixture();
+    const rememberImage = tool(tools, "remember_image");
 
     const foreign = await rememberImage.handle({ storageId: "storage_from_another_turn" });
     expect(foreign.success).toBe(false);
-    expect(deps.fetchImageBytes).not.toHaveBeenCalled();
+    expect(operations.fetchImageBytes).not.toHaveBeenCalled();
 
     const result = await rememberImage.handle({ storageId: "storage_1" });
-
     expect(result.text).toContain("provider_image");
-    expect(deps.fetchImageBytes).toHaveBeenCalledWith("storage_1");
-    expect(deps.provider.uploadImage).toHaveBeenCalledWith(
+    expect(operations.fetchImageBytes).toHaveBeenCalledWith("storage_1");
+    expect(operations.provider.uploadImage).toHaveBeenCalledWith(
       expect.objectContaining({
         containerTag: OWNER.containerTag,
         mediaType: "image/png",

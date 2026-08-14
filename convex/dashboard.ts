@@ -24,11 +24,9 @@ const syncStatuses = [
   "dead_letter",
 ] as const;
 
-const migrationStatuses = ["pending", "migrated", "failed", "skipped"] as const;
 const imageAnchorStatuses = ["pending", "active", "released"] as const;
 
 type SyncStatus = (typeof syncStatuses)[number];
-type MigrationStatus = (typeof migrationStatuses)[number];
 type ImageAnchorStatus = (typeof imageAnchorStatuses)[number];
 
 type BoundedCount = {
@@ -107,36 +105,6 @@ async function readSyncSnapshot(ctx: QueryCtx) {
   };
 }
 
-async function readMigrationSnapshot(ctx: QueryCtx) {
-  const entries = await Promise.all(
-    migrationStatuses.map(async (status) => {
-      const rows = await ctx.db
-        .query("memoryMigrationRows")
-        .withIndex("by_status", (q) => q.eq("status", status))
-        .take(OPERATIONAL_COUNT_LIMIT + 1);
-      return [status, boundedCount(rows)] as const;
-    }),
-  );
-  const counts = Object.fromEntries(entries) as Record<MigrationStatus, BoundedCount>;
-  const pending = counts.pending.count;
-  const migrated = counts.migrated.count;
-  const failed = counts.failed.count;
-  const skipped = counts.skipped.count;
-  const total = pending + migrated + failed + skipped;
-
-  return {
-    value: {
-      pending,
-      migrated,
-      failed,
-      skipped,
-      total,
-      reconciled: total > 0 && pending === 0 && failed === 0,
-    },
-    truncated: Object.values(counts).some((count) => count.truncated),
-  };
-}
-
 async function readImageAnchorSnapshot(ctx: QueryCtx) {
   const entries = await Promise.all(
     imageAnchorStatuses.map(async (status) => {
@@ -147,7 +115,10 @@ async function readImageAnchorSnapshot(ctx: QueryCtx) {
       return [status, boundedCount(rows)] as const;
     }),
   );
-  const counts = Object.fromEntries(entries) as Record<ImageAnchorStatus, BoundedCount>;
+  const counts = Object.fromEntries(entries) as Record<
+    ImageAnchorStatus,
+    BoundedCount
+  >;
   const pending = counts.pending.count;
   const active = counts.active.count;
   const released = counts.released.count;
@@ -159,24 +130,33 @@ async function readImageAnchorSnapshot(ctx: QueryCtx) {
 }
 
 function providerSnapshot(state: Doc<"memoryProviderState"> | null) {
-  const healthStatus = state?.healthStatus ?? "unconfigured";
+  const healthStatus =
+    state?.healthStatus === "healthy" ||
+    state?.healthStatus === "degraded" ||
+    state?.healthStatus === "unavailable" ||
+    state?.healthStatus === "recovery_required"
+      ? state.healthStatus
+      : "unconfigured";
   return {
-    configured: healthStatus !== "disabled" && healthStatus !== "unconfigured",
+    configured:
+      healthStatus !== "unconfigured" && healthStatus !== "recovery_required",
     healthStatus,
-    readMode: state?.readMode ?? "convex",
-    writeMode: state?.writeMode ?? "convex",
     lastSuccessfulSubmissionAt: state?.lastSuccessfulSubmissionAt,
     lastFailedSubmissionAt: state?.lastFailedSubmissionAt,
     lastWorkerActivityAt: state?.lastWorkerActivityAt,
-    lastError: state?.lastError,
+    hasError: Boolean(state?.lastError),
   };
 }
 
-function hydrationSnapshot(
-  buckets: Doc<"memoryProviderMetrics">[],
-) {
-  const requests = buckets.reduce((sum, bucket) => sum + bucket.requestCount, 0);
-  const failures = buckets.reduce((sum, bucket) => sum + bucket.failureCount, 0);
+function hydrationSnapshot(buckets: Doc<"memoryProviderMetrics">[]) {
+  const requests = buckets.reduce(
+    (sum, bucket) => sum + bucket.requestCount,
+    0,
+  );
+  const failures = buckets.reduce(
+    (sum, bucket) => sum + bucket.failureCount,
+    0,
+  );
   const totalLatencyMs = buckets.reduce(
     (sum, bucket) => sum + bucket.totalLatencyMs,
     0,
@@ -216,7 +196,9 @@ export const metrics = query({
       .withIndex("by_key", (q) => q.eq("key", DEMO_SETTING_KEY))
       .unique();
     const providerStateKey =
-      demoSetting?.value === "true" ? DEMO_DEPLOYMENT_STATE_KEY : DEPLOYMENT_STATE_KEY;
+      demoSetting?.value === "true"
+        ? DEMO_DEPLOYMENT_STATE_KEY
+        : DEPLOYMENT_STATE_KEY;
 
     const [
       messages,
@@ -225,7 +207,6 @@ export const metrics = query({
       usageRecords,
       providerState,
       sync,
-      migration,
       imageAnchors,
       providerMetricBuckets,
       providerEvents,
@@ -235,24 +216,14 @@ export const metrics = query({
         .withIndex("by_createdAt")
         .order("desc")
         .take(METRICS_SCAN_LIMIT),
-      ctx.db
-        .query("executionAgents")
-        .order("desc")
-        .take(METRICS_SCAN_LIMIT),
-      ctx.db
-        .query("automationRuns")
-        .order("desc")
-        .take(METRICS_SCAN_LIMIT),
-      ctx.db
-        .query("usageRecords")
-        .order("desc")
-        .take(METRICS_SCAN_LIMIT),
+      ctx.db.query("executionAgents").order("desc").take(METRICS_SCAN_LIMIT),
+      ctx.db.query("automationRuns").order("desc").take(METRICS_SCAN_LIMIT),
+      ctx.db.query("usageRecords").order("desc").take(METRICS_SCAN_LIMIT),
       ctx.db
         .query("memoryProviderState")
         .withIndex("by_state_key", (q) => q.eq("stateKey", providerStateKey))
         .unique(),
       readSyncSnapshot(ctx),
-      readMigrationSnapshot(ctx),
       readImageAnchorSnapshot(ctx),
       ctx.db
         .query("memoryProviderMetrics")
@@ -272,7 +243,6 @@ export const metrics = query({
       automationRuns.length === METRICS_SCAN_LIMIT ||
       usageRecords.length === METRICS_SCAN_LIMIT ||
       sync.truncated ||
-      migration.truncated ||
       imageAnchors.truncated;
 
     const buckets = new Map<
@@ -356,13 +326,14 @@ export const metrics = query({
         createdAt: event.createdAt,
       })),
       sync: sync.value,
-      migration: migration.value,
       imageAnchors: imageAnchors.value,
       agents: {
         total: agents.length,
-        completed: agents.filter((agent) => agent.status === "completed").length,
+        completed: agents.filter((agent) => agent.status === "completed")
+          .length,
         failed: agents.filter((agent) => agent.status === "failed").length,
-        cancelled: agents.filter((agent) => agent.status === "cancelled").length,
+        cancelled: agents.filter((agent) => agent.status === "cancelled")
+          .length,
         running: agents.filter(
           (agent) => agent.status === "running" || agent.status === "spawned",
         ).length,
@@ -371,8 +342,14 @@ export const metrics = query({
         total: dailyBuckets.reduce((sum, bucket) => sum + bucket.agentCost, 0),
       },
       tokens: {
-        input: dailyBuckets.reduce((sum, bucket) => sum + bucket.inputTokens, 0),
-        output: dailyBuckets.reduce((sum, bucket) => sum + bucket.outputTokens, 0),
+        input: dailyBuckets.reduce(
+          (sum, bucket) => sum + bucket.inputTokens,
+          0,
+        ),
+        output: dailyBuckets.reduce(
+          (sum, bucket) => sum + bucket.outputTokens,
+          0,
+        ),
       },
       dailyBuckets,
       truncated,

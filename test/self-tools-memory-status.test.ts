@@ -9,15 +9,35 @@ import {
 import type { MemoryProviderConfiguration } from "../server/memory/supermemory/types.js";
 
 const configuredMemory: MemoryProviderConfiguration = {
-  readMode: "shadow",
-  writeMode: "dual",
   timeoutMs: 1_200,
   threshold: 0.6,
   searchLimit: 8,
   dreaming: "dynamic",
-  historyBackfillDays: 0,
-  legacyFallback: true,
   apiKeyConfigured: true,
+};
+
+const availableOperationalState = {
+  providerState: {
+    healthStatus: "healthy" as const,
+    lastSuccessfulSubmissionAt: 100,
+    lastFailedSubmissionAt: 90,
+    hasError: false,
+    lastWorkerActivityAt: 110,
+    updatedAt: 120,
+  },
+  syncBacklog: {
+    pending: 1,
+    processing: 0,
+    submitted: 0,
+    completed: 4,
+    failed: 0,
+    deadLetter: 0,
+    active: 1,
+    total: 5,
+    truncated: false,
+  },
+  providerStateAvailable: true,
+  syncBacklogAvailable: true,
 };
 
 afterEach(() => {
@@ -26,14 +46,15 @@ afterEach(() => {
 });
 
 describe("self-tool memory provider status", () => {
-  it("reads provider health and sync backlog from the durable Convex modules", async () => {
+  it("reads sanitized provider health and the durable sync backlog", async () => {
     const query = vi
       .fn()
       .mockResolvedValueOnce({
         healthStatus: "degraded",
         lastSuccessfulSubmissionAt: 100,
         lastFailedSubmissionAt: 200,
-        lastError: "provider timeout",
+        hasError: true,
+        lastError: "sensitive provider detail",
         lastWorkerActivityAt: 250,
         updatedAt: 300,
       })
@@ -62,7 +83,7 @@ describe("self-tool memory provider status", () => {
         healthStatus: "degraded",
         lastSuccessfulSubmissionAt: 100,
         lastFailedSubmissionAt: 200,
-        lastError: "provider timeout",
+        hasError: true,
         lastWorkerActivityAt: 250,
         updatedAt: 300,
       },
@@ -80,121 +101,115 @@ describe("self-tool memory provider status", () => {
       providerStateAvailable: true,
       syncBacklogAvailable: true,
     });
+    expect(JSON.stringify(status)).not.toContain("sensitive provider detail");
   });
 
-  it("keeps partial status available if one operational query fails", async () => {
+  it("keeps the independent sync result when provider state is unavailable", async () => {
     const query = vi
       .fn()
       .mockRejectedValueOnce(new Error("provider state unavailable"))
       .mockResolvedValueOnce({ pending: 1, failed: 2, total: 3 });
 
-    await expect(readMemoryProviderOperationalStatus({ query })).resolves.toMatchObject({
+    await expect(readMemoryProviderOperationalStatus({ query })).resolves.toEqual({
       providerState: null,
       providerStateAvailable: false,
-      syncBacklog: { pending: 1, failed: 2, total: 3 },
-      syncBacklogAvailable: true,
-    });
-  });
-
-  it("exposes shadow/dual modes, operational timestamps, and inactive fallback", () => {
-    const status = buildMemoryRuntimeStatus(configuredMemory, {
-      providerState: {
-        healthStatus: "healthy",
-        lastSuccessfulSubmissionAt: 100,
-        lastFailedSubmissionAt: 90,
-        lastError: "old failure",
-        lastWorkerActivityAt: 110,
-        updatedAt: 120,
-      },
       syncBacklog: {
         pending: 1,
         processing: 0,
         submitted: 0,
-        completed: 4,
-        failed: 0,
+        completed: 0,
+        failed: 2,
         deadLetter: 0,
-        active: 1,
-        total: 5,
+        active: 3,
+        total: 3,
         truncated: false,
       },
-      providerStateAvailable: true,
       syncBacklogAvailable: true,
+    });
+  });
+
+  it("reports unconfigured without advertising a capture job", () => {
+    expect(
+      buildMemoryRuntimeStatus(
+        { ...configuredMemory, apiKeyConfigured: false },
+        availableOperationalState,
+      ),
+    ).toMatchObject({
+      memoryProvider: "supermemory",
+      memoryProviderHealth: "unconfigured",
+      memoryCaptureKind: null,
+      memoryProviderHasError: false,
+      supermemoryConfigured: false,
+    });
+  });
+
+  it("reports identity recovery while retaining the sole configured capture kind", () => {
+    const status = buildMemoryRuntimeStatus(configuredMemory, {
+      ...availableOperationalState,
+      providerState: {
+        ...availableOperationalState.providerState,
+        healthStatus: "recovery_required",
+        hasError: true,
+      },
     });
 
     expect(status).toMatchObject({
       memoryProvider: "supermemory",
-      memoryReadMode: "shadow",
-      memoryCaptureMode: "dual",
-      memoryWriteMode: "dual",
+      memoryProviderHealth: "recovery_required",
+      memoryCaptureKind: null,
+      memoryProviderHasError: true,
+      supermemoryConfigured: true,
+    });
+    expect(status).not.toHaveProperty("memoryLastProviderFailure");
+  });
+
+  it("reports healthy configured operation and normalized backlog timestamps", () => {
+    expect(buildMemoryRuntimeStatus(configuredMemory, availableOperationalState)).toEqual({
+      memoryProvider: "supermemory",
       memoryProviderHealth: "healthy",
+      memoryCaptureKind: "conversation_turn",
+      memorySyncBacklog: availableOperationalState.syncBacklog,
       memoryLastProviderSuccessAt: 100,
       memoryLastProviderFailureAt: 90,
-      memoryLastProviderFailure: "old failure",
-      memoryLegacyFallback: {
-        enabled: true,
-        active: false,
-        status: "inactive",
-      },
+      memoryProviderHasError: false,
+      memoryLastWorkerActivityAt: 110,
+      memoryProviderStateUpdatedAt: 120,
+      memoryProviderStateAvailable: true,
+      memorySyncBacklogAvailable: true,
+      supermemoryConfigured: true,
     });
   });
 
-  it("marks fallback provider-error-only after read cutover and overrides stale health", () => {
-    const operational = {
-      providerState: {
-        healthStatus: "healthy" as const,
-        lastSuccessfulSubmissionAt: null,
-        lastFailedSubmissionAt: null,
-        lastError: null,
-        lastWorkerActivityAt: null,
-        updatedAt: null,
-      },
-      syncBacklog: null,
-      providerStateAvailable: true,
-      syncBacklogAvailable: false,
-    };
-    const cutover = buildMemoryRuntimeStatus(
-      { ...configuredMemory, readMode: "supermemory" },
-      operational,
-    );
-    expect(cutover.memoryLegacyFallback).toEqual({
-      enabled: true,
-      active: true,
-      status: "provider_errors_only",
-    });
-
-    expect(
-      buildMemoryRuntimeStatus(
-        { ...configuredMemory, apiKeyConfigured: false },
-        operational,
-      ).memoryProviderHealth,
-    ).toBe("unconfigured");
-    expect(
-      buildMemoryRuntimeStatus(
-        { ...configuredMemory, readMode: "convex", writeMode: "convex" },
-        operational,
-      ).memoryProviderHealth,
-    ).toBe("disabled");
-  });
-
-  it("reports legacy embeddings retired while returning live provider status", async () => {
+  it("returns the current provider contract from get_config without error detail", async () => {
     const query = vi.spyOn(convex, "query").mockImplementation(async (reference) => {
       const name = getFunctionName(reference);
       if (name === "memoryProviderState:getDeploymentState") {
         return {
           healthStatus: "healthy",
           lastSuccessfulSubmissionAt: 100,
+          lastFailedSubmissionAt: 90,
+          hasError: true,
+          lastError: "do not expose this",
+          lastWorkerActivityAt: 105,
           updatedAt: 110,
         } as never;
       }
       if (name === "memorySyncJobs:backlog") {
         return { pending: 2, active: 2, total: 2 } as never;
       }
+      if (name === "memoryProviderState:getIdentityPresence") {
+        return {
+          hasSaltFingerprint: false,
+          hasPairingAuthority: false,
+          hasPrimaryOwner: false,
+          recoveryRequired: false,
+        } as never;
+      }
       return null as never;
     });
-    vi.stubEnv("DANIEL_MEMORY_READ_MODE", "shadow");
-    vi.stubEnv("DANIEL_MEMORY_WRITE_MODE", "dual");
-    vi.stubEnv("DANIEL_MEMORY_LEGACY_FALLBACK", "true");
+    vi.spyOn(convex, "mutation").mockResolvedValue({ status: "ready" } as never);
     vi.stubEnv("SUPERMEMORY_API_KEY", "test-key");
+    vi.stubEnv("DANIEL_MEMORY_ID_SALT", "c".repeat(64));
 
     const getConfig = createSelfTools().find((tool) => tool.name === "get_config");
     expect(getConfig).toBeDefined();
@@ -203,17 +218,15 @@ describe("self-tool memory provider status", () => {
 
     expect(query).toHaveBeenCalled();
     expect(config).toMatchObject({
-      embeddingsEnabled: false,
-      embeddingsProvider: "retired",
       memoryProvider: "supermemory",
-      memoryReadMode: "shadow",
-      memoryCaptureMode: "dual",
-      memoryWriteMode: "dual",
       memoryProviderHealth: "healthy",
+      memoryCaptureKind: "conversation_turn",
+      memoryProviderHasError: true,
       memorySyncBacklog: { pending: 2, active: 2, total: 2 },
       memoryLastProviderSuccessAt: 100,
-      memoryLegacyFallback: { enabled: true, active: false, status: "inactive" },
+      memoryLastProviderFailureAt: 90,
+      supermemoryConfigured: true,
     });
-    expect(config.memoryLegacyRuntime).toBe("retired");
+    expect(result.text).not.toContain("do not expose this");
   });
 });

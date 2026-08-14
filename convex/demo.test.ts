@@ -9,10 +9,24 @@ import schema from "./schema.js";
 
 const modules = import.meta.glob("./**/*.ts");
 
-describe("Implementation 9 dashboard demo state", () => {
-  it("seeds only namespaced SuperMemory operational state and cleans it up", async () => {
+describe("Implementation 10 dashboard demo state", () => {
+  it("seeds only namespaced Supermemory operational state and cleans it up", async () => {
     vi.useFakeTimers();
     const t = convexTest(schema, modules);
+    await t.run(async (ctx) => {
+      await ctx.db.insert("conversations", {
+        conversationId: "demo:ordinary-conversation",
+        title: "Ordinary conversation",
+        messageCount: 1,
+        lastActivityAt: 1,
+      });
+      await ctx.db.insert("messages", {
+        conversationId: "demo:ordinary-conversation",
+        role: "user",
+        content: "Keep this application message",
+        createdAt: 1,
+      });
+    });
 
     await expect(t.query(api.demo.status, {})).resolves.toMatchObject({
       enabled: false,
@@ -21,7 +35,6 @@ describe("Implementation 9 dashboard demo state", () => {
       counts: {
         providerStates: 0,
         syncJobs: 0,
-        migrationRows: 0,
         imageAnchors: 0,
       },
     });
@@ -29,11 +42,10 @@ describe("Implementation 9 dashboard demo state", () => {
     const enabled = await t.mutation(api.demo.setMode, { enabled: true });
     expect(enabled).toMatchObject({
       enabled: true,
-      total: 17,
+      total: 10,
       seeded: {
         providerStates: 2,
-        syncJobs: 10,
-        migrationRows: 5,
+        syncJobs: 8,
         imageAnchors: 0,
       },
       counts: {
@@ -49,40 +61,50 @@ describe("Implementation 9 dashboard demo state", () => {
     await expect(t.query(api.demo.status, {})).resolves.toMatchObject({
       enabled: true,
       seeded: true,
-      total: 20,
+      total: 13,
     });
     const metrics = await t.query(api.dashboard.metrics, {});
     expect(metrics.memoryProvider).toMatchObject({
       configured: true,
       healthStatus: "healthy",
-      readMode: "supermemory",
-      writeMode: "supermemory",
+      hasError: true,
     });
-    expect(metrics.memoryProvider).not.toHaveProperty("profileState");
     expect(metrics.sync).toMatchObject({
       pending: 2,
       processing: 1,
       submitted: 1,
-      completed: 4,
+      completed: 2,
       failed: 1,
       deadLetter: 1,
-      total: 10,
+      total: 8,
     });
-    expect(metrics.migration).toMatchObject({
+    expect(metrics.sync.recentJobs).toHaveLength(8);
+    expect(
+      metrics.sync.recentJobs.every((job) => job.kind === "conversation_turn"),
+    ).toBe(true);
+    expect(metrics.imageAnchors).toEqual({
       pending: 1,
-      migrated: 2,
-      failed: 1,
-      skipped: 1,
-      reconciled: false,
+      active: 1,
+      released: 1,
+      total: 3,
     });
-    expect(metrics.imageAnchors).toEqual({ pending: 1, active: 1, released: 1, total: 3 });
 
-    const legacyRows = await t.run(async (ctx) => ({
-      memories: await ctx.db.query("memoryRecords").take(1),
-      events: await ctx.db.query("memoryEvents").take(1),
-      consolidations: await ctx.db.query("consolidationRuns").take(1),
-    }));
-    expect(legacyRows).toEqual({ memories: [], events: [], consolidations: [] });
+    const jobs = await t.run(
+      async (ctx) => await ctx.db.query("memorySyncJobs").take(20),
+    );
+    expect(jobs).toHaveLength(8);
+    for (const job of jobs) {
+      expect(job.kind).toBe("conversation_turn");
+      expect(JSON.parse(job.payload)).toMatchObject({
+        schemaVersion: 1,
+        kind: "conversation_turn",
+        ingestionStrategy: "delta_turn_v1",
+        providerInput: {
+          containerTag: "demo:container",
+          customId: job.customId,
+        },
+      });
+    }
 
     const storageIds = await t.run(async (ctx) => {
       const rows = await ctx.db
@@ -95,16 +117,16 @@ describe("Implementation 9 dashboard demo state", () => {
 
     const reseeded = await t.mutation(api.demo.setMode, { enabled: true });
     expect(reseeded).toMatchObject({
-      removed: { providerStates: 2, syncJobs: 10, migrationRows: 5, imageAnchors: 3 },
-      seeded: { providerStates: 2, syncJobs: 10, migrationRows: 5, imageAnchors: 0 },
-      total: 17,
+      removed: { providerStates: 2, syncJobs: 8, imageAnchors: 3 },
+      seeded: { providerStates: 2, syncJobs: 8, imageAnchors: 0 },
+      total: 10,
     });
     await t.finishAllScheduledFunctions(vi.runAllTimers);
 
     const disabled = await t.mutation(api.demo.setMode, { enabled: false });
     expect(disabled).toMatchObject({
       enabled: false,
-      removed: { providerStates: 2, syncJobs: 10, migrationRows: 5, imageAnchors: 3 },
+      removed: { providerStates: 2, syncJobs: 8, imageAnchors: 3 },
       seeded: null,
       total: 0,
     });
@@ -120,6 +142,8 @@ describe("Implementation 9 dashboard demo state", () => {
           await ctx.db.system.get("_storage", storageId as Id<"_storage">),
         ).toBeNull();
       }
+      expect(await ctx.db.query("conversations").collect()).toHaveLength(1);
+      expect(await ctx.db.query("messages").collect()).toHaveLength(1);
     });
     vi.useRealTimers();
   });

@@ -5,7 +5,9 @@ import {
   applyExactForget,
   cancelPendingOperation,
   createExactMemory,
+  forgetDurableImageSource,
   previewForget,
+  rememberDurableImage,
   searchMemoryCandidatesForUpdate,
   SupermemoryOperationTransport,
   updateExactMemory,
@@ -251,6 +253,7 @@ const exactInput = {
 describe("explicit and versioned Supermemory operations", () => {
   it("creates exact memories through the immediately-searchable path", async () => {
     const deps = dependencies();
+    const createExact = vi.spyOn(deps.provider, "createExact");
     const created = await createExactMemory(
       { ...exactInput, content: "The user always prefers aisle seats on flights." },
       deps,
@@ -264,10 +267,17 @@ describe("explicit and versioned Supermemory operations", () => {
     expect(results).toEqual([
       expect.objectContaining({ id: created.memories[0].id, content: expect.stringContaining("aisle") }),
     ]);
-    expect(created.outboxPayload).toMatchObject({
-      schemaVersion: 1,
-      kind: "explicit_memory",
-      providerInput: { containerTag: exactInput.containerTag },
+    expect(createExact).toHaveBeenCalledWith({
+      containerTag: exactInput.containerTag,
+      memories: [
+        expect.objectContaining({
+          content: "The user always prefers aisle seats on flights.",
+          metadata: expect.objectContaining({
+            conversationKey: exactInput.conversationKey,
+            turnId: exactInput.turnId,
+          }),
+        }),
+      ],
     });
   });
 
@@ -318,6 +328,62 @@ describe("explicit and versioned Supermemory operations", () => {
     });
     expect(deps.provider.memories.get(oldId)?.isLatest).toBe(false);
     expect(deps.provider.memories.get(result.newMemoryId)?.isLatest).toBe(true);
+  });
+
+  it("uploads and later releases an exact durable image source synchronously", async () => {
+    const provider = new StatefulProvider();
+    const uploadImage = vi.spyOn(provider, "uploadImage");
+    const deleteDocument = vi.spyOn(provider, "deleteDocument");
+    let anchor: import("../server/memory/supermemory/operations.js").ImageAnchor | null = null;
+    const deps: MemoryOperationDependencies = {
+      ...dependencies({ provider }),
+      imageAnchors: {
+        async createPending(input) {
+          anchor = { ...input, status: "pending", createdAt: 1 };
+          return anchor;
+        },
+        async activate(input) {
+          if (!anchor) throw new Error("missing anchor");
+          anchor = { ...anchor, status: "active", providerDocumentId: input.providerDocumentId };
+          return anchor;
+        },
+        async loadActiveByCustomId() {
+          return anchor?.status === "active" ? anchor : null;
+        },
+        async releaseAfterProviderDeletion(input) {
+          if (!anchor) throw new Error("missing anchor");
+          anchor = { ...anchor, status: "released", releasedAt: input.now };
+          return anchor;
+        },
+      },
+      fetchImageBytes: vi.fn(async () => ({
+        bytes: new Uint8Array([1, 2, 3]),
+        mediaType: "image/png",
+      })),
+    };
+
+    const remembered = await rememberDurableImage(
+      {
+        ownerKey: exactInput.ownerKey,
+        containerTag: exactInput.containerTag,
+        storageId: "storage_1",
+        conversationId: "conversation_a",
+        turnId: exactInput.turnId,
+        reason: "remember_image_tool",
+      },
+      deps,
+    );
+    expect(remembered.providerDocumentId).toBe("doc_image");
+    expect(uploadImage).toHaveBeenCalledOnce();
+
+    await expect(
+      forgetDurableImageSource(
+        { ownerKey: exactInput.ownerKey, customId: remembered.anchor.customId },
+        deps,
+      ),
+    ).resolves.toEqual({ customId: remembered.anchor.customId, released: true });
+    expect(deleteDocument).toHaveBeenCalledWith("doc_image");
+    expect(anchor).toMatchObject({ status: "released" });
   });
 });
 

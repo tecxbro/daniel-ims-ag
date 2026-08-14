@@ -3,7 +3,7 @@ import MemorySourceExplorer, {
   type MemoryExplorerItem,
   type MemoryVersionSummary,
 } from "./MemoryGraphView.js";
-import { SupermemoryStatusBanner } from "./EmbeddingBanner.js";
+import { SupermemoryStatusBanner } from "./SupermemoryStatusBanner.js";
 import { SegmentedControl } from "./GlassPrimitives.js";
 import {
   EmptyState,
@@ -114,8 +114,11 @@ function normalizeProfile(value: unknown): ProfileSnapshot {
   const raw = record(value);
   const profile = record(raw.profile);
   const relevantValues = raw.results ?? raw.memories ?? profile.memories;
+  if (raw.profileState !== "ready" && raw.profileState !== "empty") {
+    throw new Error("Provider response did not include a profile state.");
+  }
   return {
-    state: raw.profileState === "ready" ? "ready" : "empty",
+    state: raw.profileState,
     stable: lines(profile.static ?? raw.staticProfile ?? raw.static),
     recent: lines(profile.dynamic ?? raw.dynamicProfile ?? raw.recentContext ?? raw.dynamic),
     relevant: Array.isArray(relevantValues)
@@ -131,9 +134,10 @@ function normalizeList(value: unknown, kind: "memory" | "document"): MemoryExplo
     kind === "memory"
       ? raw.results ?? raw.memories ?? raw.items ?? value
       : raw.documents ?? raw.results ?? raw.items ?? value;
-  return Array.isArray(candidates)
-    ? candidates.map((entry, index) => explorerItem(entry, index, kind))
-    : [];
+  if (!Array.isArray(candidates)) {
+    throw new Error(`Provider response did not include ${kind === "memory" ? "memory results" : "documents"}.`);
+  }
+  return candidates.map((entry, index) => explorerItem(entry, index, kind));
 }
 
 async function getJson(path: string, signal?: AbortSignal): Promise<unknown> {

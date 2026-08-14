@@ -25,12 +25,14 @@ Required env vars:
 
 - `PHOTON_PROJECT_ID`
 - `PHOTON_PROJECT_SECRET`
-- `PHOTON_IMESSAGE_PHONE` when a dedicated outbound line is needed
 
 Design rules:
 
 - Use Spectrum spaces/messages as the conversation surface.
 - Keep direct messages as the v1 default.
+- Reuse the inbound Space for replies and progress acknowledgements.
+- Resolve proactive direct messages with `im.space(user)`; do not select a
+  phone-line override.
 - Store durable workflow state in the app backend, not in the message text.
 - Strip or simplify markdown before sending to iMessage.
 - Chunk long outbound text to stay below iMessage/Spectrum transport limits.
