@@ -127,11 +127,11 @@ function validateContainer(
   }
 }
 
-function validateProviderInput(
-  kind: MemorySyncJobKind,
+function validateProviderInput<K extends MemorySyncJobKind>(
+  kind: K,
   providerInput: Record<string, unknown>,
   scope: MemorySyncPayloadScope,
-): void {
+): asserts providerInput is Record<string, unknown> & MemorySyncPayloadByKind[K] {
   validateContainer(providerInput, scope);
   switch (kind) {
     case "conversation_turn": {
@@ -205,7 +205,7 @@ function validateProviderInput(
 function legacyEnvelope(
   value: Record<string, unknown>,
   scope: MemorySyncPayloadScope,
-): MemorySyncJobPayload {
+): Record<string, unknown> {
   const providerInput = asObject(value.providerInput) ?? value;
   const normalized = { ...providerInput };
   if (normalized.containerTag === undefined) normalized.containerTag = scope.containerTag;
@@ -227,14 +227,60 @@ function legacyEnvelope(
   if (scope.kind === "image" && normalized.reason === undefined) {
     normalized.reason = "migration";
   }
-  const base = {
+  const base: Record<string, unknown> = {
     schemaVersion: MEMORY_SYNC_SCHEMA_VERSION,
     kind: scope.kind,
     providerInput: normalized,
-  } as unknown as MemorySyncJobPayload;
+  };
   return scope.kind === "conversation_turn"
-    ? ({ ...base, ingestionStrategy: CONVERSATION_INGESTION_STRATEGY } as ConversationTurnJobPayload)
+    ? { ...base, ingestionStrategy: CONVERSATION_INGESTION_STRATEGY }
     : base;
+}
+
+function validatedPayload(
+  scope: MemorySyncPayloadScope,
+  providerInput: Record<string, unknown>,
+): MemorySyncJobPayload {
+  switch (scope.kind) {
+    case "conversation_turn":
+      validateProviderInput("conversation_turn", providerInput, scope);
+      return {
+        schemaVersion: MEMORY_SYNC_SCHEMA_VERSION,
+        kind: "conversation_turn",
+        ingestionStrategy: CONVERSATION_INGESTION_STRATEGY,
+        providerInput,
+      };
+    case "explicit_memory":
+      validateProviderInput("explicit_memory", providerInput, scope);
+      return {
+        schemaVersion: MEMORY_SYNC_SCHEMA_VERSION,
+        kind: "explicit_memory",
+        providerInput,
+      };
+    case "image":
+      validateProviderInput("image", providerInput, scope);
+      return {
+        schemaVersion: MEMORY_SYNC_SCHEMA_VERSION,
+        kind: "image",
+        providerInput,
+      };
+    case "memory_update":
+      validateProviderInput("memory_update", providerInput, scope);
+      return {
+        schemaVersion: MEMORY_SYNC_SCHEMA_VERSION,
+        kind: "memory_update",
+        providerInput,
+      };
+    case "memory_forget":
+      validateProviderInput("memory_forget", providerInput, scope);
+      return {
+        schemaVersion: MEMORY_SYNC_SCHEMA_VERSION,
+        kind: "memory_forget",
+        providerInput,
+      };
+    default:
+      return assertNever(scope.kind);
+  }
 }
 
 /**
@@ -257,7 +303,7 @@ export function parseMemorySyncJobPayload(
   const envelope = asObject(parsed);
   if (!envelope) throw new MemorySyncPayloadError("memory sync payload must be an object");
 
-  let normalized: MemorySyncJobPayload;
+  let normalized: Record<string, unknown>;
   if (
     options.allowLegacy === true &&
     envelope.kind === undefined &&
@@ -283,7 +329,7 @@ export function parseMemorySyncJobPayload(
         "memory sync conversation_turn payload must use delta_turn_v1",
       );
     }
-    normalized = envelope as unknown as MemorySyncJobPayload;
+    normalized = envelope;
   }
 
   const providerInput = asObject(normalized.providerInput);
@@ -292,8 +338,7 @@ export function parseMemorySyncJobPayload(
       `memory sync ${scope.kind} payload requires providerInput`,
     );
   }
-  validateProviderInput(scope.kind, providerInput, scope);
-  return normalized;
+  return validatedPayload(scope, providerInput);
 }
 
 export function buildConversationTurnJobPayload(

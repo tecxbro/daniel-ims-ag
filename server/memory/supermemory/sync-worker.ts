@@ -1,9 +1,6 @@
-import type { ConvexHttpClient } from "convex/browser";
-import { api } from "../../../convex/_generated/api.js";
 import {
   createContainerSettingsCoordinator,
   ensureContainerSettings as ensureConfiguredContainerSettings,
-  type MemoryProviderContainerState,
 } from "./container.js";
 import {
   createSupermemoryAdapter,
@@ -13,19 +10,54 @@ import {
 } from "./client.js";
 import {
   MemorySyncPayloadError,
-  parseMemorySyncJobPayload,
-  type ImageJobInput,
-  type MemoryForgetJobInput,
-  type MemorySyncJobKind,
-  type MemorySyncPayloadByKind,
 } from "./job-contract.js";
 export { MemorySyncPayloadError } from "./job-contract.js";
 export type { MemorySyncJobKind, MemorySyncPayloadByKind } from "./job-contract.js";
-import type {
-  DanielMemoryProvider,
-  ProviderDocumentResult,
-  ProviderMemoryResult,
-} from "./types.js";
+import {
+  createMemorySyncDispatchHandlers,
+  MemorySyncDispatcher,
+  type MemorySyncDispatchHandlers,
+  type MemorySyncProvider,
+  type ProviderSubmission,
+} from "./job-dispatcher.js";
+export { createMemorySyncDispatchHandlers, MemorySyncDispatcher } from "./job-dispatcher.js";
+export type {
+  MemorySyncDispatchHandler,
+  MemorySyncDispatchHandlers,
+  MemorySyncProvider,
+  ProviderSubmission,
+} from "./job-dispatcher.js";
+import { asObject, type MemorySyncJob } from "./job-parser.js";
+export type {
+  ClaimedMemorySyncJob,
+  MemorySyncJob,
+  MemorySyncJobStatus,
+} from "./job-parser.js";
+import {
+  ConvexMemorySyncPersistence,
+  type ConvexClient,
+  type FencedMutationResult,
+  type MemoryProviderStateWriter,
+  type MemorySyncBacklogSummary,
+  type MemorySyncJobsStore,
+  type MemorySyncWorkerActivity,
+} from "./convex-sync-store.js";
+export { ConvexMemorySyncPersistence, normalizeBacklog } from "./convex-sync-store.js";
+export type {
+  ClaimDueJobInput,
+  CompleteMemorySyncJobInput,
+  ConvexClient,
+  FencedMutationResult,
+  MemoryProviderStateWriter,
+  MemorySyncBacklogSummary,
+  MemorySyncJobsStore,
+  MemorySyncWorkerActivity,
+  RecordMemorySyncFailureInput,
+  RecordProviderFailureInput,
+  RecordProviderSuccessInput,
+  RecordSubmittedInput,
+  RecordWorkerHeartbeatInput,
+} from "./convex-sync-store.js";
 
 export const MEMORY_SYNC_RETRY_DELAYS_MS = [
   10_000,
@@ -45,267 +77,8 @@ export const DEFAULT_MEMORY_SYNC_POLL_INTERVAL_MS = 1_000;
 export const DEFAULT_MEMORY_SYNC_LEASE_MS = 2 * 60_000;
 export const DEFAULT_MEMORY_SYNC_HEARTBEAT_INTERVAL_MS = 15_000;
 
-export type MemorySyncJobStatus =
-  | "pending"
-  | "processing"
-  | "submitted"
-  | "completed"
-  | "failed"
-  | "dead_letter";
-
-export interface MemorySyncJob {
-  jobId: string;
-  kind: MemorySyncJobKind;
-  ownerKey: string;
-  containerTag: string;
-  customId?: string;
-  conversationId?: string;
-  turnId?: string;
-  payload: string;
-  payloadHash: string;
-  status: MemorySyncJobStatus;
-  providerDocumentId?: string;
-  providerMemoryIds?: string[];
-  attempts: number;
-  nextAttemptAt: number;
-  lastError?: string;
-  createdAt: number;
-  updatedAt: number;
-}
-
-/**
- * `complete` resumes a job that reached Supermemory and was durably marked
- * submitted before the server stopped. It must not call the provider again.
- */
-export interface ClaimedMemorySyncJob {
-  job: MemorySyncJob;
-  resumeFrom: "dispatch" | "complete";
-}
-
-export interface ProviderSubmission {
-  providerDocumentId?: string;
-  providerMemoryIds?: string[];
-}
-
-export interface ClaimDueJobInput {
-  now: number;
-  leaseMs: number;
-  workerId: string;
-}
-
-export interface RecordSubmittedInput extends ProviderSubmission {
-  jobId: string;
-  expectedAttempt: number;
-  expectedUpdatedAt: number;
-  now: number;
-}
-
-export interface CompleteMemorySyncJobInput {
-  jobId: string;
-  expectedAttempt: number;
-  expectedUpdatedAt: number;
-  now: number;
-}
-
-export interface RecordMemorySyncFailureInput {
-  jobId: string;
-  expectedAttempt: number;
-  expectedUpdatedAt: number;
-  error: string;
-  retryable: boolean;
-  now: number;
-  nextAttemptAt?: number;
-  deadLetter: boolean;
-}
-
-export interface FencedMutationResult {
-  updated: boolean;
-  job?: MemorySyncJob | null;
-}
-
 function fencedMutationApplied(result: void | FencedMutationResult): boolean {
   return result === undefined || result.updated;
-}
-
-export interface MemorySyncJobsStore {
-  claimDue(input: ClaimDueJobInput): Promise<ClaimedMemorySyncJob | null>;
-  recordSubmitted(input: RecordSubmittedInput): Promise<void | FencedMutationResult>;
-  complete(input: CompleteMemorySyncJobInput): Promise<void | FencedMutationResult>;
-  recordFailure(input: RecordMemorySyncFailureInput): Promise<void | FencedMutationResult>;
-}
-
-export type MemorySyncWorkerActivity =
-  | "starting"
-  | "idle"
-  | "processing"
-  | "completed"
-  | "retry_scheduled"
-  | "dead_letter"
-  | "stopped";
-
-export interface RecordProviderSuccessInput extends ProviderSubmission {
-  jobId: string;
-  kind: MemorySyncJobKind;
-  at: number;
-}
-
-export interface RecordProviderFailureInput {
-  jobId: string;
-  kind: MemorySyncJobKind;
-  at: number;
-  error: string;
-  retryable: boolean;
-  deadLetter: boolean;
-}
-
-export interface RecordWorkerHeartbeatInput {
-  workerId: string;
-  at: number;
-  activity: MemorySyncWorkerActivity;
-  jobId?: string;
-}
-
-export interface MemoryProviderStateWriter {
-  recordSuccess(input: RecordProviderSuccessInput): Promise<void>;
-  recordFailure(input: RecordProviderFailureInput): Promise<void | FencedMutationResult>;
-  heartbeat(input: RecordWorkerHeartbeatInput): Promise<void>;
-}
-
-export type MemorySyncDispatchHandler<K extends MemorySyncJobKind> = (
-  payload: MemorySyncPayloadByKind[K],
-  job: MemorySyncJob,
-) => Promise<ProviderSubmission>;
-
-export type MemorySyncDispatchHandlers = {
-  [K in MemorySyncJobKind]: MemorySyncDispatchHandler<K>;
-};
-
-function asObject(value: unknown): Record<string, unknown> | null {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : null;
-}
-
-function parsePayload<K extends MemorySyncJobKind>(
-  job: MemorySyncJob,
-  expectedKind: K,
-): MemorySyncPayloadByKind[K] {
-  if (job.kind !== expectedKind) {
-    throw new MemorySyncPayloadError(
-      `memory sync job ${job.jobId} changed kind while dispatching`,
-    );
-  }
-  const envelope = parseMemorySyncJobPayload(
-    job.payload,
-    {
-      kind: expectedKind,
-      containerTag: job.containerTag,
-      customId: job.customId,
-    },
-    { allowLegacy: true },
-  );
-  return envelope.providerInput as MemorySyncPayloadByKind[K];
-}
-
-function requireCustomId(job: MemorySyncJob): string {
-  if (!job.customId) {
-    throw new MemorySyncPayloadError(
-      `memory sync ${job.kind} job ${job.jobId} is missing its stable customId`,
-    );
-  }
-  return job.customId;
-}
-
-function documentSubmission(result: ProviderDocumentResult): ProviderSubmission {
-  return { providerDocumentId: result.id };
-}
-
-function memorySubmission(results: ProviderMemoryResult[]): ProviderSubmission {
-  return { providerMemoryIds: results.map((result) => result.id) };
-}
-
-/**
- * Builds the provider dispatch boundary without importing agent, image, or UI
- * modules. Implementation 6 can replace individual handlers at construction.
- */
-export function createMemorySyncDispatchHandlers(
-  provider: MemorySyncProvider,
-  overrides: Partial<MemorySyncDispatchHandlers> = {},
-): MemorySyncDispatchHandlers {
-  const defaults: MemorySyncDispatchHandlers = {
-    conversation_turn: async (payload, job) =>
-      documentSubmission(
-        await provider.captureTurn({
-          ...payload,
-          containerTag: job.containerTag,
-          customId: requireCustomId(job),
-        }),
-      ),
-    explicit_memory: async (payload, job) =>
-      memorySubmission(
-        await provider.createExact({
-          ...payload,
-          containerTag: job.containerTag,
-        }),
-      ),
-    image: async (payload, job) => {
-      if (!provider.uploadImageJob) {
-        throw new MemorySyncPayloadError(
-          `memory sync image job ${job.jobId} has no image upload handler`,
-        );
-      }
-      return documentSubmission(
-        await provider.uploadImageJob({
-          ...payload,
-          containerTag: job.containerTag,
-          customId: requireCustomId(job),
-        }),
-      );
-    },
-    memory_update: async (payload, job) =>
-      memorySubmission([
-        await provider.update({
-          ...payload,
-          containerTag: job.containerTag,
-        }),
-      ]),
-    memory_forget: async (payload, job) => {
-      if (!provider.forgetMany) {
-        throw new MemorySyncPayloadError(
-          `memory sync memory_forget job ${job.jobId} has no bulk forget handler`,
-        );
-      }
-      await provider.forgetMany({ ...payload, containerTag: job.containerTag });
-      return {};
-    },
-  };
-
-  return { ...defaults, ...overrides };
-}
-
-export class MemorySyncDispatcher {
-  constructor(private readonly handlers: MemorySyncDispatchHandlers) {}
-
-  dispatch(job: MemorySyncJob): Promise<ProviderSubmission> {
-    switch (job.kind) {
-      case "conversation_turn":
-        return this.handlers.conversation_turn(parsePayload(job, "conversation_turn"), job);
-      case "explicit_memory":
-        return this.handlers.explicit_memory(parsePayload(job, "explicit_memory"), job);
-      case "image":
-        return this.handlers.image(parsePayload(job, "image"), job);
-      case "memory_update":
-        return this.handlers.memory_update(parsePayload(job, "memory_update"), job);
-      case "memory_forget":
-        return this.handlers.memory_forget(parsePayload(job, "memory_forget"), job);
-      default:
-        return assertNever(job.kind);
-    }
-  }
-}
-
-function assertNever(value: never): never {
-  throw new MemorySyncPayloadError(`unsupported memory sync job kind: ${String(value)}`);
 }
 
 /** Delay before the next provider attempt, or null when the job dead-letters. */
@@ -656,14 +429,6 @@ export function startMemorySyncWorker(
   return worker;
 }
 
-type MemorySyncProvider = Pick<
-  DanielMemoryProvider,
-  "captureTurn" | "createExact" | "update" | "forget"
-> & {
-  uploadImageJob?: (input: ImageJobInput) => Promise<ProviderDocumentResult>;
-  forgetMany?: (input: MemoryForgetJobInput) => Promise<void>;
-};
-
 type Environment = Record<string, string | undefined>;
 
 export interface ConfiguredMemorySyncWorkerResult {
@@ -755,281 +520,4 @@ export async function startConfiguredMemorySyncWorker(
     onError: options.onError,
   });
   return { worker, reason: "started", backlog };
-}
-
-type ConvexClient = Pick<ConvexHttpClient, "query" | "mutation">;
-
-interface ConvexMemorySyncApi {
-  memorySyncJobs: {
-    claimDue: unknown;
-    recordSubmitted: unknown;
-    complete: unknown;
-    recordFailure: unknown;
-    backlog: unknown;
-  };
-  memoryProviderState: {
-    ensureIdentitySaltFingerprint: unknown;
-    getContainerState: unknown;
-    markContainerInitialized: unknown;
-    updateHealth: unknown;
-    recordSuccess: unknown;
-    recordFailure: unknown;
-    heartbeat: unknown;
-    getBacklogSummary: unknown;
-  };
-}
-
-const memorySyncApi = api as unknown as ConvexMemorySyncApi;
-
-export interface MemorySyncBacklogSummary {
-  pending: number;
-  processing: number;
-  submitted: number;
-  completed: number;
-  failed: number;
-  deadLetter: number;
-  total: number;
-}
-
-function optionalNumberField(
-  record: Record<string, unknown>,
-  ...keys: string[]
-): number | undefined {
-  for (const key of keys) {
-    if (typeof record[key] === "number" && Number.isFinite(record[key])) {
-      return Math.max(0, record[key] as number);
-    }
-  }
-  return undefined;
-}
-
-export function normalizeBacklog(value: unknown): MemorySyncBacklogSummary {
-  const record = asObject(value) ?? {};
-  const counts = asObject(record.counts) ?? record;
-  const count = (...keys: string[]): number => {
-    for (const key of keys) {
-      const value = counts[key];
-      if (typeof value === "number") return value;
-      const entry = asObject(value);
-      if (typeof entry?.count === "number") return entry.count;
-    }
-    return 0;
-  };
-  const pending = count("pending");
-  const processing = count("processing");
-  const submitted = count("submitted");
-  const completed = count("completed");
-  const failed = count("failed");
-  const deadLetter = count("deadLetter", "dead_letter");
-  const suppliedTotal = optionalNumberField(record, "total");
-  const suppliedActive = optionalNumberField(record, "active");
-  return {
-    pending,
-    processing,
-    submitted,
-    completed,
-    failed,
-    deadLetter,
-    total:
-      suppliedTotal ??
-      (suppliedActive !== undefined
-        ? suppliedActive + deadLetter
-        : pending + processing + submitted + completed + failed + deadLetter),
-  };
-}
-
-function isJobKind(value: unknown): value is MemorySyncJobKind {
-  return (
-    value === "conversation_turn" ||
-    value === "explicit_memory" ||
-    value === "image" ||
-    value === "memory_update" ||
-    value === "memory_forget"
-  );
-}
-
-function isJobStatus(value: unknown): value is MemorySyncJobStatus {
-  return (
-    value === "pending" ||
-    value === "processing" ||
-    value === "submitted" ||
-    value === "completed" ||
-    value === "failed" ||
-    value === "dead_letter"
-  );
-}
-
-function normalizeClaimedJob(value: unknown): ClaimedMemorySyncJob | null {
-  if (value === null || value === undefined) return null;
-  const wrapper = asObject(value);
-  const rawJob = wrapper && asObject(wrapper.job) ? asObject(wrapper.job) : wrapper;
-  if (!rawJob) throw new Error("memorySyncJobs.claimDue returned an invalid job");
-  if (
-    typeof rawJob.jobId !== "string" ||
-    !isJobKind(rawJob.kind) ||
-    typeof rawJob.ownerKey !== "string" ||
-    typeof rawJob.containerTag !== "string" ||
-    typeof rawJob.payload !== "string" ||
-    typeof rawJob.payloadHash !== "string" ||
-    !isJobStatus(rawJob.status) ||
-    typeof rawJob.attempts !== "number" ||
-    typeof rawJob.nextAttemptAt !== "number" ||
-    typeof rawJob.createdAt !== "number" ||
-    typeof rawJob.updatedAt !== "number"
-  ) {
-    throw new Error("memorySyncJobs.claimDue returned an invalid job");
-  }
-
-  const job = rawJob as unknown as MemorySyncJob;
-  const explicitResume = wrapper?.resumeFrom;
-  const resumeFrom =
-    explicitResume === "complete" || rawJob.status === "submitted"
-      ? "complete"
-      : "dispatch";
-  return { job, resumeFrom };
-}
-
-/**
- * ConvexHttpClient-backed durable state adapter. It deliberately owns no
- * timers or provider objects, so tests can substitute an in-memory store.
- */
-export class ConvexMemorySyncPersistence
-  implements MemorySyncJobsStore, MemoryProviderStateWriter
-{
-  constructor(private readonly client: ConvexClient) {}
-
-  async claimDue(input: ClaimDueJobInput): Promise<ClaimedMemorySyncJob | null> {
-    const result = await this.mutation(memorySyncApi.memorySyncJobs.claimDue, {
-      now: input.now,
-      leaseMs: input.leaseMs,
-      workerId: input.workerId,
-    });
-    return normalizeClaimedJob(result);
-  }
-
-  async recordSubmitted(input: RecordSubmittedInput): Promise<FencedMutationResult> {
-    return this.fencedResult(
-      await this.mutation(memorySyncApi.memorySyncJobs.recordSubmitted, input),
-    );
-  }
-
-  async complete(input: CompleteMemorySyncJobInput): Promise<FencedMutationResult> {
-    return this.fencedResult(
-      await this.mutation(memorySyncApi.memorySyncJobs.complete, input),
-    );
-  }
-
-  recordFailure(input: RecordMemorySyncFailureInput): Promise<FencedMutationResult>;
-  recordFailure(input: RecordProviderFailureInput): Promise<void>;
-  async recordFailure(
-    input: RecordMemorySyncFailureInput | RecordProviderFailureInput,
-  ): Promise<void | FencedMutationResult> {
-    if ("now" in input) {
-      return this.fencedResult(
-        await this.mutation(memorySyncApi.memorySyncJobs.recordFailure, input),
-      );
-    }
-    await this.mutation(memorySyncApi.memoryProviderState.recordFailure, input);
-  }
-
-  async recordSuccess(input: RecordProviderSuccessInput): Promise<void> {
-    await this.mutation(memorySyncApi.memoryProviderState.recordSuccess, input);
-  }
-
-  async heartbeat(input: RecordWorkerHeartbeatInput): Promise<void> {
-    await this.mutation(memorySyncApi.memoryProviderState.heartbeat, input);
-  }
-
-  async ensureIdentitySaltFingerprint(saltFingerprint: string): Promise<string> {
-    const value = await this.mutation(
-      memorySyncApi.memoryProviderState.ensureIdentitySaltFingerprint,
-      { saltFingerprint },
-    );
-    if (typeof value !== "string") {
-      throw new Error("memoryProviderState returned an invalid salt fingerprint");
-    }
-    return value;
-  }
-
-  async getContainerState(
-    containerTag: string,
-  ): Promise<MemoryProviderContainerState | null> {
-    const value = await this.query(memorySyncApi.memoryProviderState.getContainerState, {
-      containerTag,
-    });
-    if (value === null) return null;
-    const record = asObject(value);
-    if (!record || typeof record.containerTag !== "string") {
-      throw new Error("memoryProviderState returned an invalid container state");
-    }
-    return {
-      containerTag: record.containerTag,
-      initializedAt:
-        typeof record.initializedAt === "number" ? record.initializedAt : undefined,
-      saltFingerprint:
-        typeof record.saltFingerprint === "string" ? record.saltFingerprint : undefined,
-    };
-  }
-
-  async markContainerInitialized(input: {
-    containerTag: string;
-    initializedAt: number;
-    saltFingerprint: string;
-  }): Promise<void> {
-    await this.mutation(
-      memorySyncApi.memoryProviderState.markContainerInitialized,
-      input,
-    );
-  }
-
-  async markUnconfigured(input: {
-    error: string;
-    readMode: "convex" | "shadow" | "supermemory";
-    writeMode: "convex" | "dual" | "supermemory";
-  }): Promise<void> {
-    await this.mutation(memorySyncApi.memoryProviderState.updateHealth, {
-      healthStatus: "unconfigured",
-      ...input,
-    });
-  }
-
-  async getBacklog(): Promise<MemorySyncBacklogSummary> {
-    return normalizeBacklog(
-      await this.query(memorySyncApi.memorySyncJobs.backlog, {}),
-    );
-  }
-
-  async getBacklogSummary(): Promise<MemorySyncBacklogSummary> {
-    return normalizeBacklog(
-      await this.query(memorySyncApi.memoryProviderState.getBacklogSummary, {}),
-    );
-  }
-
-  private mutation(reference: unknown, args: unknown): Promise<unknown> {
-    const mutation = this.client.mutation as unknown as (
-      functionReference: unknown,
-      functionArgs: unknown,
-    ) => Promise<unknown>;
-    return mutation.call(this.client, reference, args);
-  }
-
-  private query(reference: unknown, args: unknown): Promise<unknown> {
-    const query = this.client.query as unknown as (
-      functionReference: unknown,
-      functionArgs: unknown,
-    ) => Promise<unknown>;
-    return query.call(this.client, reference, args);
-  }
-
-  private fencedResult(value: unknown): FencedMutationResult {
-    const record = asObject(value);
-    const rawJob = record?.job;
-    const job =
-      rawJob === null
-        ? null
-        : rawJob === undefined
-          ? undefined
-          : normalizeClaimedJob(rawJob)?.job;
-    return { updated: record?.updated !== false, job };
-  }
 }

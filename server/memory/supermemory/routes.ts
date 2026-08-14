@@ -65,23 +65,6 @@ export interface CreateSupermemoryRouterOptions {
   recordProviderRead?: typeof recordProviderRead;
 }
 
-interface MemoryRoutesApi {
-  memoryProviderState: {
-    getDeploymentState: unknown;
-    getBacklogSummary: unknown;
-  };
-  memorySyncJobs: {
-    retryOwned: unknown;
-  };
-  memoryMigration: {
-    verifyOwnerCutover: unknown;
-  };
-  memoryImageAnchors: {
-    getOwnerSummary: unknown;
-  };
-}
-
-const memoryRoutesApi = api as unknown as MemoryRoutesApi;
 const MAX_QUERY_LENGTH = 8_000;
 const MAX_JOB_ID_LENGTH = 256;
 
@@ -178,21 +161,15 @@ function requireLocalRequest(req: Request, res: Response, next: NextFunction): v
 function createDefaultControlPlane(): MemoryRouteControlPlane {
   return {
     getProviderState: () =>
-      convex.query(memoryRoutesApi.memoryProviderState.getDeploymentState as never, {}),
+      convex.query(api.memoryProviderState.getDeploymentState, {}),
     getBacklog: () =>
-      convex.query(memoryRoutesApi.memoryProviderState.getBacklogSummary as never, {}),
+      convex.query(api.memoryProviderState.getBacklogSummary, {}),
     retryJob: (input) =>
-      convex.mutation(memoryRoutesApi.memorySyncJobs.retryOwned as never, input as never),
+      convex.mutation(api.memorySyncJobs.retryOwned, input),
     verifyMigration: (input) =>
-      convex.query(
-        memoryRoutesApi.memoryMigration.verifyOwnerCutover as never,
-        input as never,
-      ),
+      convex.query(api.memoryMigration.verifyOwnerCutover, input),
     getImageAnchorSummary: (ownerKey) =>
-      convex.query(
-        memoryRoutesApi.memoryImageAnchors.getOwnerSummary as never,
-        { ownerKey } as never,
-      ),
+      convex.query(api.memoryImageAnchors.getOwnerSummary, { ownerKey }),
   };
 }
 

@@ -76,13 +76,6 @@ interface MemoryStatusClient {
   query(reference: unknown, args: Record<string, never>): Promise<unknown>;
 }
 
-interface MemoryStatusApi {
-  memoryProviderState: { getDeploymentState: unknown };
-  memorySyncJobs: { backlog: unknown };
-}
-
-const memoryStatusApi = api as unknown as MemoryStatusApi;
-
 function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -157,12 +150,16 @@ function normalizeSyncBacklog(value: unknown): MemorySyncBacklogStatus | null {
 export async function readMemoryProviderOperationalStatus(
   client?: MemoryStatusClient,
 ): Promise<MemoryProviderOperationalStatus> {
-  const statusClient =
-    client ?? ((await import("./convex-client.js")).convex as unknown as MemoryStatusClient);
-  const [providerStateResult, syncBacklogResult] = await Promise.allSettled([
-    statusClient.query(memoryStatusApi.memoryProviderState.getDeploymentState, {}),
-    statusClient.query(memoryStatusApi.memorySyncJobs.backlog, {}),
-  ]);
+  const queries = client
+    ? [
+        client.query(api.memoryProviderState.getDeploymentState, {}),
+        client.query(api.memorySyncJobs.backlog, {}),
+      ]
+    : await import("./convex-client.js").then(({ convex }) => [
+        convex.query(api.memoryProviderState.getDeploymentState, {}),
+        convex.query(api.memorySyncJobs.backlog, {}),
+      ]);
+  const [providerStateResult, syncBacklogResult] = await Promise.allSettled(queries);
   return {
     providerState:
       providerStateResult.status === "fulfilled"
