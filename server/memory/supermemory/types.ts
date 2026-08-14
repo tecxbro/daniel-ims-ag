@@ -1,9 +1,4 @@
-export type MemoryProviderMode = "convex" | "shadow" | "dual" | "supermemory";
-
-export type MemoryReadMode = Extract<MemoryProviderMode, "convex" | "shadow" | "supermemory">;
-export type MemoryWriteMode = Extract<MemoryProviderMode, "convex" | "dual" | "supermemory">;
-
-export type MemoryProviderName = "convex" | "supermemory";
+export type MemoryProviderName = "supermemory";
 
 export type ProviderMetadataValue = string | number | boolean | string[];
 export type ProviderMetadata = Record<string, ProviderMetadataValue>;
@@ -62,9 +57,7 @@ export interface MemorySyncPayload {
 export interface MemoryProviderHealth {
   provider: "supermemory";
   configured: boolean;
-  readMode: MemoryReadMode;
-  writeMode: MemoryWriteMode;
-  status: "disabled" | "unconfigured" | "healthy" | "degraded" | "unavailable";
+  status: "unconfigured" | "recovery_required" | "healthy" | "degraded" | "unavailable";
   checkedAt: number;
   latencyMs?: number;
   error?: string;
@@ -217,13 +210,9 @@ export interface DanielMemoryProvider {
 }
 
 export interface MemoryProviderConfiguration {
-  readMode: MemoryReadMode;
-  writeMode: MemoryWriteMode;
   timeoutMs: number;
   threshold: number;
   searchLimit: number;
   dreaming: string;
-  historyBackfillDays: number;
-  legacyFallback: boolean;
   apiKeyConfigured: boolean;
 }

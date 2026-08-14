@@ -1,7 +1,4 @@
-import { createHash, randomUUID } from "node:crypto";
-import { api } from "../../../convex/_generated/api.js";
-import { convex } from "../../convex-client.js";
-import { readMemoryProviderConfiguration } from "./client.js";
+import { createHash } from "node:crypto";
 import {
   deriveMemoryIdentity,
   memoryIdSaltFingerprint,
@@ -14,11 +11,7 @@ import {
   type ConversationTurnJobPayload,
   type MemorySyncJobKind,
 } from "./job-contract.js";
-import type {
-  MemoryOwnerContext,
-  MemoryWriteMode,
-  ProviderMetadata,
-} from "./types.js";
+import type { MemoryOwnerContext, ProviderMetadata } from "./types.js";
 
 export { CONVERSATION_INGESTION_STRATEGY };
 export type { ConversationTurnJobPayload, MemorySyncJobKind };
@@ -28,9 +21,9 @@ export interface EnqueueMemorySyncJobInput {
   kind: MemorySyncJobKind;
   ownerKey: string;
   containerTag: string;
-  customId?: string;
-  conversationId?: string;
-  turnId?: string;
+  customId: string;
+  conversationId: string;
+  turnId: string;
   payload: string;
   payloadHash: string;
   now: number;
@@ -50,17 +43,11 @@ export interface MemoryIdentityStateStore {
   ensureIdentitySaltFingerprint(saltFingerprint: string): Promise<string>;
 }
 
-/**
- * Implementation 6 can install this boundary for explicitly durable images.
- * Ordinary screenshots and receipts remain text-only capture in this module.
- */
-export interface DurableImageCapturePolicy {
-  enqueueEligibleImages(input: {
-    identity: MemoryOwnerContext;
-    turnId: string;
-    imageStorageIds: string[];
-    eligibilityToken: string;
-  }): Promise<void>;
+export class MemoryIdentityRecoveryRequiredError extends Error {
+  constructor() {
+    super("memory identity recovery is required");
+    this.name = "MemoryIdentityRecoveryRequiredError";
+  }
 }
 
 export interface RawTurnCaptureInput {
@@ -77,7 +64,7 @@ export interface RawTurnCaptureInput {
 export type RawTurnCaptureResult =
   | {
       enqueued: false;
-      reason: "write_mode_disabled" | "synthetic_proactive";
+      reason: "unconfigured" | "recovery_required" | "synthetic_proactive";
     }
   | {
       enqueued: boolean;
@@ -90,10 +77,12 @@ export type RawTurnCaptureResult =
 export interface RawTurnCaptureDependencies {
   jobStore: MemorySyncJobStore;
   identityStateStore?: MemoryIdentityStateStore;
-  writeMode?: MemoryWriteMode;
+  memoryConfigured?: boolean;
   memoryIdSalt?: string;
   now?: () => number;
   createJobId?: () => string;
+  /** Recovery finalization may retain a job when only the state read is unavailable. */
+  allowUnverifiedIdentityOnStateError?: boolean;
 }
 
 export type PrepareRawTurnCaptureDependencies = Omit<
@@ -103,7 +92,10 @@ export type PrepareRawTurnCaptureDependencies = Omit<
 
 export type PreparedRawTurnCapture =
   | {
-      capture: { enqueued: false; reason: "write_mode_disabled" | "synthetic_proactive" };
+      capture: {
+        enqueued: false;
+        reason: "unconfigured" | "recovery_required" | "synthetic_proactive";
+      };
       job: null;
     }
   | {
@@ -169,8 +161,8 @@ export function normalizeMemorySyncPayload(payload: unknown): string {
 export function computeMemorySyncPayloadHash(input: {
   kind: MemorySyncJobKind;
   containerTag: string;
-  customId?: string;
-  turnId?: string;
+  customId: string;
+  turnId: string;
   normalizedPayload: string;
 }): string {
   return createHash("sha256")
@@ -207,30 +199,52 @@ export async function prepareRawTurnCapture(
       job: null,
     };
   }
-  const writeMode = dependencies.writeMode ?? readMemoryProviderConfiguration().writeMode;
-  if (writeMode === "convex") {
+  const memoryConfigured =
+    dependencies.memoryConfigured ?? Boolean(process.env.SUPERMEMORY_API_KEY?.trim());
+  if (!memoryConfigured) {
     return {
-      capture: { enqueued: false, reason: "write_mode_disabled" },
+      capture: { enqueued: false, reason: "unconfigured" },
       job: null,
     };
   }
-
-  const currentSaltFingerprint = memoryIdSaltFingerprint(dependencies.memoryIdSalt);
-  const persistedSaltFingerprint = dependencies.identityStateStore
-    ? await dependencies.identityStateStore.ensureIdentitySaltFingerprint(
-        currentSaltFingerprint,
-      )
-    : currentSaltFingerprint;
-  const identity = deriveMemoryIdentity(
-    {
-      memoryOwnerId: input.memoryOwnerId,
-      conversationId: input.conversationId,
-    },
-    {
-      salt: dependencies.memoryIdSalt,
-      expectedSaltFingerprint: persistedSaltFingerprint,
-    },
-  );
+  let identity: MemoryOwnerContext;
+  try {
+    const currentSaltFingerprint = memoryIdSaltFingerprint(dependencies.memoryIdSalt);
+    let persistedSaltFingerprint = currentSaltFingerprint;
+    if (dependencies.identityStateStore) {
+      try {
+        persistedSaltFingerprint =
+          await dependencies.identityStateStore.ensureIdentitySaltFingerprint(
+            currentSaltFingerprint,
+          );
+      } catch (error) {
+        if (
+          !dependencies.allowUnverifiedIdentityOnStateError ||
+          error instanceof MemoryIdentityRecoveryRequiredError
+        ) {
+          throw error;
+        }
+        // The assistant + job transaction still validates the server proof.
+        // Keeping the deterministic job here lets the recovery journal retain
+        // semantic capture intent during a transient Convex outage.
+      }
+    }
+    identity = deriveMemoryIdentity(
+      {
+        memoryOwnerId: input.memoryOwnerId,
+        conversationId: input.conversationId,
+      },
+      {
+        salt: dependencies.memoryIdSalt,
+        expectedSaltFingerprint: persistedSaltFingerprint,
+      },
+    );
+  } catch {
+    return {
+      capture: { enqueued: false, reason: "recovery_required" },
+      job: null,
+    };
+  }
   const payload = buildConversationTurnPayload({
     identity,
     turnId: input.turnId,
@@ -247,7 +261,10 @@ export async function prepareRawTurnCapture(
     turnId: input.turnId,
     normalizedPayload,
   });
-  const jobId = dependencies.createJobId?.() ?? `memory-sync-${randomUUID()}`;
+  // Stable by normalized payload so a delivered turn finalized twice resolves
+  // to the same durable source job instead of creating a conflicting recovery
+  // journal record.
+  const jobId = dependencies.createJobId?.() ?? `memory-sync-${payloadHash}`;
   const job: EnqueueMemorySyncJobInput = {
     jobId,
     kind: "conversation_turn",
@@ -265,52 +282,4 @@ export async function prepareRawTurnCapture(
     capture: { jobId, payloadHash, identity },
     job,
   };
-}
-
-/**
- * Explicit/durable image memory is owned by Implementation 6. Normal turn
- * capture never calls this helper; it only records image counts in metadata.
- */
-export async function enqueueDurableImageCapture(
-  input: {
-    identity: MemoryOwnerContext;
-    turnId: string;
-    imageStorageIds: string[];
-    eligibilityToken: string;
-  },
-  policy: DurableImageCapturePolicy,
-): Promise<void> {
-  await policy.enqueueEligibleImages(input);
-}
-
-const convexJobStore: MemorySyncJobStore = {
-  async enqueue(input) {
-    const result = await convex.mutation(api.memorySyncJobs.enqueue, input);
-    return {
-      jobId: result.job.jobId,
-      enqueued: result.created,
-      duplicate: result.duplicate,
-    };
-  },
-};
-
-const convexIdentityStateStore: MemoryIdentityStateStore = {
-  async ensureIdentitySaltFingerprint(saltFingerprint) {
-    return await convex.mutation(
-      api.memoryProviderState.ensureIdentitySaltFingerprint,
-      { saltFingerprint },
-    );
-  },
-};
-
-export function enqueueRawTurnCapture(
-  input: RawTurnCaptureInput,
-): Promise<RawTurnCaptureResult> {
-  return captureRawTurn(input, {
-    jobStore: convexJobStore,
-    identityStateStore: convexIdentityStateStore,
-    // Implementation 8 owns writes unconditionally. Avoid re-reading migration
-    // modes here so a malformed legacy flag cannot suppress the durable outbox.
-    writeMode: "supermemory",
-  });
 }

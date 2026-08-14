@@ -235,13 +235,6 @@ async function main() {
     res.json({ ok });
   });
 
-  app.post("/consolidate", requireLocalControl, (_req, res) => {
-    res.status(410).json({
-      error: "Legacy Convex memory consolidation was retired after the Supermemory write cutover.",
-      code: "legacy_memory_runtime_retired",
-    });
-  });
-
   app.post("/agents/:id/retry", requireLocalControl, async (req, res) => {
     const agentId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
     if (!agentId) {

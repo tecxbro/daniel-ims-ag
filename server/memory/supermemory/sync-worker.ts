@@ -449,11 +449,7 @@ export interface StartConfiguredMemorySyncWorkerOptions {
   onError?: (error: unknown) => void;
 }
 
-/**
- * Starts capture when enabled, or drains already-durable work after write mode
- * is disabled. A missing key leaves the outbox untouched and records an
- * unconfigured health state; it never converts configuration into dead-letter.
- */
+/** A missing key leaves durable work untouched and never dead-letters it. */
 export async function startConfiguredMemorySyncWorker(
   options: StartConfiguredMemorySyncWorkerOptions,
 ): Promise<ConfiguredMemorySyncWorkerResult> {
@@ -461,29 +457,23 @@ export async function startConfiguredMemorySyncWorker(
   const config = readMemoryProviderConfiguration(env);
   const persistence = new ConvexMemorySyncPersistence(options.client);
   const backlog = await persistence.getBacklog();
-  const captureEnabled = config.writeMode !== "convex";
   const hasBacklog = backlog.pending + backlog.processing + backlog.submitted + backlog.failed > 0;
 
-  if (!captureEnabled && !hasBacklog) {
-    return { worker: null, reason: "no_backlog", backlog };
+  if (!config.apiKeyConfigured) {
+    if (!hasBacklog) return { worker: null, reason: "no_backlog", backlog };
+    const error = "SUPERMEMORY_API_KEY is required to drain the durable memory sync backlog";
+    options.onError?.(
+      new SupermemoryProviderError(error, {
+        operation: "sync-worker-startup",
+        code: "configuration",
+      }),
+    );
+    return { worker: null, reason: "provider_unconfigured", backlog };
   }
 
   let provider = options.provider;
   if (!provider) {
-    const apiKey = env.SUPERMEMORY_API_KEY?.trim();
-    if (!apiKey) {
-      const error = "SUPERMEMORY_API_KEY is required to drain the durable memory sync backlog";
-      await persistence.markUnconfigured({
-        error,
-        readMode: config.readMode,
-        writeMode: config.writeMode,
-      });
-      options.onError?.(new SupermemoryProviderError(error, {
-        operation: "sync-worker-startup",
-        code: "configuration",
-      }));
-      return { worker: null, reason: "provider_unconfigured", backlog };
-    }
+    const apiKey = env.SUPERMEMORY_API_KEY!.trim();
     provider = createSupermemoryAdapter({
       apiKey,
       timeoutMs: config.timeoutMs,

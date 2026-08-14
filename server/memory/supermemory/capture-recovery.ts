@@ -5,31 +5,36 @@ import { isAbsolute, join, resolve, sep } from "node:path";
 import { api } from "../../../convex/_generated/api.js";
 import { convex } from "../../convex-client.js";
 import {
+  MemoryIdentityRecoveryRequiredError,
   prepareRawTurnCapture,
   type EnqueueMemorySyncJobInput,
   type RawTurnCaptureInput,
 } from "./capture.js";
-import { memoryIdSaltFingerprint } from "./identity.js";
+import {
+  memoryIdSaltFingerprint,
+  memoryPairingAuthorityProof,
+} from "./identity.js";
 import { parseMemorySyncJobPayload } from "./job-contract.js";
 
-const RECOVERY_SCHEMA_VERSION = 1 as const;
+const LEGACY_RECOVERY_SCHEMA_VERSION = 1 as const;
+const RECOVERY_SCHEMA_VERSION = 2 as const;
 const DEFAULT_REPLAY_INTERVAL_MS = 30_000;
 const DEFAULT_REPLAY_LIMIT = 50;
 const MAX_RECOVERY_FILE_BYTES = 2 * 1024 * 1024;
 
 export interface AssistantCaptureRecoveryRecord {
-  schemaVersion: typeof RECOVERY_SCHEMA_VERSION;
+  schemaVersion: typeof LEGACY_RECOVERY_SCHEMA_VERSION | typeof RECOVERY_SCHEMA_VERSION;
   createdAt: number;
   assistant: {
     conversationId: string;
     content: string;
     turnId: string;
   };
-  job: EnqueueMemorySyncJobInput;
+  job?: EnqueueMemorySyncJobInput;
 }
 
 export interface AssistantCapturePersistenceResult {
-  job?: { jobId?: string };
+  job?: { jobId?: string; payloadHash?: string };
 }
 
 export interface CaptureRecoveryDependencies {
@@ -39,6 +44,7 @@ export interface CaptureRecoveryDependencies {
     record: AssistantCaptureRecoveryRecord,
   ) => Promise<AssistantCapturePersistenceResult>;
   memoryIdSalt?: string;
+  memoryConfigured?: boolean;
   ensureIdentitySaltFingerprint?: (saltFingerprint: string) => Promise<string>;
 }
 
@@ -87,24 +93,28 @@ function validateRecord(value: unknown): AssistantCaptureRecoveryRecord {
   }
   const record = value as Partial<AssistantCaptureRecoveryRecord>;
   if (
-    record.schemaVersion !== RECOVERY_SCHEMA_VERSION ||
+    (record.schemaVersion !== LEGACY_RECOVERY_SCHEMA_VERSION &&
+      record.schemaVersion !== RECOVERY_SCHEMA_VERSION) ||
     typeof record.createdAt !== "number" ||
     !record.assistant ||
     typeof record.assistant.conversationId !== "string" ||
     typeof record.assistant.content !== "string" ||
     typeof record.assistant.turnId !== "string" ||
-    !record.job ||
-    record.job.kind !== "conversation_turn" ||
-    record.job.turnId !== record.assistant.turnId ||
-    record.job.conversationId !== record.assistant.conversationId
+    (record.schemaVersion === LEGACY_RECOVERY_SCHEMA_VERSION && !record.job) ||
+    (record.job !== undefined &&
+      (record.job.kind !== "conversation_turn" ||
+        record.job.turnId !== record.assistant.turnId ||
+        record.job.conversationId !== record.assistant.conversationId))
   ) {
     throw new Error("capture recovery record is invalid");
   }
-  parseMemorySyncJobPayload(record.job.payload, {
-    kind: record.job.kind,
-    containerTag: record.job.containerTag,
-    customId: record.job.customId,
-  });
+  if (record.job) {
+    parseMemorySyncJobPayload(record.job.payload, {
+      kind: record.job.kind,
+      containerTag: record.job.containerTag,
+      customId: record.job.customId,
+    });
+  }
   return record as AssistantCaptureRecoveryRecord;
 }
 
@@ -131,7 +141,7 @@ export async function writeCaptureRecoveryRecord(
   try {
     const existing = validateRecord(JSON.parse(await readFile(path, "utf8")));
     if (
-      existing.job.payloadHash !== validated.job.payloadHash ||
+      existing.job?.payloadHash !== validated.job?.payloadHash ||
       existing.assistant.content !== validated.assistant.content
     ) {
       throw new Error(`capture recovery turn has conflicting content: ${validated.assistant.turnId}`);
@@ -160,41 +170,47 @@ export async function writeCaptureRecoveryRecord(
 async function defaultPersist(
   record: AssistantCaptureRecoveryRecord,
 ): Promise<AssistantCapturePersistenceResult> {
-  return await convex.mutation(api.messages.persistAssistantWithMemoryCapture, {
+  return await convex.mutation(api.messages.persistAssistantTurn, {
     ...record.assistant,
     job: record.job,
+    pairingAuthorityProof: record.job ? memoryPairingAuthorityProof() : undefined,
   });
 }
 
 async function prepareRecoveryRecord(
   input: RawTurnCaptureInput & { assistantReply: string },
   dependencies: CaptureRecoveryDependencies,
-): Promise<AssistantCaptureRecoveryRecord | null> {
+): Promise<AssistantCaptureRecoveryRecord> {
   const now = dependencies.now ?? Date.now;
   const base = {
-    writeMode: "supermemory" as const,
+    memoryConfigured: dependencies.memoryConfigured,
     memoryIdSalt: dependencies.memoryIdSalt,
     now,
   };
-  let prepared;
-  try {
-    prepared = await prepareRawTurnCapture(input, {
-      ...base,
-      identityStateStore: {
-        ensureIdentitySaltFingerprint:
-          dependencies.ensureIdentitySaltFingerprint ??
-          (async (saltFingerprint) =>
-            await convex.mutation(api.memoryProviderState.ensureIdentitySaltFingerprint, {
-              saltFingerprint,
-            })),
-      },
-    });
-  } catch {
-    // Convex may be the failing dependency. The current salt still yields the
-    // deterministic owner identity needed to make the recovery record replayable.
-    prepared = await prepareRawTurnCapture(input, base);
-  }
-  if (!prepared.job) return null;
+  const prepared = await prepareRawTurnCapture(input, {
+    ...base,
+    allowUnverifiedIdentityOnStateError: true,
+    identityStateStore: {
+      ensureIdentitySaltFingerprint:
+        dependencies.ensureIdentitySaltFingerprint ??
+        (async (saltFingerprint) =>
+          {
+            const result = await convex.mutation(
+              api.memoryProviderState.verifyIdentityConfiguration,
+              {
+                saltFingerprint,
+                pairingAuthorityProof: memoryPairingAuthorityProof(
+                  dependencies.memoryIdSalt,
+                ),
+              },
+            );
+            if (result.status !== "ready") {
+              throw new MemoryIdentityRecoveryRequiredError();
+            }
+            return saltFingerprint;
+          }),
+    },
+  });
   return validateRecord({
     schemaVersion: RECOVERY_SCHEMA_VERSION,
     createdAt: now(),
@@ -203,8 +219,18 @@ async function prepareRecoveryRecord(
       content: input.assistantReply,
       turnId: input.turnId,
     },
-    job: prepared.job,
+    job: prepared.job ?? undefined,
   });
+}
+
+function confirmsExpectedJob(
+  expected: EnqueueMemorySyncJobInput,
+  result: AssistantCapturePersistenceResult,
+): boolean {
+  return (
+    result.job?.jobId === expected.jobId ||
+    result.job?.payloadHash === expected.payloadHash
+  );
 }
 
 /**
@@ -218,21 +244,20 @@ export async function finalizeAssistantTurnCapture(
 ): Promise<{ durable: "convex" | "journal" | "skipped"; jobId?: string }> {
   if (input.kind === "proactive") return { durable: "skipped" };
   const record = await prepareRecoveryRecord(input, dependencies);
-  if (!record) return { durable: "skipped" };
   const persist = dependencies.persist ?? defaultPersist;
   try {
     const result = await persist(record);
-    if (result.job?.jobId !== record.job.jobId) {
+    if (record.job && !confirmsExpectedJob(record.job, result)) {
       throw new Error("Convex did not confirm the expected memory sync job");
     }
-    return { durable: "convex", jobId: record.job.jobId };
+    return { durable: "convex", jobId: record.job?.jobId };
   } catch (error) {
     await writeCaptureRecoveryRecord(record, dependencies);
     console.warn("[supermemory-capture] Convex unavailable; turn journaled", {
       turnId: input.turnId,
       errorName: error instanceof Error ? error.name : "UnknownError",
     });
-    return { durable: "journal", jobId: record.job.jobId };
+    return { durable: "journal", jobId: record.job?.jobId };
   }
 }
 
@@ -264,7 +289,7 @@ export async function replayCaptureRecoveryJournal(
     try {
       const record = validateRecord(JSON.parse(await readFile(path, "utf8")));
       const result = await persist(record);
-      if (result.job?.jobId !== record.job.jobId) {
+      if (record.job && !confirmsExpectedJob(record.job, result)) {
         throw new Error("Convex did not confirm the expected memory sync job");
       }
       await unlink(path);

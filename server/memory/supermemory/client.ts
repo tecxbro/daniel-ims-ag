@@ -6,12 +6,10 @@ import Supermemory, {
 } from "supermemory";
 import { validateProviderIdentifier } from "./identity.js";
 import {
-  fetchConvexImageBytes,
   SupermemoryOperationTransport,
   SupermemoryProviderError,
 } from "./operations.js";
 export { SupermemoryProviderError } from "./operations.js";
-import type { ImageJobInput, MemoryForgetJobInput } from "./job-contract.js";
 import type {
   CaptureTurnInput,
   CreateExactMemoryInput,
@@ -19,10 +17,8 @@ import type {
   ForgetMemoryInput,
   MemoryHydrationResult,
   MemoryProviderConfiguration,
-  MemoryReadMode,
   MemorySearchResult,
   MemoryVersionHistoryItem,
-  MemoryWriteMode,
   ListDocumentsInput,
   ListMemoryEntriesInput,
   ProfileInput,
@@ -39,7 +35,6 @@ const DEFAULT_BASE_URL = "https://api.supermemory.ai";
 const DEFAULT_TIMEOUT_MS = 1_200;
 const DEFAULT_THRESHOLD = 0.6;
 const DEFAULT_SEARCH_LIMIT = 8;
-const SDK_BACKGROUND_RETRIES = 2;
 // Durable outbox attempts own write retries and their exact backoff schedule.
 // Retrying inside the SDK would create untracked provider calls per attempt.
 const OUTBOX_WRITE_RETRIES = 0;
@@ -127,23 +122,6 @@ export interface SupermemoryAdapterOptions {
   sleep?: (milliseconds: number) => Promise<void>;
 }
 
-function parseMode<T extends string>(
-  env: Environment,
-  key: string,
-  allowed: readonly T[],
-  fallback: T,
-): T {
-  const value = env[key]?.trim().toLowerCase();
-  if (!value) return fallback;
-  if (!allowed.includes(value as T)) {
-    throw new SupermemoryProviderError(
-      `${key} must be one of: ${allowed.join(", ")}`,
-      { operation: "configuration", code: "configuration" },
-    );
-  }
-  return value as T;
-}
-
 function parseNumber(
   env: Environment,
   key: string,
@@ -163,33 +141,10 @@ function parseNumber(
   return value;
 }
 
-function parseBoolean(env: Environment, key: string, fallback: boolean): boolean {
-  const value = env[key]?.trim().toLowerCase();
-  if (!value) return fallback;
-  if (value === "true") return true;
-  if (value === "false") return false;
-  throw new SupermemoryProviderError(`${key} must be true or false`, {
-    operation: "configuration",
-    code: "configuration",
-  });
-}
-
 export function readMemoryProviderConfiguration(
   env: Environment = process.env,
 ): MemoryProviderConfiguration {
   return {
-    readMode: parseMode<MemoryReadMode>(
-      env,
-      "DANIEL_MEMORY_READ_MODE",
-      ["convex", "shadow", "supermemory"],
-      "supermemory",
-    ),
-    writeMode: parseMode<MemoryWriteMode>(
-      env,
-      "DANIEL_MEMORY_WRITE_MODE",
-      ["convex", "dual", "supermemory"],
-      "supermemory",
-    ),
     timeoutMs: parseNumber(
       env,
       "DANIEL_SUPERMEMORY_TIMEOUT_MS",
@@ -212,22 +167,14 @@ export function readMemoryProviderConfiguration(
       "an integer between 1 and 100",
     ),
     dreaming: env.DANIEL_SUPERMEMORY_DREAMING?.trim() || "dynamic",
-    historyBackfillDays: parseNumber(
-      env,
-      "DANIEL_SUPERMEMORY_HISTORY_BACKFILL_DAYS",
-      0,
-      (value) => Number.isInteger(value) && value >= 0,
-      "a non-negative integer",
-    ),
-    legacyFallback: parseBoolean(env, "DANIEL_MEMORY_LEGACY_FALLBACK", false),
     apiKeyConfigured: Boolean(env.SUPERMEMORY_API_KEY?.trim()),
   };
 }
 
 export function shouldInitializeSupermemoryClient(
-  config: Pick<MemoryProviderConfiguration, "readMode" | "writeMode">,
+  config: Pick<MemoryProviderConfiguration, "apiKeyConfigured">,
 ): boolean {
-  return config.readMode !== "convex" || config.writeMode !== "convex";
+  return config.apiKeyConfigured;
 }
 
 function assertServerRuntime(): void {
@@ -404,14 +351,14 @@ export class SupermemoryAdapter
       baseUrl: this.baseUrl,
       fetchImpl: this.fetchImpl,
       sleep: this.sleep,
-      retries: SDK_BACKGROUND_RETRIES,
+      retries: USER_PATH_RETRIES,
     });
     const sdkFactory = options.sdkFactory ?? ((clientOptions) => new Supermemory(clientOptions));
     this.sdk = sdkFactory({
       apiKey,
       baseURL: this.baseUrl,
       timeout: this.timeoutMs,
-      maxRetries: SDK_BACKGROUND_RETRIES,
+      maxRetries: USER_PATH_RETRIES,
     });
   }
 
@@ -625,35 +572,6 @@ export class SupermemoryAdapter
     await this.operationTransport.forgetExact(input);
   }
 
-  async forgetMany(input: MemoryForgetJobInput): Promise<void> {
-    const result = await this.operationTransport.applyExactForget(input);
-    const forgottenIds = new Set(result.forgotten.map((memory) => memory.id));
-    if (input.ids.some((id) => !forgottenIds.has(id))) {
-      throw new SupermemoryProviderError(
-        "Supermemory bulk forget did not confirm every exact memory ID",
-        { operation: "forgetMany" },
-      );
-    }
-  }
-
-  async uploadImageJob(input: ImageJobInput): Promise<ProviderDocumentResult> {
-    const image = await fetchConvexImageBytes(input.storageId);
-    const extension = image.mediaType.split("/")[1]?.replace("jpeg", "jpg") || "img";
-    return await this.operationTransport.uploadImage({
-      containerTag: input.containerTag,
-      customId: input.customId,
-      bytes: image.bytes,
-      mediaType: image.mediaType,
-      filename: `${input.customId}.${extension}`,
-      metadata: input.metadata ?? {
-        source: "daniel_durable_image",
-        reason: input.reason,
-        ...(input.turnId ? { turnId: input.turnId } : {}),
-        schemaVersion: 1,
-      },
-    });
-  }
-
   async getContainerSettings(containerTag: string): Promise<ContainerTagSettings | null> {
     validateProviderIdentifier(containerTag, "containerTag");
     try {
@@ -790,10 +708,7 @@ export function createConfiguredSupermemoryProvider(
   if (!shouldInitializeSupermemoryClient(config)) return null;
   const apiKey = env.SUPERMEMORY_API_KEY?.trim();
   if (!apiKey) {
-    throw new SupermemoryProviderError(
-      "SUPERMEMORY_API_KEY is required when a Supermemory read or write mode is enabled",
-      { operation: "configuration", code: "configuration" },
-    );
+    return null;
   }
   return createSupermemoryAdapter({
     apiKey,

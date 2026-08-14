@@ -19,7 +19,8 @@ export default defineSchema({
       "turnId",
       "role",
     ])
-    .index("by_createdAt", ["createdAt"]),
+    .index("by_createdAt", ["createdAt"])
+    .index("by_role_and_created_at", ["role", "createdAt"]),
 
   conversations: defineTable({
     conversationId: v.string(),
@@ -29,59 +30,14 @@ export default defineSchema({
     lastActivityAt: v.number(),
   }).index("by_conversation", ["conversationId"]),
 
-  memoryRecords: defineTable({
-    memoryId: v.string(),
-    content: v.string(),
-    tier: v.union(v.literal("short"), v.literal("long"), v.literal("permanent")),
-    segment: v.union(
-      v.literal("identity"),
-      v.literal("preference"),
-      v.literal("correction"),
-      v.literal("relationship"),
-      v.literal("project"),
-      v.literal("knowledge"),
-      v.literal("context"),
-    ),
-    importance: v.number(),
-    decayRate: v.number(),
-    accessCount: v.number(),
-    lastAccessedAt: v.number(),
-    sourceTurn: v.optional(v.string()),
-    lifecycle: v.union(v.literal("active"), v.literal("archived"), v.literal("pruned")),
-    supersedes: v.optional(v.array(v.string())),
-    embedding: v.optional(v.array(v.float64())),
-    // Structured sidecar data (JSON blob). Currently used to carry
-    // `corrects` text on correction-segment memories. Intentionally loose
-    // so extraction prompts can stash provider-specific hints without
-    // schema churn.
-    metadata: v.optional(v.string()),
-    createdAt: v.number(),
-    imageStorageIds: v.optional(v.array(v.id("_storage"))),
-  })
-    .index("by_memory_id", ["memoryId"])
-    .index("by_tier", ["tier"])
-    .index("by_segment", ["segment"])
-    .index("by_lifecycle", ["lifecycle"])
-    .vectorIndex("by_embedding", {
-      vectorField: "embedding",
-      dimensions: 1024,
-      filterFields: ["lifecycle"],
-    }),
-
   memorySyncJobs: defineTable({
     jobId: v.string(),
-    kind: v.union(
-      v.literal("conversation_turn"),
-      v.literal("explicit_memory"),
-      v.literal("image"),
-      v.literal("memory_update"),
-      v.literal("memory_forget"),
-    ),
+    kind: v.literal("conversation_turn"),
     ownerKey: v.string(),
     containerTag: v.string(),
-    customId: v.optional(v.string()),
-    conversationId: v.optional(v.string()),
-    turnId: v.optional(v.string()),
+    customId: v.string(),
+    conversationId: v.string(),
+    turnId: v.string(),
     payload: v.string(),
     payloadHash: v.string(),
     status: v.union(
@@ -132,44 +88,6 @@ export default defineSchema({
     .index("by_status", ["status"])
     .index("by_owner_key_and_status", ["ownerKey", "status"]),
 
-  memoryMigrationRows: defineTable({
-    legacyMemoryId: v.string(),
-    ownerKey: v.string(),
-    containerTag: v.string(),
-    status: v.union(
-      v.literal("pending"),
-      v.literal("migrated"),
-      v.literal("failed"),
-      v.literal("skipped"),
-    ),
-    providerDocumentId: v.optional(v.string()),
-    providerMemoryId: v.optional(v.string()),
-    contentHash: v.string(),
-    lastError: v.optional(v.string()),
-    createdAt: v.number(),
-    updatedAt: v.number(),
-  })
-    .index("by_legacy_memory_id", ["legacyMemoryId"])
-    .index("by_status", ["status"])
-    .index("by_owner_key_and_container_tag_and_status", [
-      "ownerKey",
-      "containerTag",
-      "status",
-    ]),
-
-  legacyMemoryCleanupRuns: defineTable({
-    runId: v.string(),
-    expectedMemoryRecords: v.number(),
-    expectedMemoryEvents: v.number(),
-    expectedConsolidationRuns: v.number(),
-    deletedMemoryRecords: v.number(),
-    deletedMemoryEvents: v.number(),
-    deletedConsolidationRuns: v.number(),
-    status: v.union(v.literal("running"), v.literal("zero_verified")),
-    createdAt: v.number(),
-    updatedAt: v.number(),
-  }).index("by_run_id", ["runId"]),
-
   memoryPendingOperations: defineTable({
     operationId: v.string(),
     ownerKey: v.string(),
@@ -201,8 +119,8 @@ export default defineSchema({
     initializedAt: v.optional(v.number()),
     healthStatus: v.optional(
       v.union(
-        v.literal("disabled"),
         v.literal("unconfigured"),
+        v.literal("recovery_required"),
         v.literal("healthy"),
         v.literal("degraded"),
         v.literal("unavailable"),
@@ -211,12 +129,11 @@ export default defineSchema({
     lastSuccessfulSubmissionAt: v.optional(v.number()),
     lastFailedSubmissionAt: v.optional(v.number()),
     lastError: v.optional(v.string()),
-    readMode: v.optional(
-      v.union(v.literal("convex"), v.literal("shadow"), v.literal("supermemory")),
-    ),
-    writeMode: v.optional(
-      v.union(v.literal("convex"), v.literal("dual"), v.literal("supermemory")),
-    ),
+    pairingAuthorityProof: v.optional(v.string()),
+    primaryOwnerKey: v.optional(v.string()),
+    primaryContainerTag: v.optional(v.string()),
+    primaryConversationId: v.optional(v.string()),
+    primaryRegisteredAt: v.optional(v.number()),
     lastWorkerActivityAt: v.optional(v.number()),
     updatedAt: v.number(),
   })
@@ -436,17 +353,6 @@ export default defineSchema({
     createdAt: v.number(),
   }).index("by_agent", ["agentId"]),
 
-  memoryEvents: defineTable({
-    eventType: v.string(),
-    conversationId: v.optional(v.string()),
-    memoryId: v.optional(v.string()),
-    agentId: v.optional(v.string()),
-    data: v.string(),
-    createdAt: v.number(),
-  })
-    .index("by_conversation", ["conversationId"])
-    .index("by_type", ["eventType"]),
-
   automations: defineTable({
     automationId: v.string(),
     name: v.string(),
@@ -490,27 +396,6 @@ export default defineSchema({
   })
     .index("by_draft_id", ["draftId"])
     .index("by_conversation_status", ["conversationId", "status"]),
-
-  consolidationRuns: defineTable({
-    runId: v.string(),
-    trigger: v.string(),
-    status: v.union(
-      v.literal("running"),
-      v.literal("completed"),
-      v.literal("failed"),
-    ),
-    proposalsCount: v.number(),
-    mergedCount: v.number(),
-    prunedCount: v.number(),
-    notes: v.optional(v.string()),
-    // JSON blob: { proposals: [...], decisions: [...], applied: [...] }
-    // Captured so you can inspect the reasoning for any historical run.
-    details: v.optional(v.string()),
-    startedAt: v.number(),
-    completedAt: v.optional(v.number()),
-  })
-    .index("by_run_id", ["runId"])
-    .index("by_status", ["status"]),
 
   // Runtime overrides for things normally pinned by env vars (e.g. the Claude
   // model). Lets the user say "use opus" via iMessage and have the next agent

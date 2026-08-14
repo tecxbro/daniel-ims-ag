@@ -29,9 +29,6 @@
     "test": "vitest run --passWithNoTests",
     "test:watch": "vitest",
     "evaluate:supermemory-recall": "tsx scripts/evaluate-supermemory-recall.ts",
-    "memory:export": "tsx scripts/export-convex-memory.ts",
-    "memory:migrate": "tsx scripts/migrate-memory-to-supermemory.ts",
-    "memory:verify": "tsx scripts/verify-supermemory-migration.ts",
     "check:branding": "node scripts/check-branding.mjs",
     "validate": "npm run check:branding && npm run typecheck && npm test && npm run build:debug"
   },
@@ -41,7 +38,6 @@
     "@composio/core": "^0.6.10",
     "@hugeicons/core-free-icons": "^1.0.0",
     "@hugeicons/react": "^1.0.0",
-    "@huggingface/transformers": "^4.2.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "convex": "^1.44.0",
     "cors": "^2.8.5",

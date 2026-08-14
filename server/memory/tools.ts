@@ -1,68 +1,10 @@
 import { z } from "zod";
-import { api } from "../../convex/_generated/api.js";
-import { convex } from "../convex-client.js";
-import { embed, embeddingsAvailable } from "../embeddings.js";
-import { createClaudeMcpServer } from "../runtimes/claude.js";
 import { defineRuntimeTool } from "../runtimes/tool.js";
 import { runtimeText, type RuntimeTool, type RuntimeToolResult } from "../runtimes/types.js";
-import {
-  getSupermemoryProvider,
-  readMemoryProviderConfiguration,
-} from "./supermemory/client.js";
-import {
-  type MemoryContextInstrumentationHook,
-  type MemoryRecallResult,
-} from "./supermemory/context.js";
-import {
-  SupermemoryOperationTransport,
-  createConvexImageAnchorStore,
-  createConvexPendingOperationStore,
-  createMemoryOperationProvider,
-  fetchConvexImageBytes,
-  type MemoryOperationDependencies,
-} from "./supermemory/operations.js";
-import type {
-  DanielMemoryProvider,
-  MemoryOwnerContext,
-  MemoryProviderConfiguration,
-} from "./supermemory/types.js";
-import {
-  DEFAULT_DECAY,
-  SEGMENT_PREFERRED_TIER,
-  makeMemoryId,
-  type MemoryRecord,
-} from "./types.js";
-import {
-  createMemoryReadStrategy,
-  type LegacyMemoryRecall,
-  type LegacyMemoryResult,
-} from "./read-strategy.js";
-import {
-  createMemoryWriteStrategy,
-  type LegacyMemoryWriteInput,
-  type LegacyMemoryWriteResult,
-} from "./write-strategy.js";
-
-export type {
-  LegacyMemoryRecall,
-  LegacyMemoryResult,
-} from "./read-strategy.js";
-export type {
-  LegacyMemoryWriteInput,
-  LegacyMemoryWriteResult,
-} from "./write-strategy.js";
+import { SupermemoryService } from "./supermemory/service.js";
 
 const NAMESPACE = "daniel-memory";
 const DEFAULT_TOOL_SEARCH_LIMIT = 8;
-const tierEnum = z.enum(["short", "long", "permanent"]);
-const segmentEnum = z.enum([
-  "identity",
-  "preference",
-  "relationship",
-  "project",
-  "knowledge",
-  "context",
-]);
 const staticKindEnum = z.enum([
   "preferred_name",
   "core_identity",
@@ -70,220 +12,10 @@ const staticKindEnum = z.enum([
   "home_timezone",
 ]);
 
-export type MemoryToolConfig = Pick<
-  MemoryProviderConfiguration,
-  | "readMode"
-  | "writeMode"
-  | "timeoutMs"
-  | "threshold"
-  | "searchLimit"
-  | "legacyFallback"
->;
-
 export interface CreateMemoryToolsOptions {
-  owner: MemoryOwnerContext;
-  turnId: string;
-  /** Exact current-turn images the dispatcher is allowed to make durable. */
+  service: SupermemoryService;
+  /** Exact current-turn images the dispatcher may make durable. */
   imageStorageIds?: readonly string[];
-  config?: MemoryToolConfig;
-  provider?: Pick<DanielMemoryProvider, "profile" | "search"> | null;
-  operationDependencies?: MemoryOperationDependencies | null;
-  instrumentation?: MemoryContextInstrumentationHook;
-  legacyRecall?: typeof recallLegacyMemory;
-  legacyWrite?: typeof writeLegacyMemory;
-}
-
-interface ResolvedMemoryToolContext {
-  owner: MemoryOwnerContext | null;
-  turnId: string;
-  config: MemoryToolConfig;
-  legacyRecall: typeof recallLegacyMemory;
-  legacyWrite: typeof writeLegacyMemory;
-}
-
-function asLegacyMemoryResult(value: unknown): LegacyMemoryResult | null {
-  if (!value || typeof value !== "object") return null;
-  const record = value as Partial<MemoryRecord>;
-  if (
-    typeof record.memoryId !== "string" ||
-    typeof record.content !== "string" ||
-    typeof record.tier !== "string" ||
-    typeof record.segment !== "string" ||
-    typeof record.importance !== "number"
-  ) {
-    return null;
-  }
-  return {
-    memoryId: record.memoryId,
-    content: record.content,
-    tier: record.tier,
-    segment: record.segment,
-    importance: record.importance,
-  };
-}
-
-/**
- * The one legacy recall boundary used by both automatic shadow hydration and
- * the optional recall tool. It intentionally retains the old vector-first,
- * substring-fallback behavior. Cutover callers are read-only by default;
- * pre-cutover compatibility callers may request best-effort bookkeeping,
- * which is isolated so telemetry can never erase a successful read.
- */
-export async function recallLegacyMemory(input: {
-  conversationId: string;
-  query: string;
-  limit?: number;
-  bookkeeping?: "disabled" | "best_effort";
-}): Promise<LegacyMemoryRecall> {
-  const limit = Math.max(1, Math.min(100, Math.floor(input.limit ?? DEFAULT_TOOL_SEARCH_LIMIT)));
-  let results: LegacyMemoryResult[] = [];
-  let mode: LegacyMemoryRecall["mode"] = "substring";
-
-  if (embeddingsAvailable()) {
-    const queryVector = await embed(input.query);
-    if (queryVector) {
-      const hits = (await convex.action(api.memoryRecords.vectorSearch, {
-        embedding: queryVector,
-        limit,
-      })) as Array<{ record?: unknown }>;
-      results = hits
-        .map((hit) => asLegacyMemoryResult(hit.record))
-        .filter((result): result is LegacyMemoryResult => result !== null);
-      mode = "vector";
-    }
-  }
-  if (results.length === 0) {
-    const matches = (await convex.query(api.memoryRecords.search, {
-      query: input.query,
-      limit,
-    })) as unknown[];
-    results = matches
-      .map(asLegacyMemoryResult)
-      .filter((result): result is LegacyMemoryResult => result !== null);
-    mode = "substring";
-  }
-
-  if (input.bookkeeping === "best_effort") {
-    await bestEffortLegacyRecallBookkeeping({
-      conversationId: input.conversationId,
-      query: input.query,
-      results,
-      mode,
-    });
-  }
-  return { results, mode };
-}
-
-async function bestEffortLegacyRecallBookkeeping(input: {
-  conversationId: string;
-  query: string;
-  results: LegacyMemoryResult[];
-  mode: LegacyMemoryRecall["mode"];
-}): Promise<void> {
-  try {
-    await Promise.all(
-      input.results.map((result) =>
-        convex.mutation(api.memoryRecords.markAccessed, { memoryId: result.memoryId }),
-      ),
-    );
-    await convex.mutation(api.memoryEvents.emit, {
-      eventType: "memory.recalled",
-      conversationId: input.conversationId,
-      data: JSON.stringify({ query: input.query, hits: input.results.length, mode: input.mode }),
-    });
-  } catch (error) {
-    console.warn("[memory] legacy recall bookkeeping unavailable", {
-      errorName: error instanceof Error ? error.name : "UnknownError",
-      resultCount: input.results.length,
-    });
-  }
-}
-
-/** Legacy write path retained only for convex/dual rollback coverage. */
-export async function writeLegacyMemory(
-  input: LegacyMemoryWriteInput,
-): Promise<LegacyMemoryWriteResult> {
-  const tier = input.tier ?? SEGMENT_PREFERRED_TIER[input.segment];
-  const memoryId = makeMemoryId();
-  const embedding = (await embed(input.content)) ?? undefined;
-  await convex.mutation(api.memoryRecords.upsert, {
-    memoryId,
-    content: input.content,
-    tier,
-    segment: input.segment,
-    importance: input.importance,
-    decayRate: DEFAULT_DECAY[tier],
-    supersedes: input.supersedes,
-    embedding,
-  });
-  await convex.mutation(api.memoryEvents.emit, {
-    eventType: "memory.written",
-    conversationId: input.conversationId,
-    memoryId,
-    data: JSON.stringify({ tier, segment: input.segment, importance: input.importance }),
-  });
-  return { memoryId, tier, segment: input.segment };
-}
-
-function formatLegacyRecall(recall: LegacyMemoryRecall): RuntimeToolResult {
-  if (recall.results.length === 0) return runtimeText("No memories matched.");
-  return runtimeText(
-    recall.results
-      .map(
-        (result) =>
-          `• [${result.tier}/${result.segment} importance=${result.importance.toFixed(2)}] ${result.memoryId}: ${result.content}`,
-      )
-      .join("\n"),
-  );
-}
-
-function formatProviderRecall(
-  results: MemoryRecallResult["results"],
-): RuntimeToolResult {
-  if (results.length === 0) return runtimeText("No memories matched.");
-  return runtimeText(
-    results
-      .map(
-        (result) =>
-          `• [supermemory relevance=${result.similarity.toFixed(2)}] ${result.id}: ${result.content}`,
-      )
-      .join("\n"),
-  );
-}
-
-function safeConfiguration(): {
-  config: MemoryToolConfig;
-  error?: unknown;
-} {
-  try {
-    return { config: readMemoryProviderConfiguration() };
-  } catch (error) {
-    const rawReadMode = process.env.DANIEL_MEMORY_READ_MODE?.trim().toLowerCase();
-    const readMode =
-      rawReadMode === "convex" || rawReadMode === "shadow" || rawReadMode === "supermemory"
-        ? rawReadMode
-        : rawReadMode
-          ? "supermemory"
-          : "convex";
-    const rawWriteMode = process.env.DANIEL_MEMORY_WRITE_MODE?.trim().toLowerCase();
-    const writeMode =
-      rawWriteMode === "convex" || rawWriteMode === "dual" || rawWriteMode === "supermemory"
-        ? rawWriteMode
-        : rawWriteMode
-          ? "supermemory"
-          : "convex";
-    return {
-      config: {
-        readMode,
-        writeMode,
-        timeoutMs: 1_200,
-        threshold: 0.6,
-        searchLimit: DEFAULT_TOOL_SEARCH_LIMIT,
-        legacyFallback: false,
-      },
-      error,
-    };
-  }
 }
 
 function providerFailure(action: string, error?: unknown): RuntimeToolResult {
@@ -298,204 +30,74 @@ function providerFailure(action: string, error?: unknown): RuntimeToolResult {
   );
 }
 
-/**
- * The string overload is a temporary compatibility path for legacy-only
- * callers. Supermemory reads and operations require the full owner context.
- */
-export function createMemoryTools(conversationId: string): RuntimeTool[];
-export function createMemoryTools(options: CreateMemoryToolsOptions): RuntimeTool[];
-export function createMemoryTools(
-  input: string | CreateMemoryToolsOptions,
-): RuntimeTool[] {
-  const fallbackConfiguration = safeConfiguration();
-  const legacy: ResolvedMemoryToolContext =
-    typeof input === "string"
-      ? {
-          owner: null,
-          turnId: `legacy-${makeMemoryId()}`,
-          config: fallbackConfiguration.config,
-          legacyRecall: recallLegacyMemory,
-          legacyWrite: writeLegacyMemory,
-        }
-      : {
-          owner: input.owner,
-          turnId: input.turnId,
-          config: input.config ?? fallbackConfiguration.config,
-          legacyRecall: input.legacyRecall ?? recallLegacyMemory,
-          legacyWrite: input.legacyWrite ?? writeLegacyMemory,
-        };
-  const conversationId =
-    typeof input === "string" ? input : input.owner.conversationId;
-  const instrumentation = typeof input === "string" ? undefined : input.instrumentation;
-  const eligibleImageStorageIds = new Set(
-    typeof input === "string" ? [] : (input.imageStorageIds ?? []),
-  );
+export function createMemoryTools(options: CreateMemoryToolsOptions): RuntimeTool[] {
+  const eligibleImageStorageIds = new Set(options.imageStorageIds ?? []);
   const eligibleImageDescription =
     eligibleImageStorageIds.size > 0
       ? [...eligibleImageStorageIds].join(", ")
       : "(no current-turn images)";
-  let providerConfigurationError = fallbackConfiguration.error;
-  let resolvedProvider: Pick<DanielMemoryProvider, "profile" | "search"> | null;
-  if (typeof input !== "string" && input.provider !== undefined) {
-    resolvedProvider = input.provider;
-  } else {
-    try {
-      resolvedProvider = getSupermemoryProvider();
-    } catch (error) {
-      providerConfigurationError = error;
-      console.warn("[memory.tools] provider initialization failed", {
-        errorCode:
-          error && typeof error === "object" && "code" in error
-            ? String((error as { code?: unknown }).code ?? "configuration")
-            : "configuration",
-      });
-      resolvedProvider = null;
-    }
-  }
-
-  let resolvedOperationDependencies: MemoryOperationDependencies | null;
-  if (typeof input !== "string" && input.operationDependencies !== undefined) {
-    resolvedOperationDependencies = input.operationDependencies;
-  } else {
-    const apiKey = process.env.SUPERMEMORY_API_KEY?.trim();
-    const operationProvider = resolvedProvider;
-    if (!operationProvider || !apiKey || !legacy.owner) {
-      resolvedOperationDependencies = null;
-    } else {
-      const transport = new SupermemoryOperationTransport({
-        apiKey,
-        timeoutMs: legacy.config.timeoutMs,
-      });
-      resolvedOperationDependencies = {
-        provider: createMemoryOperationProvider({
-          transport,
-          search: (request) => operationProvider.search(request),
-        }),
-        pendingOperations: createConvexPendingOperationStore(),
-        imageAnchors: createConvexImageAnchorStore(),
-        fetchImageBytes: fetchConvexImageBytes,
-      };
-    }
-  }
-
-  const readStrategy = createMemoryReadStrategy({
-    owner: legacy.owner,
-    conversationId,
-    config: legacy.config,
-    provider: resolvedProvider,
-    providerConfigurationError,
-    instrumentation,
-    legacyRecall: legacy.legacyRecall,
-  });
-  const writeStrategy = createMemoryWriteStrategy({
-    owner: legacy.owner,
-    conversationId,
-    turnId: legacy.turnId,
-    mode: legacy.config.writeMode,
-    dependencies: resolvedOperationDependencies,
-    providerConfigurationError,
-    legacyWrite: legacy.legacyWrite,
-  });
 
   return [
     defineRuntimeTool(
       NAMESPACE,
-      "write_memory",
-      "Persist one exact durable fact for future turns. In dual mode Daniel also writes the Convex rollback copy. Use only for durable identity, preferences, projects, relationships, or knowledge, not transient conversational state.",
+      "remember_memory",
+      "Persist one exact durable fact in Supermemory for future turns. Use for durable identity, preferences, projects, relationships, or knowledge, not transient conversation state.",
       {
-        content: z.string().min(1).max(10_000).describe("The exact fact to remember, in one clear sentence."),
-        segment: segmentEnum.describe(
-          "identity: core facts about who they are. preference: how they like things done. relationship: people they know. project: ongoing work. knowledge: facts about their world. context: current situation.",
-        ),
-        importance: z.number().min(0).max(1).describe("0-1; how critical the rollback copy is to retain."),
-        tier: tierEnum.optional().describe("Convex rollback tier override; ignored by Supermemory."),
-        supersedes: z
-          .array(z.string())
-          .optional()
-          .describe("Legacy memory IDs superseded in the Convex rollback copy."),
+        content: z
+          .string()
+          .min(1)
+          .max(10_000)
+          .describe("The exact fact to remember, in one clear sentence."),
         staticKind: staticKindEnum
           .optional()
-          .describe("Only for an explicitly durable preferred name, identity, long-term role, or home timezone."),
+          .describe(
+            "Only for an explicitly durable preferred name, identity, long-term role, or home timezone.",
+          ),
       },
       async (args) => {
         try {
-          const result = await writeStrategy.writeExact({
-            content: args.content,
-            segment: args.segment,
-            importance: args.importance,
-            tier: args.tier,
-            supersedes: args.supersedes,
-            staticKind: args.staticKind,
-          });
-          if (result.kind === "legacy") {
-            return runtimeText(
-              `Stored ${result.legacy.memoryId} (tier=${result.legacy.tier}, segment=${result.legacy.segment}).`,
-            );
-          }
-          if (result.kind === "supermemory") {
-            const ids = result.provider.memories.map((memory) => memory.id).join(", ");
-            return runtimeText(`Stored exact Supermemory ${ids || "memory"}.`);
-          }
-          if (result.provider.status === "fulfilled" && result.legacy.status === "fulfilled") {
-            const ids = result.provider.value.memories.map((memory) => memory.id).join(", ");
-            return runtimeText(
-              `Stored exact Supermemory ${ids || "memory"} and Convex rollback ${result.legacy.value.memoryId}.`,
-            );
-          }
-          if (result.provider.status === "fulfilled") {
-            return runtimeText(
-              "Stored the exact Supermemory memory, but the Convex rollback copy failed.",
-              false,
-            );
-          }
-          if (result.legacy.status === "fulfilled") {
-            return runtimeText(
-              writeStrategy.providerOperationsAvailable
-                ? `Stored Convex rollback ${result.legacy.value.memoryId}, but the Supermemory exact write failed.`
-                : `Stored Convex rollback ${result.legacy.value.memoryId}, but the Supermemory exact write was unavailable.`,
-              false,
-            );
-          }
-          return providerFailure("create the exact memory", result.provider.reason);
+          const result = await options.service.rememberExact(args);
+          const ids = result.memories.map((memory) => memory.id).join(", ");
+          return runtimeText(`Remembered exact Supermemory ${ids || "memory"}.`);
         } catch (error) {
-          return providerFailure(
-            writeStrategy.mode === "convex" ? "store the legacy memory" : "create the exact memory",
-            error,
-          );
+          return providerFailure("remember that fact", error);
         }
       },
     ),
-
     defineRuntimeTool(
       NAMESPACE,
       "recall",
-      "Run an optional narrow memory query. Memory context is already preloaded; use this only when the current question needs a more specific search.",
+      "Run an optional narrow Supermemory query. Context is already preloaded; use this only for a specific follow-up search.",
       {
         query: z.string().min(1).describe("A specific topic or fact to search for."),
         limit: z.number().int().min(1).max(20).optional().default(DEFAULT_TOOL_SEARCH_LIMIT),
       },
       async (args) => {
-        const result = await readStrategy.recall(args);
-        if (result.source === "legacy") return formatLegacyRecall(result.recall);
-        if (result.source === "supermemory") return formatProviderRecall(result.results);
-        return providerFailure(result.action, result.error);
+        const result = await options.service.recall(args.query);
+        if (result.status === "failed") return providerFailure("recall memory", result.error);
+        if (result.results.length === 0) return runtimeText("No memories matched.");
+        return runtimeText(
+          result.results
+            .slice(0, args.limit)
+            .map(
+              (memory) =>
+                `• [relevance=${memory.similarity.toFixed(2)}] ${memory.id}: ${memory.content}`,
+            )
+            .join("\n"),
+        );
       },
     ),
-
     defineRuntimeTool(
       NAMESPACE,
       "update_memory",
-      "Find candidate Supermemory entries or update one selected exact provider memory ID as a new version. Search first when the exact ID is not already known.",
+      "Search for candidate Supermemory entries or update one selected exact memory ID as a new version.",
       {
-        query: z.string().min(1).optional().describe("Search text used only to list update candidates."),
-        memoryId: z.string().min(1).optional().describe("The exact provider memory ID selected for update."),
+        query: z.string().min(1).optional().describe("Search text used only to list candidates."),
+        memoryId: z.string().min(1).optional().describe("The exact memory ID selected for update."),
         newContent: z.string().min(1).max(10_000).optional().describe("The corrected complete memory content."),
         limit: z.number().int().min(1).max(8).optional().default(DEFAULT_TOOL_SEARCH_LIMIT),
       },
       async (args) => {
-        if (!writeStrategy.providerOperationsAvailable) {
-          return runtimeText("Versioned memory updates require Supermemory write mode.", false);
-        }
         try {
           if (!args.memoryId) {
             if (!args.query || args.newContent) {
@@ -504,7 +106,7 @@ export function createMemoryTools(
                 false,
               );
             }
-            const candidates = await writeStrategy.searchUpdateCandidates({
+            const candidates = await options.service.searchUpdateCandidates({
               query: args.query,
               limit: args.limit,
             });
@@ -524,7 +126,7 @@ export function createMemoryTools(
               false,
             );
           }
-          const result = await writeStrategy.updateExact({
+          const result = await options.service.updateExact({
             memoryId: args.memoryId,
             newContent: args.newContent,
           });
@@ -534,22 +136,18 @@ export function createMemoryTools(
         }
       },
     ),
-
     defineRuntimeTool(
       NAMESPACE,
       "forget_memory",
-      "Preview memories matching a forget request, then apply only the exact IDs stored in that preview after confirmation. Never confirm without showing the preview to the user.",
+      "Preview matching memories, then forget only the exact IDs stored in that preview after user confirmation.",
       {
         query: z.string().min(1).optional().describe("Stage 1 semantic forget request."),
-        operationId: z.string().min(1).optional().describe("Stage 2 pending operation ID returned by the preview."),
-        confirm: z.boolean().optional().default(false).describe("True only after the user explicitly confirms the preview."),
+        operationId: z.string().min(1).optional().describe("Stage 2 pending operation ID."),
+        confirm: z.boolean().optional().default(false).describe("True only after explicit confirmation."),
         reason: z.string().max(1_000).optional(),
         maxForget: z.number().int().min(1).max(100).optional().default(25),
       },
       async (args) => {
-        if (!writeStrategy.providerOperationsAvailable) {
-          return runtimeText("Exact memory forgetting requires Supermemory write mode.", false);
-        }
         try {
           if (args.confirm) {
             if (!args.operationId || args.query) {
@@ -558,7 +156,7 @@ export function createMemoryTools(
                 false,
               );
             }
-            const result = await writeStrategy.applyForget({
+            const result = await options.service.confirmForget({
               operationId: args.operationId,
               reason: args.reason,
             });
@@ -570,38 +168,33 @@ export function createMemoryTools(
               false,
             );
           }
-          const result = await writeStrategy.previewForget({
+          const result = await options.service.previewForget({
             query: args.query,
             reason: args.reason,
             maxForget: args.maxForget,
           });
           if (!result.operationId) return runtimeText(result.preview);
-          const expiresAt = result.expiresAt
-            ? new Date(result.expiresAt).toISOString()
-            : "unavailable";
           return runtimeText(
-            `${result.preview}\n\nPending operation: ${result.operationId}\nExpires: ${expiresAt}`,
+            `${result.preview}\n\nPending operation: ${result.operationId}\nExpires: ${
+              result.expiresAt ? new Date(result.expiresAt).toISOString() : "unavailable"
+            }`,
           );
         } catch (error) {
           return providerFailure("forget memory", error);
         }
       },
     ),
-
     defineRuntimeTool(
       NAMESPACE,
       "remember_image",
-      "Make one explicitly selected Convex image durable in Supermemory. Use only when the user asks to remember the image or identifies it as a durable object.",
+      "Make one explicitly selected current-turn image durable in Supermemory.",
       {
         storageId: z
           .string()
           .min(1)
-          .describe(`Exact current-turn Convex image storage ID. Available: ${eligibleImageDescription}`),
+          .describe(`Exact current-turn image storage ID. Available: ${eligibleImageDescription}`),
       },
       async (args) => {
-        if (!writeStrategy.providerOperationsAvailable) {
-          return runtimeText("Durable image memory requires Supermemory write mode.", false);
-        }
         if (!eligibleImageStorageIds.has(args.storageId)) {
           return runtimeText(
             "That image is not attached to the current user turn, so it cannot be made durable.",
@@ -609,7 +202,7 @@ export function createMemoryTools(
           );
         }
         try {
-          const result = await writeStrategy.rememberImage({ storageId: args.storageId });
+          const result = await options.service.rememberImage({ storageId: args.storageId });
           return runtimeText(
             `Remembered durable image ${result.anchor.customId} (provider document ${result.providerDocumentId}).`,
           );
@@ -619,11 +212,4 @@ export function createMemoryTools(
       },
     ),
   ];
-}
-
-export function createMemoryMcp(input: string | CreateMemoryToolsOptions) {
-  return createClaudeMcpServer(
-    NAMESPACE,
-    typeof input === "string" ? createMemoryTools(input) : createMemoryTools(input),
-  );
 }

@@ -1,15 +1,10 @@
-import { mutation, query } from "./_generated/server";
+import { internalMutation, internalQuery, mutation, query } from "./_generated/server";
 import type { MutationCtx } from "./_generated/server";
 import type { Doc } from "./_generated/dataModel";
 import { v } from "convex/values";
+import { requireMemoryServerAuthority } from "./memoryProviderState";
 
-export const jobKindValidator = v.union(
-  v.literal("conversation_turn"),
-  v.literal("explicit_memory"),
-  v.literal("image"),
-  v.literal("memory_update"),
-  v.literal("memory_forget"),
-);
+export const jobKindValidator = v.literal("conversation_turn");
 
 const jobStatusValidator = v.union(
   v.literal("pending"),
@@ -28,9 +23,9 @@ export interface EnqueueMemorySyncJobArgs {
   kind: MemorySyncJob["kind"];
   ownerKey: string;
   containerTag: string;
-  customId?: string;
-  conversationId?: string;
-  turnId?: string;
+  customId: string;
+  conversationId: string;
+  turnId: string;
   payload: string;
   payloadHash: string;
   now?: number;
@@ -94,9 +89,6 @@ export async function enqueueMemorySyncJob(
     if (!/^[a-f0-9]{64}$/.test(payloadHash)) {
       throw new Error("payloadHash must be a 64-character SHA-256 hex digest");
     }
-    if (args.kind === "conversation_turn" && !args.turnId) {
-      throw new Error("conversation_turn jobs require turnId");
-    }
     let envelope: Record<string, unknown>;
     try {
       const parsed = JSON.parse(args.payload) as unknown;
@@ -118,22 +110,18 @@ export async function enqueueMemorySyncJob(
       throw new Error("memory sync payload containerTag does not match the durable job");
     }
 
-    if (args.kind === "conversation_turn") {
-      const existingByTurn = await ctx.db
-        .query("memorySyncJobs")
-        .withIndex("by_turn_id", (q) => q.eq("turnId", args.turnId!))
-        .take(1_000);
-      const existingConversationTurn = existingByTurn.find(
-        (job) => job.kind === "conversation_turn",
-      );
-      if (existingConversationTurn) {
-        if (existingConversationTurn.payloadHash === payloadHash) {
-          return { created: false, duplicate: true, job: existingConversationTurn };
-        }
-        throw new Error(
-          `conversation turn already has a different memory sync payload: ${args.turnId}`,
-        );
+    const existingByTurn = await ctx.db
+      .query("memorySyncJobs")
+      .withIndex("by_turn_id", (q) => q.eq("turnId", args.turnId))
+      .take(1_000);
+    const existingConversationTurn = existingByTurn[0];
+    if (existingConversationTurn) {
+      if (existingConversationTurn.payloadHash === payloadHash) {
+        return { created: false, duplicate: true, job: existingConversationTurn };
       }
+      throw new Error(
+        `conversation turn already has a different memory sync payload: ${args.turnId}`,
+      );
     }
 
     const existingByHash = await ctx.db
@@ -174,15 +162,15 @@ export async function enqueueMemorySyncJob(
     return { created: true, duplicate: false, job };
 }
 
-export const enqueue = mutation({
+export const enqueue = internalMutation({
   args: {
     jobId: v.string(),
     kind: jobKindValidator,
     ownerKey: v.string(),
     containerTag: v.string(),
-    customId: v.optional(v.string()),
-    conversationId: v.optional(v.string()),
-    turnId: v.optional(v.string()),
+    customId: v.string(),
+    conversationId: v.string(),
+    turnId: v.string(),
     payload: v.string(),
     payloadHash: v.string(),
     now: v.optional(v.number()),
@@ -197,6 +185,7 @@ export const enqueue = mutation({
  */
 export const claimDue = mutation({
   args: {
+    pairingAuthorityProof: v.string(),
     now: v.optional(v.number()),
     // Accepted for worker observability/call-site stability. The current
     // schema uses an expiring transactional lease rather than storing owner.
@@ -204,6 +193,7 @@ export const claimDue = mutation({
     leaseMs: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
+    await requireMemoryServerAuthority(ctx, args.pairingAuthorityProof);
     const now = timestamp(args.now);
     const requestedLease = args.leaseMs ?? DEFAULT_LEASE_MS;
     const leaseMs = Math.max(1_000, Math.floor(requestedLease));
@@ -271,6 +261,7 @@ export const claimDue = mutation({
 /** Records provider identifiers before completion so they survive a crash. */
 export const recordSubmitted = mutation({
   args: {
+    pairingAuthorityProof: v.string(),
     jobId: v.string(),
     expectedAttempt: v.number(),
     expectedUpdatedAt: v.number(),
@@ -279,6 +270,7 @@ export const recordSubmitted = mutation({
     now: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
+    await requireMemoryServerAuthority(ctx, args.pairingAuthorityProof);
     const job = await getByJobId(ctx, args.jobId);
     if (
       !job ||
@@ -305,12 +297,14 @@ export const recordSubmitted = mutation({
 
 export const complete = mutation({
   args: {
+    pairingAuthorityProof: v.string(),
     jobId: v.string(),
     expectedAttempt: v.number(),
     expectedUpdatedAt: v.number(),
     now: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
+    await requireMemoryServerAuthority(ctx, args.pairingAuthorityProof);
     const job = await getByJobId(ctx, args.jobId);
     if (
       !job ||
@@ -333,9 +327,10 @@ export const complete = mutation({
   },
 });
 
-/** Applies the migration's fixed retry schedule or dead-letters the job. */
+/** Applies the fixed retry schedule or dead-letters the job. */
 export const recordFailure = mutation({
   args: {
+    pairingAuthorityProof: v.string(),
     jobId: v.string(),
     expectedAttempt: v.number(),
     expectedUpdatedAt: v.number(),
@@ -346,6 +341,7 @@ export const recordFailure = mutation({
     now: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
+    await requireMemoryServerAuthority(ctx, args.pairingAuthorityProof);
     const job = await getByJobId(ctx, args.jobId);
     if (
       !job ||
@@ -390,63 +386,10 @@ export const recordFailure = mutation({
   },
 });
 
-export const moveToDeadLetter = mutation({
-  args: {
-    jobId: v.string(),
-    expectedAttempt: v.optional(v.number()),
-    error: v.string(),
-    now: v.optional(v.number()),
-  },
-  handler: async (ctx, args) => {
-    const job = await getByJobId(ctx, args.jobId);
-    if (!job || (args.expectedAttempt !== undefined && job.attempts !== args.expectedAttempt)) {
-      return { updated: false, job };
-    }
-    if (job.status === "completed") {
-      return { updated: false, job };
-    }
-
-    const now = timestamp(args.now);
-    const updatedAt = transitionTimestamp(job.updatedAt, now);
-    await ctx.db.patch(job._id, {
-      status: "dead_letter",
-      nextAttemptAt: now,
-      lastError: normalizeError(args.error),
-      updatedAt,
-    });
-    return { updated: true, job: await ctx.db.get(job._id) };
-  },
-});
-
-/** Requeues the existing source row; it never creates another payload hash. */
-export const retry = mutation({
-  args: {
-    jobId: v.string(),
-    now: v.optional(v.number()),
-  },
-  handler: async (ctx, args) => {
-    const job = await getByJobId(ctx, args.jobId);
-    if (!job) return { retried: false, reason: "not_found", job: null };
-    if (job.status !== "failed" && job.status !== "dead_letter") {
-      return { retried: false, reason: "not_retryable", job };
-    }
-
-    const now = timestamp(args.now);
-    const updatedAt = transitionTimestamp(job.updatedAt, now);
-    await ctx.db.patch(job._id, {
-      status: "pending",
-      attempts: 0,
-      nextAttemptAt: now,
-      lastError: undefined,
-      updatedAt,
-    });
-    return { retried: true, reason: "requeued", job: await ctx.db.get(job._id) };
-  },
-});
-
 /** Atomically verifies owner/container and status before requeueing a job. */
 export const retryOwned = mutation({
   args: {
+    pairingAuthorityProof: v.string(),
     jobId: v.string(),
     ownerKey: v.string(),
     containerTag: v.string(),
@@ -454,6 +397,7 @@ export const retryOwned = mutation({
     now: v.optional(v.number()),
   },
   handler: async (ctx, args) => {
+    await requireMemoryServerAuthority(ctx, args.pairingAuthorityProof);
     const job = await getByJobId(ctx, args.jobId);
     if (
       !job ||
@@ -479,7 +423,7 @@ export const retryOwned = mutation({
   },
 });
 
-export const list = query({
+export const list = internalQuery({
   args: {
     status: v.optional(jobStatusValidator),
     limit: v.optional(v.number()),

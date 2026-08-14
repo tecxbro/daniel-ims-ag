@@ -18,9 +18,9 @@ export interface MemorySyncJob {
   kind: MemorySyncJobKind;
   ownerKey: string;
   containerTag: string;
-  customId?: string;
-  conversationId?: string;
-  turnId?: string;
+  customId: string;
+  conversationId: string;
+  turnId: string;
   payload: string;
   payloadHash: string;
   status: MemorySyncJobStatus;
@@ -46,53 +46,18 @@ export function asObject(value: unknown): Record<string, unknown> | null {
 
 export function parseMemorySyncPayloadForKind(
   job: MemorySyncJob,
-  expectedKind: "conversation_turn",
-): MemorySyncPayloadByKind["conversation_turn"];
-export function parseMemorySyncPayloadForKind(
-  job: MemorySyncJob,
-  expectedKind: "explicit_memory",
-): MemorySyncPayloadByKind["explicit_memory"];
-export function parseMemorySyncPayloadForKind(
-  job: MemorySyncJob,
-  expectedKind: "image",
-): MemorySyncPayloadByKind["image"];
-export function parseMemorySyncPayloadForKind(
-  job: MemorySyncJob,
-  expectedKind: "memory_update",
-): MemorySyncPayloadByKind["memory_update"];
-export function parseMemorySyncPayloadForKind(
-  job: MemorySyncJob,
-  expectedKind: "memory_forget",
-): MemorySyncPayloadByKind["memory_forget"];
-export function parseMemorySyncPayloadForKind(
-  job: MemorySyncJob,
   expectedKind: MemorySyncJobKind,
-): MemorySyncPayloadByKind[MemorySyncJobKind] {
+): MemorySyncPayloadByKind["conversation_turn"] {
   if (job.kind !== expectedKind) {
     throw new MemorySyncPayloadError(
       `memory sync job ${job.jobId} changed kind while dispatching`,
     );
   }
-  const envelope = parseMemorySyncJobPayload(
-    job.payload,
-    {
-      kind: expectedKind,
-      containerTag: job.containerTag,
-      customId: job.customId,
-    },
-    { allowLegacy: true },
-  );
-  return envelope.providerInput;
-}
-
-function isJobKind(value: unknown): value is MemorySyncJobKind {
-  return (
-    value === "conversation_turn" ||
-    value === "explicit_memory" ||
-    value === "image" ||
-    value === "memory_update" ||
-    value === "memory_forget"
-  );
+  return parseMemorySyncJobPayload(job.payload, {
+    kind: "conversation_turn",
+    containerTag: job.containerTag,
+    customId: job.customId,
+  }).providerInput;
 }
 
 function isJobStatus(value: unknown): value is MemorySyncJobStatus {
@@ -118,9 +83,12 @@ export function normalizeClaimedMemorySyncJob(value: unknown): ClaimedMemorySync
   if (!rawJob) throw new Error("memorySyncJobs.claimDue returned an invalid job");
   if (
     typeof rawJob.jobId !== "string" ||
-    !isJobKind(rawJob.kind) ||
+    rawJob.kind !== "conversation_turn" ||
     typeof rawJob.ownerKey !== "string" ||
     typeof rawJob.containerTag !== "string" ||
+    typeof rawJob.customId !== "string" ||
+    typeof rawJob.conversationId !== "string" ||
+    typeof rawJob.turnId !== "string" ||
     typeof rawJob.payload !== "string" ||
     typeof rawJob.payloadHash !== "string" ||
     !isJobStatus(rawJob.status) ||
@@ -138,15 +106,14 @@ export function normalizeClaimedMemorySyncJob(value: unknown): ClaimedMemorySync
   ) {
     throw new Error("memorySyncJobs.claimDue returned invalid provider memory IDs");
   }
-
   const job: MemorySyncJob = {
     jobId: rawJob.jobId,
-    kind: rawJob.kind,
+    kind: "conversation_turn",
     ownerKey: rawJob.ownerKey,
     containerTag: rawJob.containerTag,
-    customId: optionalString(rawJob.customId),
-    conversationId: optionalString(rawJob.conversationId),
-    turnId: optionalString(rawJob.turnId),
+    customId: rawJob.customId,
+    conversationId: rawJob.conversationId,
+    turnId: rawJob.turnId,
     payload: rawJob.payload,
     payloadHash: rawJob.payloadHash,
     status: rawJob.status,
@@ -160,9 +127,11 @@ export function normalizeClaimedMemorySyncJob(value: unknown): ClaimedMemorySync
     createdAt: rawJob.createdAt,
     updatedAt: rawJob.updatedAt,
   };
-  const resumeFrom =
-    wrapper?.resumeFrom === "complete" || rawJob.status === "submitted"
-      ? "complete"
-      : "dispatch";
-  return { job, resumeFrom };
+  return {
+    job,
+    resumeFrom:
+      wrapper?.resumeFrom === "complete" || rawJob.status === "submitted"
+        ? "complete"
+        : "dispatch",
+  };
 }

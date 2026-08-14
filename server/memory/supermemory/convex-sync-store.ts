@@ -9,6 +9,7 @@ import {
 } from "./job-parser.js";
 import type { MemorySyncJobKind } from "./job-contract.js";
 import type { ProviderSubmission } from "./job-dispatcher.js";
+import { memoryPairingAuthorityProof } from "./identity.js";
 
 export type ConvexClient = Pick<ConvexHttpClient, "query" | "mutation">;
 
@@ -153,22 +154,40 @@ export function normalizeBacklog(value: unknown): MemorySyncBacklogSummary {
 export class ConvexMemorySyncPersistence
   implements MemorySyncJobsStore, MemoryProviderStateWriter
 {
-  constructor(private readonly client: ConvexClient) {}
+  constructor(
+    private readonly client: ConvexClient,
+    private readonly authorityProof?: string,
+  ) {}
+
+  private serverAuthorityProof(): string {
+    return this.authorityProof ?? memoryPairingAuthorityProof();
+  }
 
   async claimDue(input: ClaimDueJobInput): Promise<ClaimedMemorySyncJob | null> {
     return normalizeClaimedMemorySyncJob(
-      await this.client.mutation(api.memorySyncJobs.claimDue, input),
+      await this.client.mutation(api.memorySyncJobs.claimDue, {
+        ...input,
+        pairingAuthorityProof: this.serverAuthorityProof(),
+      }),
     );
   }
 
   async recordSubmitted(input: RecordSubmittedInput): Promise<FencedMutationResult> {
     return this.fencedResult(
-      await this.client.mutation(api.memorySyncJobs.recordSubmitted, input),
+      await this.client.mutation(api.memorySyncJobs.recordSubmitted, {
+        ...input,
+        pairingAuthorityProof: this.serverAuthorityProof(),
+      }),
     );
   }
 
   async complete(input: CompleteMemorySyncJobInput): Promise<FencedMutationResult> {
-    return this.fencedResult(await this.client.mutation(api.memorySyncJobs.complete, input));
+    return this.fencedResult(
+      await this.client.mutation(api.memorySyncJobs.complete, {
+        ...input,
+        pairingAuthorityProof: this.serverAuthorityProof(),
+      }),
+    );
   }
 
   recordFailure(input: RecordMemorySyncFailureInput): Promise<FencedMutationResult>;
@@ -178,25 +197,44 @@ export class ConvexMemorySyncPersistence
   ): Promise<void | FencedMutationResult> {
     if ("now" in input) {
       return this.fencedResult(
-        await this.client.mutation(api.memorySyncJobs.recordFailure, input),
+        await this.client.mutation(api.memorySyncJobs.recordFailure, {
+          ...input,
+          pairingAuthorityProof: this.serverAuthorityProof(),
+        }),
       );
     }
-    await this.client.mutation(api.memoryProviderState.recordFailure, input);
+    await this.client.mutation(api.memoryProviderState.recordFailure, {
+      ...input,
+      pairingAuthorityProof: this.serverAuthorityProof(),
+    });
   }
 
   async recordSuccess(input: RecordProviderSuccessInput): Promise<void> {
-    await this.client.mutation(api.memoryProviderState.recordSuccess, input);
+    await this.client.mutation(api.memoryProviderState.recordSuccess, {
+      ...input,
+      pairingAuthorityProof: this.serverAuthorityProof(),
+    });
   }
 
   async heartbeat(input: RecordWorkerHeartbeatInput): Promise<void> {
-    await this.client.mutation(api.memoryProviderState.heartbeat, input);
+    await this.client.mutation(api.memoryProviderState.heartbeat, {
+      ...input,
+      pairingAuthorityProof: this.serverAuthorityProof(),
+    });
   }
 
   async ensureIdentitySaltFingerprint(saltFingerprint: string): Promise<string> {
-    return await this.client.mutation(
-      api.memoryProviderState.ensureIdentitySaltFingerprint,
-      { saltFingerprint },
+    const result = await this.client.mutation(
+      api.memoryProviderState.verifyIdentityConfiguration,
+      {
+        saltFingerprint,
+        pairingAuthorityProof: this.serverAuthorityProof(),
+      },
     );
+    if (result.status !== "ready") {
+      throw new Error("memory identity recovery is required");
+    }
+    return saltFingerprint;
   }
 
   async getContainerState(
@@ -204,6 +242,7 @@ export class ConvexMemorySyncPersistence
   ): Promise<MemoryProviderContainerState | null> {
     const value = await this.client.query(api.memoryProviderState.getContainerState, {
       containerTag,
+      pairingAuthorityProof: this.serverAuthorityProof(),
     });
     if (value === null) return null;
     return {
@@ -218,17 +257,9 @@ export class ConvexMemorySyncPersistence
     initializedAt: number;
     saltFingerprint: string;
   }): Promise<void> {
-    await this.client.mutation(api.memoryProviderState.markContainerInitialized, input);
-  }
-
-  async markUnconfigured(input: {
-    error: string;
-    readMode: "convex" | "shadow" | "supermemory";
-    writeMode: "convex" | "dual" | "supermemory";
-  }): Promise<void> {
-    await this.client.mutation(api.memoryProviderState.updateHealth, {
-      healthStatus: "unconfigured",
+    await this.client.mutation(api.memoryProviderState.markContainerInitialized, {
       ...input,
+      pairingAuthorityProof: this.serverAuthorityProof(),
     });
   }
 

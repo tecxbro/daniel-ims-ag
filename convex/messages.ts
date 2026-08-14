@@ -7,6 +7,7 @@ import {
   jobKindValidator,
   type EnqueueMemorySyncJobArgs,
 } from "./memorySyncJobs";
+import { requireMemoryServerAuthority } from "./memoryProviderState";
 
 interface MessageWriteArgs {
   conversationId: string;
@@ -68,34 +69,37 @@ export const send = mutation({
 });
 
 /**
- * Commits the assistant row and its normal-turn outbox entry in one Convex
- * transaction. Replays are idempotent by conversation/turn/role and turnId;
- * conflicting content or payload hashes fail the whole transaction.
+ * Commits one idempotent assistant turn and, when configured, its durable
+ * conversation capture in the same transaction.
  */
-export const persistAssistantWithMemoryCapture = mutation({
+export const persistAssistantTurn = mutation({
   args: {
     conversationId: v.string(),
     content: v.string(),
     turnId: v.string(),
-    job: v.object({
+    pairingAuthorityProof: v.optional(v.string()),
+    job: v.optional(v.object({
       jobId: v.string(),
       kind: jobKindValidator,
       ownerKey: v.string(),
       containerTag: v.string(),
-      customId: v.optional(v.string()),
-      conversationId: v.optional(v.string()),
-      turnId: v.optional(v.string()),
+      customId: v.string(),
+      conversationId: v.string(),
+      turnId: v.string(),
       payload: v.string(),
       payloadHash: v.string(),
       now: v.optional(v.number()),
-    }),
+    })),
   },
   handler: async (ctx, args) => {
-    if (args.job.kind !== "conversation_turn" || args.job.turnId !== args.turnId) {
+    if (args.job && (args.job.kind !== "conversation_turn" || args.job.turnId !== args.turnId)) {
       throw new Error("assistant capture requires a matching conversation_turn job");
     }
-    if (args.job.conversationId !== args.conversationId) {
+    if (args.job && args.job.conversationId !== args.conversationId) {
       throw new Error("assistant capture conversation does not match the memory job");
+    }
+    if (args.job) {
+      await requireMemoryServerAuthority(ctx, args.pairingAuthorityProof ?? "");
     }
 
     const existingMessages = await ctx.db
@@ -115,10 +119,9 @@ export const persistAssistantWithMemoryCapture = mutation({
       throw new Error(`assistant turn already has different content: ${args.turnId}`);
     }
 
-    const jobResult = await enqueueMemorySyncJob(
-      ctx,
-      args.job as EnqueueMemorySyncJobArgs,
-    );
+    const jobResult = args.job
+      ? await enqueueMemorySyncJob(ctx, args.job as EnqueueMemorySyncJobArgs)
+      : null;
     const messageId =
       existingMessage?._id ??
       (await insertMessage(
@@ -129,14 +132,15 @@ export const persistAssistantWithMemoryCapture = mutation({
           content: args.content,
           turnId: args.turnId,
         },
-        args.job.now ?? Date.now(),
+        args.job?.now ?? Date.now(),
       ));
     return {
       messageId,
       messageCreated: existingMessage === undefined,
-      job: jobResult.job,
-      jobCreated: jobResult.created,
-      duplicate: !jobResult.created && existingMessage !== undefined,
+      job: jobResult?.job,
+      jobCreated: jobResult?.created ?? false,
+      duplicate:
+        existingMessage !== undefined && (jobResult === null || !jobResult.created),
     };
   },
 });
@@ -161,6 +165,58 @@ export const recent = query({
       .order("desc")
       .take(args.limit ?? 20);
     return msgs.reverse();
+  },
+});
+
+/** Bounded source for local primary-owner pairing candidates. */
+export const recentInboundSms = query({
+  args: {
+    pairingAuthorityProof: v.string(),
+    limit: v.optional(v.number()),
+  },
+  handler: async (ctx, args) => {
+    const state = await ctx.db
+      .query("memoryProviderState")
+      .withIndex("by_state_key", (q) => q.eq("stateKey", "deployment"))
+      .unique();
+    if (!state || state.pairingAuthorityProof !== args.pairingAuthorityProof) {
+      return [];
+    }
+    const limit = Math.max(1, Math.min(100, Math.floor(args.limit ?? 50)));
+    const rows = await ctx.db
+      .query("messages")
+      .withIndex("by_role_and_created_at", (q) => q.eq("role", "user"))
+      .order("desc")
+      .take(limit);
+    return rows
+      .filter((row) => /^sms:\+[1-9][0-9]{7,14}$/.test(row.conversationId))
+      .map((row) => ({
+        conversationId: row.conversationId,
+        createdAt: row.createdAt,
+      }));
+  },
+});
+
+export const hasInboundUserMessage = query({
+  args: {
+    pairingAuthorityProof: v.string(),
+    conversationId: v.string(),
+  },
+  handler: async (ctx, args) => {
+    const state = await ctx.db
+      .query("memoryProviderState")
+      .withIndex("by_state_key", (q) => q.eq("stateKey", "deployment"))
+      .unique();
+    if (!state || state.pairingAuthorityProof !== args.pairingAuthorityProof) {
+      return false;
+    }
+    if (!/^sms:\+[1-9][0-9]{7,14}$/.test(args.conversationId)) return false;
+    const rows = await ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) => q.eq("conversationId", args.conversationId))
+      .order("desc")
+      .take(100);
+    return rows.some((row) => row.role === "user");
   },
 });
 
