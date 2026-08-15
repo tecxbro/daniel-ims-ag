@@ -168,6 +168,175 @@ export const recent = query({
   },
 });
 
+const HISTORY_MAX_TURNS = 10;
+const HISTORY_MAX_CHARACTERS = 16_000;
+const HISTORY_MESSAGE_MAX_CHARACTERS = 4_000;
+const HISTORY_SCAN_LIMIT = 200;
+const HISTORY_TRUNCATION_MARKER = "\n… [prior message truncated] …\n";
+const HISTORY_TURN_FIXED_CHARACTERS =
+  "USER: ".length + "\nASSISTANT: ".length;
+
+function safePrefix(value: string, length: number): string {
+  let end = Math.max(0, Math.min(value.length, length));
+  const trailing = value.charCodeAt(end - 1);
+  if (trailing >= 0xd800 && trailing <= 0xdbff) end -= 1;
+  return value.slice(0, end);
+}
+
+function safeSuffix(value: string, length: number): string {
+  let start = Math.max(0, value.length - Math.max(0, length));
+  const leading = value.charCodeAt(start);
+  if (leading >= 0xdc00 && leading <= 0xdfff) start += 1;
+  return value.slice(start);
+}
+
+function truncateHistoryMessage(
+  content: string,
+  maxCharacters: number,
+): { content: string; truncated: boolean } {
+  if (content.length <= maxCharacters) {
+    return { content, truncated: false };
+  }
+  if (maxCharacters <= HISTORY_TRUNCATION_MARKER.length) {
+    return {
+      content: safePrefix(content, maxCharacters),
+      truncated: true,
+    };
+  }
+  const contentCharacters = maxCharacters - HISTORY_TRUNCATION_MARKER.length;
+  const prefixCharacters = Math.ceil(contentCharacters * 0.75);
+  const suffixCharacters = contentCharacters - prefixCharacters;
+  return {
+    content:
+      safePrefix(content, prefixCharacters) +
+      HISTORY_TRUNCATION_MARKER +
+      safeSuffix(content, suffixCharacters),
+    truncated: true,
+  };
+}
+
+/**
+ * Returns the newest complete prior turns, already bounded for prompt use.
+ * The inbound row is an exact chronology boundary, so a later concurrent turn
+ * cannot leak into this turn's prompt even if it finishes first.
+ */
+export const recentCompleteTurns = query({
+  args: {
+    conversationId: v.string(),
+    beforeMessageId: v.id("messages"),
+  },
+  handler: async (ctx, args) => {
+    const inbound = await ctx.db.get(args.beforeMessageId);
+    if (
+      !inbound ||
+      inbound.conversationId !== args.conversationId ||
+      inbound.role !== "user" ||
+      !inbound.turnId
+    ) {
+      return [];
+    }
+
+    type HistoryRow = typeof inbound;
+    type PendingTurn = {
+      turnId: string;
+      user?: HistoryRow;
+      assistant?: HistoryRow;
+    };
+
+    const pending = new Map<string, PendingTurn>();
+    const completedTurnIds = new Set<string>();
+    const completeNewestFirst: Array<Required<PendingTurn>> = [];
+    const rows = ctx.db
+      .query("messages")
+      .withIndex("by_conversation", (q) =>
+        q
+          .eq("conversationId", args.conversationId)
+          .lt("_creationTime", inbound._creationTime),
+      )
+      .order("desc");
+
+    let scanned = 0;
+    for await (const row of rows) {
+      scanned += 1;
+      if (scanned > HISTORY_SCAN_LIMIT) break;
+      if (
+        !row.turnId ||
+        row.turnId === inbound.turnId ||
+        completedTurnIds.has(row.turnId) ||
+        (row.role !== "user" && row.role !== "assistant")
+      ) {
+        continue;
+      }
+
+      const turn = pending.get(row.turnId) ?? { turnId: row.turnId };
+      if (row.role === "user" && !turn.user) turn.user = row;
+      if (row.role === "assistant" && !turn.assistant) turn.assistant = row;
+      pending.set(row.turnId, turn);
+      if (turn.user && turn.assistant) {
+        completeNewestFirst.push(turn as Required<PendingTurn>);
+        completedTurnIds.add(row.turnId);
+        pending.delete(row.turnId);
+        if (completeNewestFirst.length === HISTORY_MAX_TURNS) break;
+      }
+    }
+
+    const selectedNewestFirst: Array<{
+      turnId: string;
+      user: { content: string; truncated: boolean };
+      assistant: { content: string; truncated: boolean };
+    }> = [];
+    let usedCharacters = 0;
+
+    for (const turn of completeNewestFirst) {
+      const separatorCharacters = selectedNewestFirst.length === 0 ? 0 : 2;
+      const availableContentCharacters =
+        HISTORY_MAX_CHARACTERS -
+        usedCharacters -
+        separatorCharacters -
+        HISTORY_TURN_FIXED_CHARACTERS;
+      if (availableContentCharacters < 2) break;
+
+      let userLimit = Math.min(
+        turn.user.content.length,
+        HISTORY_MESSAGE_MAX_CHARACTERS,
+      );
+      let assistantLimit = Math.min(
+        turn.assistant.content.length,
+        HISTORY_MESSAGE_MAX_CHARACTERS,
+      );
+      let overflow =
+        userLimit + assistantLimit - availableContentCharacters;
+      if (overflow > 0) {
+        const assistantReduction = Math.min(
+          overflow,
+          Math.max(0, assistantLimit - 1),
+        );
+        assistantLimit -= assistantReduction;
+        overflow -= assistantReduction;
+      }
+      if (overflow > 0) {
+        userLimit -= Math.min(overflow, Math.max(0, userLimit - 1));
+      }
+      if (userLimit < 1 || assistantLimit < 1) break;
+
+      const user = truncateHistoryMessage(turn.user.content, userLimit);
+      const assistant = truncateHistoryMessage(
+        turn.assistant.content,
+        assistantLimit,
+      );
+      selectedNewestFirst.push({ turnId: turn.turnId, user, assistant });
+      usedCharacters +=
+        separatorCharacters +
+        HISTORY_TURN_FIXED_CHARACTERS +
+        user.content.length +
+        assistant.content.length;
+      if (usedCharacters >= HISTORY_MAX_CHARACTERS) break;
+    }
+
+    return selectedNewestFirst.reverse();
+  },
+});
+
 /** Bounded source for local primary-owner pairing candidates. */
 export const recentInboundSms = query({
   args: {

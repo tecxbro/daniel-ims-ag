@@ -40,6 +40,23 @@ export function getIntegration(name: string): IntegrationModule | undefined {
   return registry.get(name);
 }
 
+/**
+ * Validates canonical integration names without silently dropping mistakes.
+ * An empty list remains valid for workers that only need web access.
+ */
+export function validateIntegrationNames(
+  requested: readonly string[],
+  available: readonly string[],
+): string[] {
+  const invalid = [...new Set(requested.filter((name) => !available.includes(name)))];
+  if (invalid.length > 0) {
+    throw new Error(
+      `Unknown or unavailable integration${invalid.length === 1 ? "" : "s"}: ${invalid.join(", ")}. Available integrations: ${available.join(", ") || "(none)"}.`,
+    );
+  }
+  return [...new Set(requested)];
+}
+
 export async function loadIntegrations(): Promise<void> {
   const { registerComposioToolkits } = await import("./composio-loader.js");
   await registerComposioToolkits();
@@ -67,16 +84,11 @@ export async function buildMcpServersForIntegrations(
 ): Promise<Record<string, McpSdkServerConfigWithInstance>> {
   const ctx = makeContext(conversationId);
   const out: Record<string, McpSdkServerConfigWithInstance> = {};
-  for (const name of names) {
+  const enabled = (await listEnabledIntegrations()).map((mod) => mod.name);
+  for (const name of validateIntegrationNames(names, enabled)) {
     const mod = registry.get(name);
-    if (!mod) {
-      console.warn(`[integrations] unknown integration: ${name}`);
-      continue;
-    }
-    if (mod.isEnabled && !(await mod.isEnabled())) {
-      console.warn(`[integrations] skipped disabled integration: ${name}`);
-      continue;
-    }
+    // Validation above guarantees the module exists and is enabled.
+    if (!mod) throw new Error(`Integration registry changed while loading ${name}.`);
     try {
       out[name] = await mod.createServer(ctx);
     } catch (err) {
@@ -92,18 +104,12 @@ export async function buildRuntimeToolsForIntegrations(
 ): Promise<RuntimeTool[]> {
   const ctx = makeContext(conversationId);
   const out: RuntimeTool[] = [];
-  for (const name of names) {
+  const enabled = (await listEnabledIntegrations()).map((mod) => mod.name);
+  for (const name of validateIntegrationNames(names, enabled)) {
     const mod = registry.get(name);
-    if (!mod) {
-      console.warn(`[integrations] unknown integration: ${name}`);
-      continue;
-    }
+    if (!mod) throw new Error(`Integration registry changed while loading ${name}.`);
     if (!mod.createTools) {
       console.warn(`[integrations] ${name} does not expose runtime tools`);
-      continue;
-    }
-    if (mod.isEnabled && !(await mod.isEnabled())) {
-      console.warn(`[integrations] skipped disabled integration: ${name}`);
       continue;
     }
     try {

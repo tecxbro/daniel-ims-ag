@@ -2,6 +2,10 @@ import { z } from "zod";
 import { api } from "../convex/_generated/api.js";
 import { convex } from "./convex-client.js";
 import { spawnExecutionAgent } from "./execution-agent.js";
+import {
+  listEnabledIntegrations,
+  validateIntegrationNames,
+} from "./integrations/registry.js";
 import { createClaudeMcpServer } from "./runtimes/claude.js";
 import { defineRuntimeTool } from "./runtimes/tool.js";
 import { runtimeText, type RuntimeTool } from "./runtimes/types.js";
@@ -84,6 +88,20 @@ export function createDraftDecisionTools(
         if (!draft || draft.status !== "pending") {
           return runtimeText(`Draft ${args.draftId} not found or already decided.`, false);
         }
+        let integrations: string[];
+        try {
+          const enabledIntegrations = (await listEnabledIntegrations()).map(
+            (integration) => integration.name,
+          );
+          integrations = validateIntegrationNames(
+            args.integrations,
+            enabledIntegrations,
+          );
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : "Invalid integration selection.";
+          return runtimeText(`Draft not sent: ${message}`, false);
+        }
         await convex.mutation(api.drafts.setStatus, {
           draftId: args.draftId,
           status: "sent",
@@ -94,7 +112,7 @@ summary: ${draft.summary}
 payload JSON: ${draft.payload}`;
         const res = await spawnExecutionAgent({
           task,
-          integrations: args.integrations,
+          integrations,
           conversationId,
           name: `send:${draft.kind}`,
           runtimeConfig,

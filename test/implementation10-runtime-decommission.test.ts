@@ -57,17 +57,17 @@ describe("Implementation 10 runtime decommission", () => {
     const disabled = buildInteractionSystemPrompt({ ...base, memoryEnabled: false });
 
     expect(enabled).toContain("recall / remember_memory / update_memory");
-    expect(enabled).toContain("Memory context is automatically preloaded");
-    expect(enabled).not.toContain("Long-term memory tools and preloaded memory are unavailable");
+    expect(enabled).toContain("Long-term context is already preloaded");
+    expect(enabled).not.toContain("Long-term memory is unavailable this turn");
     expect(disabled).not.toContain("remember_memory");
-    expect(disabled).not.toContain("Memory context is automatically preloaded");
-    expect(disabled).toContain("Do not claim that you recalled, saved, updated, forgot");
+    expect(disabled).not.toContain("Long-term context is already preloaded");
+    expect(disabled).toContain("Do not claim you recalled, saved");
   });
 
   it("uses durable assistant persistence and has no retired runtime tokens", () => {
-    const interactionSource = source("server/interaction-agent.ts");
-    expect(interactionSource).toContain("finalizeAssistantTurnCapture({");
-    expect(interactionSource).toContain('opts.kind === "proactive"');
+    const turnSource = source("server/dispatcher/turn.ts");
+    expect(turnSource).toContain("finalizeAssistantTurnCapture({");
+    expect(turnSource).toContain('opts.kind === "proactive"');
 
     const prohibited = [
       token("memory", "Records"),

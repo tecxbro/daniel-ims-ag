@@ -28,6 +28,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run --passWithNoTests",
     "test:watch": "vitest",
+    "evaluate:dispatcher": "tsx scripts/evaluate-dispatcher.ts",
     "evaluate:supermemory-recall": "tsx scripts/evaluate-supermemory-recall.ts",
     "check:branding": "node scripts/check-branding.mjs",
     "validate": "npm run check:branding && npm run typecheck && npm test && npm run build:debug"

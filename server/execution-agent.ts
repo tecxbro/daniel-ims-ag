@@ -4,7 +4,9 @@ import { broadcast } from "./broadcast.js";
 import {
   buildMcpServersForIntegrations,
   buildRuntimeToolsForIntegrations,
+  listEnabledIntegrations,
   listIntegrations,
+  validateIntegrationNames,
 } from "./integrations/registry.js";
 import { createDraftStagingTools } from "./draft-tools.js";
 import { EMPTY_USAGE, type UsageTotals } from "./usage.js";
@@ -120,8 +122,15 @@ export interface SpawnResult {
 }
 
 export async function spawnExecutionAgent(opts: SpawnExecutionAgentOpts): Promise<SpawnResult> {
+  const enabledIntegrations = (await listEnabledIntegrations()).map(
+    (integration) => integration.name,
+  );
+  const integrations = validateIntegrationNames(
+    opts.integrations,
+    enabledIntegrations,
+  );
   const agentId = randomId("agent");
-  const name = opts.name ?? (opts.integrations.join("+") || "general");
+  const name = opts.name ?? (integrations.join("+") || "general");
   const abort = new AbortController();
   running.set(agentId, abort);
 
@@ -130,7 +139,7 @@ export async function spawnExecutionAgent(opts: SpawnExecutionAgentOpts): Promis
   const taskPreview =
     opts.task.length > 120 ? opts.task.slice(0, 120) + "…" : opts.task;
   logAgent(
-    `spawn: ${name} [${opts.integrations.join(", ") || "no integrations"}] images=${opts.imageStorageIds?.length ?? 0} — ${JSON.stringify(taskPreview)}`,
+    `spawn: ${name} [${integrations.join(", ") || "no integrations"}] images=${opts.imageStorageIds?.length ?? 0} — ${JSON.stringify(taskPreview)}`,
   );
   const agentStart = Date.now();
   const runtimeConfig = opts.runtimeConfig ?? (await getRuntimeConfig());
@@ -144,7 +153,7 @@ export async function spawnExecutionAgent(opts: SpawnExecutionAgentOpts): Promis
     model: runtimeConfig.model,
     reasoningEffort: runtimeConfig.reasoningEffort,
     billingMode: runtimeConfig.billingMode,
-    mcpServers: opts.integrations,
+    mcpServers: integrations,
   });
   broadcast("agent_spawned", { agentId, name, task: opts.task });
 
@@ -153,11 +162,11 @@ export async function spawnExecutionAgent(opts: SpawnExecutionAgentOpts): Promis
   const draftTools = opts.conversationId ? createDraftStagingTools(opts.conversationId) : [];
   const integrationServers =
     runtimeConfig.runtime === "claude"
-      ? await buildMcpServersForIntegrations(opts.integrations, opts.conversationId)
+      ? await buildMcpServersForIntegrations(integrations, opts.conversationId)
       : {};
   const integrationTools =
     runtimeConfig.runtime === "codex"
-      ? await buildRuntimeToolsForIntegrations(opts.integrations, opts.conversationId)
+      ? await buildRuntimeToolsForIntegrations(integrations, opts.conversationId)
       : [];
   const mcpServers = integrationServers;
   const runtimeTools = [...draftTools, ...integrationTools];

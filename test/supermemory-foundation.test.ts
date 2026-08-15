@@ -87,14 +87,21 @@ describe("Supermemory foundation configuration", () => {
   });
 
   it("keeps tool handlers on a thin Supermemory service facade", () => {
-    const interactionSource = readFileSync(resolve(process.cwd(), "server/interaction-agent.ts"), "utf8");
+    const dispatcherTurnSource = readFileSync(
+      resolve(process.cwd(), "server/dispatcher/turn.ts"),
+      "utf8",
+    );
+    const dispatcherToolsSource = readFileSync(
+      resolve(process.cwd(), "server/dispatcher/tools.ts"),
+      "utf8",
+    );
     const serviceSource = readFileSync(
       resolve(process.cwd(), "server/memory/supermemory/service.ts"),
       "utf8",
     );
     const toolsSource = readFileSync(resolve(process.cwd(), "server/memory/tools.ts"), "utf8");
-    expect(interactionSource).toContain('from "./memory/tools.js"');
-    expect(interactionSource).toContain("createConfiguredSupermemoryService(");
+    expect(dispatcherToolsSource).toContain('from "../memory/tools.js"');
+    expect(dispatcherTurnSource).toContain("createConfiguredSupermemoryService(");
     expect(serviceSource).toContain('from "./context.js"');
     expect(serviceSource).toContain('from "./operations.js"');
     expect(serviceSource).toContain("retries: 0");
