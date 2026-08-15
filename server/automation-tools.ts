@@ -2,6 +2,10 @@ import { z } from "zod";
 import { api } from "../convex/_generated/api.js";
 import { convex } from "./convex-client.js";
 import { availableIntegrations } from "./execution-agent.js";
+import {
+  listEnabledIntegrations,
+  validateIntegrationNames,
+} from "./integrations/registry.js";
 import { nextRunFor, validateSchedule } from "./automations.js";
 import { describeUserNow } from "./timezone-config.js";
 import { createClaudeMcpServer } from "./runtimes/claude.js";
@@ -55,6 +59,20 @@ Integrations available: ${integrationHint}`,
           .describe("If true, send the result to this conversation when it runs."),
       },
       async (args) => {
+        let integrations: string[];
+        try {
+          const enabledIntegrations = (await listEnabledIntegrations()).map(
+            (integration) => integration.name,
+          );
+          integrations = validateIntegrationNames(
+            args.integrations,
+            enabledIntegrations,
+          );
+        } catch (error) {
+          const message =
+            error instanceof Error ? error.message : "Invalid integration selection.";
+          return runtimeText(`Automation not created: ${message}`, false);
+        }
         const tzInfo = await describeUserNow();
         const timezone = tzInfo.timezone;
         const validation = validateSchedule(args.schedule, timezone);
@@ -67,7 +85,7 @@ Integrations available: ${integrationHint}`,
           automationId,
           name: args.name,
           task: args.task,
-          integrations: args.integrations,
+          integrations,
           schedule: args.schedule,
           timezone,
           conversationId,

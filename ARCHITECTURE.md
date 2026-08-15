@@ -11,7 +11,8 @@ Photon Spectrum / POST /chat
           |
           v
 server/interaction-agent.ts
-  Daniel voice, SuperMemory context, routing, draft/automation/self tools
+  facade for server/dispatcher/turn.ts
+  deterministic gates, then Daniel voice / SuperMemory / model routing
           |
           +--> answer directly
           |
@@ -38,17 +39,27 @@ state. SuperMemory is the only semantic-memory provider.
 
 ## Interaction Agent
 
-`server/interaction-agent.ts` is the front door for each user turn.
+`server/interaction-agent.ts` is the stable facade; `server/dispatcher/turn.ts`
+is the front door for each user turn.
 
-- Reads the inbound message, recent history, current images, runtime settings,
-  and bounded SuperMemory context when memory is configured.
+- Handles trusted proactive notices, pending coding answers, explicit runtime /
+  model / timezone changes, disabled-browser requests, and simple configuration
+  reads in code before loading history, hydrating memory, constructing tools, or
+  calling the dispatcher model.
+- For remaining turns, loads runtime settings, enabled integrations, bounded
+  SuperMemory context, and recent history in parallel. History contains up to
+  ten complete user/assistant turns before the current inbound message, is
+  capped at 16,000 characters, truncates unusually large prior messages, and
+  excludes acknowledgements, proactive notices, incomplete turns, and later
+  concurrent turns.
 - Uses the shared Daniel voice prompt from `server/prompts/daniel-voice.ts`.
 - Can call memory tools, normal worker spawn, coding worker spawn, automation
   tools, draft decision tools, and self-inspection tools.
 - Cannot directly use shell, files, web browsing, or third-party integrations.
   Those capabilities live behind workers.
-- Rewrites worker output into Daniel voice by default, including coding
-  results unless the user explicitly chooses `raw_codex`.
+- Rewrites newly spawned worker output into Daniel voice by default unless the
+  user explicitly chooses `raw_codex`; pending coding continuations return the
+  coding worker's already-final response directly.
 
 Tool surface:
 
